@@ -580,7 +580,6 @@ func (n *testNode) keepStatus(folder string) (node.KeepStatus, error) {
 	return ks, err
 }
 
-
 // buildCLI builds cmd/keepsync into dir.
 func buildCLI(t *testing.T, dir string) string {
 	t.Helper()
