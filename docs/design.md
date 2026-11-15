@@ -58,6 +58,7 @@ Syncthing traffic runs node to node. The server is only on the path for membersh
 | `zerofs` | ZeroFS pin, download and supervisor |
 | `syncer` | Embedded Syncthing |
 | `keeper` | Keep loop, expiry and `keep status` |
+| `hook` | Conflict hook runner |
 | `gateway` | Local read-only Perkeep gateway on a node |
 | `kit` | Recovery kit, recover and drill |
 | `config`, `ctl` | On-disk config and the control socket |
@@ -82,7 +83,7 @@ The base directory is `--dir`, else `$KEEPSYNC_DIR`, else `$XDG_DATA_HOME/keepsy
 
 | Path | Holds |
 | --- | --- |
-| `node.toml` | `name`, `server` (tc address), `[network]`, `keep_interval` (default 5m), `[gateway] listen` (default `127.0.0.1:3179`, empty disables), `conflict_hook` (read, not used yet), and `[[folder]]` entries (name, path, Syncthing folder ID) |
+| `node.toml` | `name`, `server` (tc address), `[network]`, `keep_interval` (default 5m), `[gateway] listen` (default `127.0.0.1:3179`, empty disables), `conflict_hook` and `conflict_hook_timeout` (default 5m), and `[[folder]]` entries (name, path, Syncthing folder ID, optional per-folder `conflict_hook`) |
 | `tailcat.key.json` | The node's tailcat identity |
 | `syncthing/` | Device certificate, `config.xml`, the `index-v2` SQLite index |
 | `membership.json` | The last membership seen, so the node syncs with known peers when it starts while the server is unreachable |
@@ -178,7 +179,9 @@ A kept folder maps to one root permanode whose tree only ever grows. Expiry remo
 
 Durations accept Go syntax plus a `d` suffix. A policy is rejected unless grace < max-defer, and max-defer < expire when expire is set.
 
-**Mapping.** `keepsync keep <folder>` asks the server to create the root permanode and writes its ref to a `.keepsync` file inside the folder. Syncthing carries that file to every node, so all nodes agree on the permanode.
+**Mapping.** `keepsync keep <folder>` asks the server to create the root permanode and writes its ref to a `.keepsync` file inside the folder. Syncthing carries that file to every node, so all nodes agree on the permanode. The registry also records it as the folder's `Archive`.
+
+**Unkeep.** `keepsync unkeep <folder>` clears the folder's policy and keepers. This node stops its keeper at once, and every other node stops when the membership drops the policy: no more puts and no expiry. The archive, `Folder.Archive` and `.keepsync` all stay, so `restore` still reads the archive, and `keep` again continues the same tree. `keep status` on an unkept folder says it is not kept and names the archive.
 
 **Kept tree layout.** The tree uses Perkeep's own conventions, so the web UI, search and `pk-mount` show kept folders as ordinary directories:
 
@@ -232,7 +235,28 @@ BEP's TLS runs end to end, so Syncthing still checks device IDs.
 
 **Folder types.** Every node defaults to send-receive. A folder's `ReceiveOnly` list marks nodes as receive-only.
 
-**Conflicts.** Syncthing writes `.sync-conflict-<date>-<device>` copies. The node logs each conflict event, and conflict copies are kept in Perkeep and expire like any other file. Reporting conflicts and running the conflict hook are not built yet.
+**Conflicts.** Syncthing writes `.sync-conflict-<date>-<device>` copies. Conflict copies are kept in Perkeep under their own name, next to the original, and expire like any other file, so a losing version is never lost and unresolved conflicts do not pile up in sync.
+
+**Conflict hook.** `conflict_hook = "/path/to/script"` in node.toml applies to every folder, and a `conflict_hook` on a `[[folder]]` overrides it. The hook lets an LLM or any other tool resolve conflicts.
+
+- **Who runs it.** On a kept folder, only `Keepers[0]`. On an unkept folder, `Members[0]`. Other nodes only report.
+- **When.** On each conflict event from Syncthing, and on a scan of the folder when the node starts or attaches it. Each copy is debounced for 5 s, and hooks run one at a time per folder.
+- **Before it runs**, on a kept folder, the node reads the original's current kept version as the base. Then it keeps the original and the copy immediately, skipping grace, so anything the hook does is recoverable. If that fails, the hook does not run.
+- **Timeout.** `conflict_hook_timeout` (default 5m). On timeout the hook's whole process group is killed.
+
+The script runs in the folder root and its output is logged. It gets:
+
+| Variable | Value |
+| --- | --- |
+| `KEEPSYNC_FOLDER` | Folder name |
+| `KEEPSYNC_ORIGINAL` | Absolute path of the current file |
+| `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
+| `KEEPSYNC_CONFLICT_NODE` | Name of the node whose device is in the copy's name, else the short device ID |
+| `KEEPSYNC_BASE` | The base in a temp file, for a three-way merge, or empty if there is none (always empty on an unkept folder). The file is deleted afterwards. |
+
+**Contract.** To resolve, the script writes the result to the original path, deletes the conflict copy and exits 0. Syncthing syncs that like any other edit. A non-zero exit, a timeout, or a copy still in place leaves the conflict for a human. A failed copy is not retried until its size or mtime changes.
+
+**`keepsync conflicts`** lists the conflict copies in attached folders, with the original, the node, and the hook state: none, pending, running, failed (with the reason), or not this node's job. **`keepsync conflicts resolve <path>`** runs the hook now on this node, whatever its role, keeping both versions first on a kept folder.
 
 ## Perkeep gateway
 
@@ -300,11 +324,13 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 | `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here. Files stay. |
 | `keep <folder> [--grace] [--max-defer] [--expire]` | Node | Marks a folder kept. Creates the permanode and `.keepsync`. |
 | `keep status <folder> [-v]` | Node | Files in grace, kept, lagging and expirable. |
-| `restore <folder> [<path>] [--at] [--to] [--force]` | Node | Pulls kept files back, including expired ones. |
+| `unkeep <folder>` | Node | Stops keeping a folder on every node. The archive stays. |
+| `restore <folder> [<path>] [--at] [--to] [--force]` | Node | Pulls kept files back, including expired ones, and from unkept folders. |
+| `conflicts` / `conflicts resolve <path>` | Node | Lists conflict copies and hook state, or runs the hook now. |
 | `gateway config [--path]` | Node | Writes a Perkeep client config for the local gateway. |
 | `recover <kit> [--drill --bucket <copy> --baseline <file>]` | Any | Rebuilds the server from the bucket, or runs the drill. |
 
-`unkeep`, `conflicts` and `purge` exist as commands but report "not implemented yet".
+`purge` exists as a command but reports "not implemented yet".
 
 ## Failure modes
 
@@ -318,6 +344,7 @@ When the server is unreachable, sync keeps working, and only keeping, expiry and
 | Lagging keeper reports an older file | The server rejects it. `keep status` shows the file as lagging. |
 | Registry connection goes silent | Both sides drop it within 30 s, and the node reconnects and refetches the membership. |
 | ZeroFS flush failing | Nothing new becomes durable, so expiry stops removing files. `server status` shows the failure. |
+| Conflict hook fails or makes a bad merge | A failure leaves the copy for a human, shown in `conflicts`. Both versions were kept before the hook ran, so a bad merge can be undone with `restore`. |
 | Server lost | `keepsync recover <kit>` from the bucket. The tailcat key is the same, so nodes reconnect on their own. |
 
 ## Testing
@@ -339,8 +366,6 @@ Not yet measured: keep throughput, bucket write operations and restore time on a
 
 ## Not built yet
 
-- **Conflict reporting and the conflict hook.** The plan: `keepsync conflicts` and `conflicts resolve <path>`, and a `conflict_hook` script run by `Keepers[0]`, one at a time per folder, with a timeout and a debounce. The script gets `KEEPSYNC_FOLDER`, `KEEPSYNC_ORIGINAL`, `KEEPSYNC_CONFLICT`, `KEEPSYNC_CONFLICT_NODE` and `KEEPSYNC_BASE` (the last kept version, for a three-way merge). Before the hook runs, both versions are kept immediately, skipping grace (`keeper.KeepNow` exists for this). To resolve, the script writes the original, deletes the copy and exits 0. Anything else leaves the conflict for a human.
-- **`unkeep`**, which stops keeping a folder and leaves the archive.
 - **Deleting from keep**, as a `del-attribute` on `camliPath:<name>` in the parent directory's permanode, or a `delete` claim. Both are reversible. **`purge`**, the rare manual physical delete, since Perkeep has no garbage collector.
 - **ZeroFS without a mount**: a Perkeep blobserver that writes diskpacked packs through a Go 9P client straight to ZeroFS.
 - **A native tailcat transport inside Syncthing**, replacing the loopback bridge. It needs a patch to the vendored `lib/connections`.
