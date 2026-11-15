@@ -19,6 +19,7 @@ import (
 	"github.com/progrium/keepsync/internal/node"
 	"github.com/progrium/keepsync/internal/registry"
 	"github.com/progrium/keepsync/internal/server"
+	"github.com/progrium/keepsync/internal/zerofs"
 )
 
 const syncTimeout = 90 * time.Second
@@ -826,6 +827,51 @@ func TestCluster(t *testing.T) {
 			}
 			if s.Mode != e2eMode() || s.Nodes != 3 || s.Online == 0 || s.LastFlush.IsZero() || s.IndexBytes == 0 {
 				return fmt.Errorf("summary %+v", *s)
+			}
+			return nil
+		})
+	})
+
+	step("zerofs-restart", func(t *testing.T) {
+		// Kill the server's zerofs mid-run: the supervisor restarts it
+		// and reconnects, and keeping and flushing carry on.
+		cfgPath := filepath.Join(c.srvCfg.ZeroFSDir(), "zerofs.toml")
+		pidOf := func() string {
+			out, _ := exec.Command("pgrep", "-f", "run --config "+cfgPath).Output()
+			return strings.TrimSpace(string(out))
+		}
+		pid := pidOf()
+		if pid == "" || strings.Contains(pid, "\n") {
+			t.Fatalf("zerofs pid %q", pid)
+		}
+		if err := exec.Command("kill", "-9", pid).Run(); err != nil {
+			t.Fatal(err)
+		}
+		killed := time.Now()
+		eventually(t, 2*time.Minute, "zerofs back up", func() error {
+			var st server.Status
+			if err := c.serverCall(server.MethodStatus, nil, &st); err != nil {
+				return err
+			}
+			if st.ZeroFS.State != zerofs.HealthUp || st.ZeroFS.Since.Before(killed) {
+				return fmt.Errorf("zerofs %+v", st.ZeroFS)
+			}
+			if p := pidOf(); p == "" || p == pid {
+				return fmt.Errorf("zerofs pid %q (was %s)", p, pid)
+			}
+			return nil
+		})
+		t.Logf("zerofs back %v after SIGKILL", time.Since(killed).Round(time.Millisecond))
+		a.write("docs", "after-restart.txt", "written after zerofs restarted")
+		eventually(t, time.Minute, "after-restart.txt kept", func() error { return wantState(a, "docs", "after-restart.txt", keeper.StateKept) })
+		c.flush("")
+		eventually(t, time.Minute, "node summary says zerofs up", func() error {
+			ns, err := a.status()
+			if err != nil {
+				return err
+			}
+			if s := ns.ServerSummary; s == nil || s.ZeroFS != zerofs.HealthUp || s.FlushErr != "" {
+				return fmt.Errorf("summary %+v (%s)", s, ns.SummaryErr)
 			}
 			return nil
 		})
