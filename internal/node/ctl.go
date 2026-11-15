@@ -153,33 +153,7 @@ func (n *Node) handlers() {
 		if err := ready(); err != nil {
 			return nil, err
 		}
-		if _, err := n.localFolder(p.Name); err != nil {
-			return nil, err
-		}
-		// Leave the folder in the registry so this node stops being a
-		// member (and keeper). If the server cannot be told, still stop
-		// syncing here and say so; the files stay either way.
-		var res RmResult
-		if err := n.reg.LeaveFolder(ctx, p.Name); err != nil {
-			res.Warning = err.Error()
-		} else {
-			res.Left = true
-		}
-		n.cfgMu.Lock()
-		ok := n.cfg.RemoveFolder(p.Name)
-		var err error
-		if ok {
-			err = n.cfg.Save()
-		}
-		n.cfgMu.Unlock()
-		if !ok {
-			return nil, errors.New("folder " + p.Name + " is not attached here")
-		}
-		if err != nil {
-			return nil, err
-		}
-		n.reconcile(n.ctx)
-		return res, nil
+		return n.folderRm(ctx, p.Name)
 	})
 	ctl.HandleFunc(n.ctl, MethodKeep, func(ctx context.Context, p KeepParams) (any, error) {
 		if err := ready(); err != nil {
@@ -259,6 +233,39 @@ func (n *Node) handlers() {
 		n.mu.Unlock()
 		return out, nil
 	})
+}
+
+// folderRm is MethodFolderRm: stop syncing a folder here and leave it on
+// the server, or, if the server cannot be told, leave it once it answers.
+func (n *Node) folderRm(ctx context.Context, name string) (RmResult, error) {
+	if _, err := n.localFolder(name); err != nil {
+		return RmResult{}, err
+	}
+	// Leave the folder in the registry so this node stops being a
+	// member (and keeper). If the server cannot be told, still stop
+	// syncing here and say so; the files stay either way.
+	var res RmResult
+	if err := n.reg.LeaveFolder(ctx, name); err != nil {
+		res.Warning = err.Error() + " (the node will leave the folder on the server once it answers)"
+		n.addPendingLeave(name)
+	} else {
+		res.Left = true
+	}
+	n.cfgMu.Lock()
+	ok := n.cfg.RemoveFolder(name)
+	var err error
+	if ok {
+		err = n.cfg.Save()
+	}
+	n.cfgMu.Unlock()
+	if !ok {
+		return RmResult{}, errors.New("folder " + name + " is not attached here")
+	}
+	if err != nil {
+		return RmResult{}, err
+	}
+	n.reconcile(n.ctx)
+	return res, nil
 }
 
 // UnkeepResult is the result of MethodUnkeep.
@@ -399,6 +406,7 @@ func (n *Node) attach(ctx context.Context, p FolderParams, call func(context.Con
 	if err != nil {
 		return nil, err
 	}
+	n.dropPendingLeave(f.Name)
 	// The registry publishes the change to the watch as well; reconciling
 	// now just makes the CLI's next command see it sooner.
 	n.mu.Lock()

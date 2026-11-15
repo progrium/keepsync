@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +53,8 @@ type Server struct {
 	open    map[net.Conn]api.NodeKey
 	timers  map[*time.Timer]struct{}
 	closed  bool
+	// epoch is new each time the server starts; see api.Membership.
+	epoch string
 }
 
 type subscriber struct {
@@ -80,7 +83,12 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: load state: %w", err)
 	}
+	epoch, err := newEpoch()
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
+		epoch:   epoch,
 		cfg:     cfg,
 		state:   st,
 		conns:   map[api.NodeKey]int{},
@@ -129,7 +137,7 @@ func (s *Server) Close() error {
 func (s *Server) Membership() api.Membership {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.state.membership()
+	return s.membershipOf(s.state)
 }
 
 // NodeInfo is one approved node, for `server nodes`.
@@ -330,7 +338,7 @@ func (s *Server) mutate(ctx context.Context, fn func(*State) error) error {
 		return fmt.Errorf("registry: save state: %w", err)
 	}
 	s.state = next
-	m := next.membership()
+	m := s.membershipOf(next)
 	for sub := range s.subs {
 		select {
 		case <-sub.ch:
@@ -524,7 +532,7 @@ func (s *Server) disconnect(conn net.Conn, peer api.NodeKey) {
 func (s *Server) streamWatch(ctx context.Context, conn net.Conn, id uint64, send func(response) error) {
 	sub := &subscriber{ch: make(chan api.Membership, 1)}
 	s.mu.Lock()
-	sub.ch <- s.state.membership()
+	sub.ch <- s.membershipOf(s.state)
 	s.subs[sub] = struct{}{}
 	s.mu.Unlock()
 	defer func() {
@@ -856,6 +864,23 @@ func (s *Server) paths(ctx context.Context, peer api.NodeKey, pn api.BlobRef) (m
 		return nil, err
 	}
 	return s.cfg.Signer.Paths(ctx, pn)
+}
+
+// membershipOf is the membership published for st, stamped with this
+// run's epoch.
+func (s *Server) membershipOf(st State) api.Membership {
+	m := st.membership()
+	m.Epoch = s.epoch
+	return m
+}
+
+// newEpoch returns a random epoch for one run of the server.
+func newEpoch() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // newFolderID makes a Syncthing-style folder ID ("abcde-fghij").

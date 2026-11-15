@@ -332,7 +332,7 @@ func (r *Registry) publishLocked() {
 }
 
 func copyMembership(m api.Membership) api.Membership {
-	out := api.Membership{Version: m.Version}
+	out := api.Membership{Epoch: m.Epoch, Version: m.Version}
 	out.Nodes = append(out.Nodes, m.Nodes...)
 	for _, f := range m.Folders {
 		f.Members = append([]api.NodeKey(nil), f.Members...)

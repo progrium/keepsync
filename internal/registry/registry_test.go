@@ -799,3 +799,19 @@ func TestUnkeep(t *testing.T) {
 		t.Fatalf("keep again: %+v", f.Keep)
 	}
 }
+
+// TestEpochIsNewEachStart checks that each run of the server stamps its
+// membership with its own epoch, so nodes accept a restarted (maybe
+// recovered, older) registry whatever its version.
+func TestEpochIsNewEachStart(t *testing.T) {
+	e := newEnv(t)
+	first := e.srv.Membership()
+	if first.Epoch == "" {
+		t.Fatal("membership has no epoch")
+	}
+	e.srv.Close()
+	e.start()
+	if second := e.srv.Membership(); second.Epoch == first.Epoch || second.Version != first.Version {
+		t.Fatalf("after restart: epoch %q version %d, before: epoch %q version %d", second.Epoch, second.Version, first.Epoch, first.Version)
+	}
+}

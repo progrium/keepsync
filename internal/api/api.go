@@ -89,8 +89,12 @@ type Folder struct {
 }
 
 // Membership is the registry's view of the network, versioned so watchers
-// can tell updates apart.
+// can tell updates apart. Version only orders memberships with the same
+// Epoch, which the registry picks afresh each time it starts: a registry
+// recovered from an older state may publish lower versions than a node has
+// seen, and its membership must still win.
 type Membership struct {
+	Epoch   string
 	Version uint64
 	Nodes   []Node
 	Folders []Folder

@@ -145,6 +145,7 @@ type Node struct {
 	ctx        context.Context
 	cfgMu      sync.Mutex // serializes config edits and saves
 	recMu      sync.Mutex // serializes reconcile
+	leaves     pendingLeaves
 }
 
 type kept struct {
@@ -258,6 +259,9 @@ func (n *Node) health(ctx context.Context) {
 			n.reachable, n.serverErr, n.serverSeen = true, "", time.Now()
 		}
 		n.mu.Unlock()
+		if err == nil {
+			n.retryLeaves(ctx)
+		}
 	}
 }
 
@@ -337,6 +341,7 @@ func (n *Node) watch(ctx context.Context) {
 		n.mu.Lock()
 		n.registered, n.reachable, n.serverErr, n.serverSeen = true, true, "", time.Now()
 		n.mu.Unlock()
+		n.retryLeaves(ctx)
 		n.apply(ctx, m)
 		ch, err := n.reg.Watch(ctx)
 		if err != nil {
@@ -386,11 +391,21 @@ func (n *Node) events() {
 // folders attached here. It is idempotent.
 func (n *Node) apply(ctx context.Context, m api.Membership) {
 	n.mu.Lock()
-	if n.haveMember && m.Version < n.member.Version {
+	// Versions only order memberships from one run of the registry. A
+	// different epoch is a restarted (maybe recovered, older) registry,
+	// whose membership wins whatever its version.
+	if n.haveMember && m.Epoch == n.member.Epoch && m.Version < n.member.Version {
 		n.mu.Unlock()
 		return
 	}
+	wasRunner := n.hookFoldersLocked()
 	n.member, n.haveMember = m, true
+	var nowRunner []string
+	for f := range n.hookFoldersLocked() {
+		if !wasRunner[f] {
+			nowRunner = append(nowRunner, f)
+		}
+	}
 	n.mu.Unlock()
 	n.saveMembership(m)
 	n.reconcile(ctx)
@@ -401,9 +416,35 @@ func (n *Node) apply(ctx context.Context, m api.Membership) {
 	first := !c.scanned
 	c.scanned = true
 	c.mu.Unlock()
-	if first {
+	switch {
+	case first:
 		go n.scanConflicts()
+	case len(nowRunner) > 0:
+		// This node just became the hook runner (keeper failover, say).
+		// Copies that arrived while another node had the job were set
+		// aside as not this node's, so pick them up now.
+		go n.scanConflicts(nowRunner...)
 	}
+}
+
+// hookFoldersLocked returns the folders whose conflict hook this node runs
+// under the current membership (see hookNode). The caller holds n.mu.
+func (n *Node) hookFoldersLocked() map[string]bool {
+	out := map[string]bool{}
+	if !n.haveMember || n.tr == nil {
+		return out
+	}
+	self := n.tr.Key()
+	for _, f := range n.member.Folders {
+		if f.Keep != nil {
+			if len(f.Keep.Keepers) > 0 && f.Keep.Keepers[0] == self {
+				out[f.Name] = true
+			}
+		} else if len(f.Members) > 0 && f.Members[0] == self {
+			out[f.Name] = true
+		}
+	}
+	return out
 }
 
 // reconcile applies the current membership and config.
