@@ -3,9 +3,11 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -158,5 +160,46 @@ exit 1
 			t.Fatal("the new hook runner never ran the hook")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// failingPutter refuses one file by name.
+type failingPutter struct {
+	api.BlobPutter
+	bad string
+}
+
+func (f failingPutter) PutFile(ctx context.Context, path string) (api.BlobRef, error) {
+	if filepath.Base(path) == f.bad {
+		return "", errors.New("refused for the test")
+	}
+	return f.BlobPutter.PutFile(ctx, path)
+}
+
+// TestKeepStatusShowsFileErrors checks that a file the keeper fails on
+// every pass is named in keep status and logged once, not only counted.
+func TestKeepStatusShowsFileErrors(t *testing.T) {
+	var logged atomic.Int64
+	tn := newTestNode(t, func(pk *fake.Perkeep) api.BlobPutter { return failingPutter{pk, "bad.txt"} })
+	tn.logf = func(format string, args ...any) {
+		if strings.Contains(fmt.Sprintf(format, args...), "refused for the test") {
+			logged.Add(1)
+		}
+	}
+	writeOld(t, filepath.Join(tn.dir, "bad.txt"), "x", 10*24*time.Hour)
+	writeOld(t, filepath.Join(tn.dir, "good.txt"), "y", 10*24*time.Hour)
+	tn.keep(t)
+	var ks KeepStatus
+	waitFor(t, "a few passes", func() bool {
+		var err error
+		ks, err = tn.keepStatus(tn.ctx, "docs")
+		return err == nil && len(ks.Errors) > 0 && logged.Load() > 0
+	})
+	time.Sleep(100 * time.Millisecond) // several more 20ms passes
+	if len(ks.Errors) != 1 || !strings.Contains(ks.Errors[0], "bad.txt") {
+		t.Fatalf("keep status errors: %q", ks.Errors)
+	}
+	if n := logged.Load(); n != 1 {
+		t.Fatalf("error logged %d times, want once", n)
 	}
 }

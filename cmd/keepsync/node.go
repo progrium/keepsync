@@ -255,6 +255,12 @@ func (e *env) keepStatus(args []string) error {
 		}
 		fmt.Fprintln(e.stdout)
 	}
+	if len(ks.Errors) > 0 {
+		fmt.Fprintf(e.stdout, "%d files failed in the last pass:\n", len(ks.Errors))
+		for _, msg := range ks.Errors {
+			fmt.Fprintf(e.stdout, "  %s\n", msg)
+		}
+	}
 	if ks.Status.DurabilityUnknown {
 		fmt.Fprintln(e.stdout, "durability unknown (server unreachable): nothing is reported expirable")
 	}

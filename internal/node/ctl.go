@@ -112,7 +112,10 @@ type KeepStatus struct {
 	Status    keeper.Status  `json:"status"`
 	LastPass  time.Time      `json:"lastPass,omitzero"`
 	LastError string         `json:"lastError,omitempty"`
-	Last      keeper.Report  `json:"-"`
+	// Errors are the per-file errors of the last pass, such as a claim
+	// the server refused. Those files were not kept or expired.
+	Errors []string      `json:"errors,omitempty"`
+	Last   keeper.Report `json:"-"`
 }
 
 func (n *Node) handlers() {
@@ -211,28 +214,36 @@ func (n *Node) handlers() {
 		if err := ready(); err != nil {
 			return nil, err
 		}
-		if _, err := n.localFolder(p.Name); err != nil {
-			return nil, err
-		}
-		n.mu.Lock()
-		k := n.keepers[p.Name]
-		n.mu.Unlock()
-		if k == nil {
-			return nil, n.notKept(p.Name)
-		}
-		st, err := k.k.Status(ctx)
-		if err != nil {
-			return nil, err
-		}
-		out := KeepStatus{Folder: p.Name, Keeper: k.k.IsKeeper(), Status: st, Counts: map[string]int{}}
-		for s, c := range st.Counts() {
-			out.Counts[s.String()] = c
-		}
-		n.mu.Lock()
-		out.LastPass, out.LastError = k.lastAt, k.lastE
-		n.mu.Unlock()
-		return out, nil
+		return n.keepStatus(ctx, p.Name)
 	})
+}
+
+// keepStatus is MethodKeepStatus.
+func (n *Node) keepStatus(ctx context.Context, name string) (KeepStatus, error) {
+	if _, err := n.localFolder(name); err != nil {
+		return KeepStatus{}, err
+	}
+	n.mu.Lock()
+	k := n.keepers[name]
+	n.mu.Unlock()
+	if k == nil {
+		return KeepStatus{}, n.notKept(name)
+	}
+	st, err := k.k.Status(ctx)
+	if err != nil {
+		return KeepStatus{}, err
+	}
+	out := KeepStatus{Folder: name, Keeper: k.k.IsKeeper(), Status: st, Counts: map[string]int{}}
+	for s, c := range st.Counts() {
+		out.Counts[s.String()] = c
+	}
+	n.mu.Lock()
+	out.LastPass, out.LastError = k.lastAt, k.lastE
+	for _, e := range k.last.Errors {
+		out.Errors = append(out.Errors, e.Error())
+	}
+	n.mu.Unlock()
+	return out, nil
 }
 
 // folderRm is MethodFolderRm: stop syncing a folder here and leave it on

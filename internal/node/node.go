@@ -156,6 +156,9 @@ type kept struct {
 	last   keeper.Report
 	lastAt time.Time
 	lastE  string
+	// errs holds the per-file errors of the last pass, to log each one
+	// once rather than every pass.
+	errs map[string]bool
 }
 
 // Options configures Run.
@@ -565,7 +568,21 @@ func (n *Node) runKeeper(ctx context.Context, name string, k *kept) {
 		if err != nil {
 			k.lastE = err.Error()
 		}
+		errs := map[string]bool{}
+		var fresh []string
+		for _, e := range rep.Errors {
+			msg := e.Error()
+			errs[msg] = true
+			if !k.errs[msg] {
+				fresh = append(fresh, msg)
+			}
+		}
+		k.errs = errs
 		n.mu.Unlock()
+		// Per-file errors repeat every pass until fixed: log each once.
+		for _, msg := range fresh {
+			n.logf("keep %s: %s", name, msg)
+		}
 		if err != nil {
 			n.logf("keep %s: %v", name, err)
 		} else if len(rep.Kept)+len(rep.Expired)+len(rep.Errors) > 0 {
