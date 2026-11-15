@@ -34,9 +34,10 @@ type Config struct {
 	Mount MountMode
 	// MountDir is where the filesystem is mounted. Default DataDir/mnt.
 	MountDir string
-	// CacheSizeGB is the local disk cache size. Default 10.
+	// CacheSizeGB is the local disk cache size. Default DefaultCacheSizeGB.
 	CacheSizeGB float64
-	// MemoryCacheGB is the in-memory cache size. Default 1.
+	// MemoryCacheGB is the in-memory cache size. Default
+	// DefaultMemoryCacheGB.
 	MemoryCacheGB float64
 	// StartTimeout bounds how long Start waits for zerofs and the mount to
 	// come up. Default 2m (a first start against a remote bucket can be slow).
@@ -52,6 +53,19 @@ type Config struct {
 	// Release is the pin the binary is checked against. Default Pinned.
 	Release *Release
 }
+
+// Cache defaults. ZeroFS's caches are read caches only: writes are buffered
+// in RAM (an open 256 MiB segment plus up to four sealing ones) and PUT
+// straight to the bucket, so the cache size changes neither write buffering
+// nor what Flush has to do. A read that misses goes to the bucket and fills
+// the cache. keepsync's replica is written far more than it is read (the
+// diskpacked index, and recovery), so the defaults are ZeroFS v2.3.7's
+// floors: it gives each half of the disk cache at least 1 GiB and each half
+// of the memory cache at least 32 MiB, whatever is configured.
+const (
+	DefaultCacheSizeGB   = 2
+	DefaultMemoryCacheGB = 0.25
+)
 
 // Supervisor runs ZeroFS as a child process and mounts it over 9P. It
 // implements api.ZeroFS.
@@ -103,10 +117,10 @@ func New(cfg Config) (*Supervisor, error) {
 		return nil, err
 	}
 	if cfg.CacheSizeGB == 0 {
-		cfg.CacheSizeGB = 10
+		cfg.CacheSizeGB = DefaultCacheSizeGB
 	}
 	if cfg.MemoryCacheGB == 0 {
-		cfg.MemoryCacheGB = 1
+		cfg.MemoryCacheGB = DefaultMemoryCacheGB
 	}
 	if cfg.StartTimeout == 0 {
 		cfg.StartTimeout = 2 * time.Minute
