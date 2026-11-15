@@ -48,13 +48,24 @@ Syncthing config file at startup.
   `SyncItemChanged`, `Device` is the global file's `ModifiedBy`.
   Events are hints: Syncthing drops events for slow subscribers.
 - **Scan.** `Internals.ScanFolderSubdirs`, which returns when the scan is done.
+- **FileState.** Reads the global entry (`Internals.GlobalFileInfo`) for
+  `Known`, `Version`, `Deleted` and `Dir`; the version vector's counters
+  become `api.Version` pairs keyed by `ShortID.String()`. `Current` compares
+  this device's own entry (`Internals.LocalFileInfo`, a vendored patch) with
+  the global one: true when the versions are equal and the local entry is
+  valid (not ignored or unscanned-invalid), or when the path is deleted
+  globally and absent here. That is the same condition under which
+  Syncthing needs nothing for the path. An unknown folder or path is
+  `Known: false` with no error. Deletes and recreations get versions that
+  descend from the previous one, so a keeper can tell a recreated file
+  from a stale one without clocks.
 
 ## Syncthing internals touched
 
 | What | Package | Stability |
 | --- | --- | --- |
 | `syncthing.New`, `App.Start/Stop`, `OpenDatabase`, `LoadOrGenerateCertificate` | `lib/syncthing` | Public entry point used by `cmd/syncthing`; changed signature between v1 and v2 (LevelDB backend replaced by `db.DB`). |
-| `App.Internals.ScanFolderSubdirs`, `GlobalFileInfo` | `lib/syncthing` | Documented as unstable ("the interface in Internals is unstable"). |
+| `App.Internals.ScanFolderSubdirs`, `GlobalFileInfo`, `LocalFileInfo` (patch) | `lib/syncthing` | Documented as unstable ("the interface in Internals is unstable"). |
 | `config.New`, `config.Wrap`, `Wrapper.Modify`, `Configuration` fields | `lib/config` | Exported and used by the REST API; option fields come and go between releases. |
 | `events.NewLogger`, `Subscribe`, event data maps | `lib/events` | Event payloads are untyped maps; keys match the documented REST event API. |
 | `protocol.DeviceID`, `ShortID` | `lib/protocol` | Stable. |

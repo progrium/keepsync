@@ -56,6 +56,12 @@ func (m *Internals) GlobalFileInfo(folderID, path string) (protocol.FileInfo, bo
 	return m.model.CurrentGlobalFile(folderID, path)
 }
 
+// LocalFileInfo returns this device's own index entry for path.
+// keepsync patch: upstream exposes only the global entry here.
+func (m *Internals) LocalFileInfo(folderID, path string) (protocol.FileInfo, bool, error) {
+	return m.model.CurrentFolderFile(folderID, path)
+}
+
 func (m *Internals) GlobalTree(folderID string, prefix string, levels int, returnOnlyDirectories bool) ([]*model.TreeEntry, error) {
 	return m.model.GlobalDirectoryTree(folderID, prefix, levels, returnOnlyDirectories)
 }

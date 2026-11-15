@@ -14,6 +14,11 @@ A pruned copy of [Syncthing](https://github.com/syncthing/syncthing)
 1. `lib/api/auto/gui.files.go` (new file): stub assets for builds without
    `-tags noassets`. Upstream generates this file and does not publish it.
 
+2. `lib/syncthing/internals.go`: adds `Internals.LocalFileInfo`, a
+   one-line accessor for this device's own index entry
+   (`model.CurrentFolderFile`), which `syncer.FileState` needs to tell
+   whether this node holds the global version.
+
 Patched files stay under MPL-2.0.
 
 ## Updating
