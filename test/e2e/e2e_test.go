@@ -417,9 +417,24 @@ func TestCluster(t *testing.T) {
 			t.Errorf("KEEPSYNC_BASE held %q (%v), want the last kept version", b, err)
 		}
 		// Both versions were kept before the merge; the merge itself is
-		// inside grace.
+		// inside grace. The hook deleted the copy, so once the keeper marks
+		// it deleted in sync, restore skips it unless asked.
+		eventually(t, time.Minute, "the copy marked deleted in sync", func() error {
+			res, err := hookN.restore(node.RestoreParams{Folder: "notes", Path: "f.txt", To: t.TempDir()})
+			if err != nil {
+				return err
+			}
+			all, err := hookN.restore(node.RestoreParams{Folder: "notes", To: t.TempDir()})
+			if err != nil {
+				return err
+			}
+			if len(all.Deleted) != 1 || !strings.HasPrefix(all.Deleted[0], "f.sync-conflict-") {
+				return fmt.Errorf("skipped as deleted: %v (f.txt alone: %v)", all.Deleted, res.Deleted)
+			}
+			return nil
+		})
 		to := t.TempDir()
-		if _, err := hookN.restore(node.RestoreParams{Folder: "notes", To: to}); err != nil {
+		if _, err := hookN.restore(node.RestoreParams{Folder: "notes", To: to, Deleted: true}); err != nil {
 			t.Fatalf("restore notes: %v", err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(to, "f.txt")); string(got) != "from "+hookN.name+"\n" {
