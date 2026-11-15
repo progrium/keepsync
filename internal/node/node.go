@@ -536,7 +536,7 @@ func (n *Node) reconcileKeepers(want map[string]api.Folder, dirs map[string]conf
 			Policy:   *f.Keep,
 			Registry: n.reg,
 			Putter:   n.putter,
-			Scanner:  n.sy,
+			Syncer:   n.sy,
 			Logf:     n.logf, // the keeper prefixes its own lines
 
 		})
