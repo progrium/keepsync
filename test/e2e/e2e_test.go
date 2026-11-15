@@ -1,0 +1,1061 @@
+package e2e
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/progrium/keepsync/internal/api"
+	"github.com/progrium/keepsync/internal/config"
+	"github.com/progrium/keepsync/internal/keeper"
+	"github.com/progrium/keepsync/internal/kit"
+	"github.com/progrium/keepsync/internal/node"
+	"github.com/progrium/keepsync/internal/registry"
+	"github.com/progrium/keepsync/internal/server"
+	"github.com/progrium/keepsync/internal/zerofs"
+)
+
+const syncTimeout = 90 * time.Second
+
+// TestCluster runs one server and three nodes through the milestone 1 to 4
+// flows. perkeepd runs once per process, so every step shares the cluster
+// and the steps run in order; a step that fails stops the rest.
+func TestCluster(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts MinIO, ZeroFS, perkeepd and three Syncthings")
+	}
+	c := newCluster(t)
+	var a, b, cc *testNode
+
+	step := func(name string, fn func(t *testing.T)) {
+		if !t.Run(name, fn) {
+			t.FailNow()
+		}
+	}
+
+	step("join", func(t *testing.T) {
+		a, b, cc = c.addNode("a"), c.addNode("b"), c.addNode("c")
+		eventually(t, time.Minute, "all nodes registered and online", func() error {
+			var nodes []registry.NodeInfo
+			if err := c.serverCall(server.MethodNodes, nil, &nodes); err != nil {
+				return err
+			}
+			if len(nodes) != 3 {
+				return fmt.Errorf("%d nodes", len(nodes))
+			}
+			for _, n := range nodes {
+				if !n.Registered || !n.Online {
+					return fmt.Errorf("%s registered=%v online=%v", n.Name, n.Registered, n.Online)
+				}
+			}
+			return nil
+		})
+		for _, n := range []*testNode{a, b, cc} {
+			eventually(t, time.Minute, n.name+" watching", func() error {
+				st, err := n.status()
+				if err != nil {
+					return err
+				}
+				if !st.Registered || !st.Watching {
+					return fmt.Errorf("registered=%v watching=%v err=%q", st.Registered, st.Watching, st.ServerErr)
+				}
+				if st.Device != n.dev {
+					return fmt.Errorf("device %s, init said %s", st.Device, n.dev)
+				}
+				return nil
+			})
+		}
+	})
+
+	step("sync", func(t *testing.T) {
+		addFolder(t, a, "docs", b, cc)
+		a.write("docs", "hello.txt", "hello from a")
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "hello.txt reaches "+n.name, func() error { return n.hasContent("docs", "hello.txt", "hello from a") })
+		}
+		eventually(t, syncTimeout, "peers connected", func() error {
+			for _, n := range []*testNode{a, b, cc} {
+				st, err := n.status()
+				if err != nil {
+					return err
+				}
+				if len(st.Peers) != 2 {
+					return fmt.Errorf("%s has %d peers", n.name, len(st.Peers))
+				}
+				for _, p := range st.Peers {
+					if !p.Connected {
+						return fmt.Errorf("%s: peer %s not connected", n.name, p.Name)
+					}
+				}
+			}
+			return nil
+		})
+		b.write("docs", "hello.txt", "edited on b")
+		b.write("docs", "sub/dir/deep.txt", "nested")
+		for _, n := range []*testNode{a, cc} {
+			eventually(t, syncTimeout, "edit reaches "+n.name, func() error {
+				if err := n.hasContent("docs", "hello.txt", "edited on b"); err != nil {
+					return err
+				}
+				return n.hasContent("docs", "sub/dir/deep.txt", "nested")
+			})
+		}
+		if err := os.Remove(cc.path("docs", "sub/dir/deep.txt")); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range []*testNode{a, b} {
+			eventually(t, syncTimeout, "delete reaches "+n.name, func() error { return n.absent("docs", "sub/dir/deep.txt") })
+		}
+	})
+
+	step("join-merge", func(t *testing.T) {
+		if err := a.call(node.MethodFolderAdd, node.FolderParams{Name: "shared", Path: a.dir("shared")}, nil); err != nil {
+			t.Fatalf("folder add shared: %v", err)
+		}
+		b.write("shared", "mine.txt", "already on b")
+		join := func(n *testNode, merge bool) error {
+			return n.call(node.MethodFolderJoin, node.FolderParams{Name: "shared", Path: n.dir("shared"), Merge: merge}, nil)
+		}
+		if err := join(b, false); err == nil || !strings.Contains(err.Error(), "not empty") {
+			t.Fatalf("join from a non-empty directory without merge: err=%v, want a refusal", err)
+		}
+		if f, err := serverFolder(c, "shared"); err != nil {
+			t.Fatal(err)
+		} else if slices.Contains(f.Members, b.key) {
+			t.Fatal("a refused join still made b a member")
+		}
+		if err := join(b, true); err != nil {
+			t.Fatalf("join with merge: %v", err)
+		}
+		// Rejoining at the path it is attached at needs no merge.
+		if err := join(b, false); err != nil {
+			t.Fatalf("rejoin at the same path: %v", err)
+		}
+		if err := join(cc, false); err != nil {
+			t.Fatalf("join from an empty directory: %v", err)
+		}
+		for _, n := range []*testNode{a, cc} {
+			eventually(t, syncTimeout, "merged file reaches "+n.name, func() error { return n.hasContent("shared", "mine.txt", "already on b") })
+		}
+	})
+
+	step("keep-grace", func(t *testing.T) {
+		const grace = 6 * time.Second
+		keep(t, a, "docs", node.KeepParams{Grace: grace, MaxDefer: 30 * time.Second})
+		for _, n := range []*testNode{a, b, cc} {
+			eventually(t, syncTimeout, ".keepsync reaches "+n.name, func() error {
+				m, err := keeper.ReadMapping(n.dir("docs"))
+				if err != nil {
+					return err
+				}
+				if m.Permanode == "" {
+					return errors.New("no permanode in .keepsync")
+				}
+				return nil
+			})
+		}
+		keepers := folderKeepers(t, c, "docs")
+		if len(keepers) != 2 {
+			t.Fatalf("docs has keepers %v, want two", keepers)
+		}
+		// hello.txt is older than grace by now: it is kept.
+		eventually(t, time.Minute, "hello.txt kept", func() error { return wantState(a, "docs", "hello.txt", keeper.StateKept) })
+
+		wrote := time.Now()
+		a.write("docs", "notes.txt", "fresh")
+		var keptAt time.Time
+		eventually(t, time.Minute, "notes.txt kept", func() error {
+			ks, err := a.keepStatus("docs")
+			if err != nil {
+				return err
+			}
+			f, ok := fileState(ks, "notes.txt")
+			if !ok {
+				return errors.New("notes.txt not in keep status")
+			}
+			if f.State == keeper.StateKept {
+				keptAt = time.Now()
+				return nil
+			}
+			return fmt.Errorf("notes.txt is %s", f.State)
+		})
+		if d := keptAt.Sub(wrote); d < grace {
+			t.Errorf("notes.txt kept %v after it was written, inside the %v grace", d, grace)
+		}
+		// Both keepers see the kept tree; a node that is not a keeper reports
+		// the same state from the server's tree.
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, time.Minute, "notes.txt kept as seen by "+n.name, func() error { return wantState(n, "docs", "notes.txt", keeper.StateKept) })
+		}
+	})
+
+	step("expiry-gated-on-durability", func(t *testing.T) {
+		addFolder(t, a, "photos", b, cc)
+		keep(t, a, "photos", node.KeepParams{Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: time.Minute})
+		old := time.Now().Add(-time.Hour)
+		a.write("photos", "old.jpg", "old photo")
+		if err := os.Chtimes(a.path("photos", "old.jpg"), old, old); err != nil {
+			t.Fatal(err)
+		}
+		a.write("photos", "new.jpg", "new photo")
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "photos reach "+n.name, func() error {
+				if err := n.hasContent("photos", "old.jpg", "old photo"); err != nil {
+					return err
+				}
+				return n.hasContent("photos", "new.jpg", "new photo")
+			})
+		}
+		eventually(t, time.Minute, "old.jpg kept", func() error { return wantState(a, "photos", "old.jpg", keeper.StateKept) })
+		// Kept and long past expire, but not durable: the server has not
+		// flushed since, so nothing may expire.
+		holds(t, 8*time.Second, "old.jpg stays until durable", func() error {
+			for _, n := range []*testNode{a, b, cc} {
+				if err := n.hasContent("photos", "old.jpg", "old photo"); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		c.flush("")
+		for _, n := range []*testNode{a, b, cc} {
+			eventually(t, syncTimeout, "old.jpg expires on "+n.name, func() error { return n.absent("photos", "old.jpg") })
+		}
+		for _, n := range []*testNode{a, b, cc} {
+			if err := n.hasContent("photos", "new.jpg", "new photo"); err != nil {
+				t.Errorf("new.jpg is inside expire and must stay: %v", err)
+			}
+		}
+	})
+
+	t.Run("restart-delete", func(t *testing.T) {
+		a.write("docs", "r1.txt", "one")
+		a.write("docs", "r2.txt", "two")
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "r1, r2 reach "+n.name, func() error {
+				if err := n.hasContent("docs", "r1.txt", "one"); err != nil {
+					return err
+				}
+				return n.hasContent("docs", "r2.txt", "two")
+			})
+		}
+		// Deleted while the node is down.
+		cc.kill()
+		if err := os.Remove(cc.path("docs", "r1.txt")); err != nil {
+			t.Fatal(err)
+		}
+		cc.start()
+		for _, n := range []*testNode{a, b} {
+			eventually(t, syncTimeout, "delete made while down reaches "+n.name, func() error { return n.absent("docs", "r1.txt") })
+		}
+		// Deleted after the restart.
+		if err := os.Remove(cc.path("docs", "r2.txt")); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range []*testNode{a, b} {
+			eventually(t, syncTimeout, "delete after restart reaches "+n.name, func() error { return n.absent("docs", "r2.txt") })
+		}
+	})
+
+	t.Run("folder-leave", func(t *testing.T) {
+		if err := cc.call(node.MethodFolderRm, node.FolderParams{Name: "docs"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, time.Minute, "c leaves docs on the server", func() error {
+			f, err := serverFolder(c, "docs")
+			if err != nil {
+				return err
+			}
+			if slices.Contains(f.Members, cc.key) {
+				return errors.New("c is still a member of docs")
+			}
+			if f.Keep != nil && slices.Contains(f.Keep.Keepers, cc.key) {
+				return errors.New("c is still a keeper of docs")
+			}
+			return nil
+		})
+		// Files stay on disk, and new files stop arriving.
+		if err := cc.hasContent("docs", "hello.txt", "edited on b"); err != nil {
+			t.Errorf("leaving must leave files in place: %v", err)
+		}
+		a.write("docs", "after-leave.txt", "not for c")
+		eventually(t, syncTimeout, "after-leave.txt reaches b", func() error { return b.hasContent("docs", "after-leave.txt", "not for c") })
+		holds(t, 5*time.Second, "after-leave.txt stays off c", func() error { return cc.absent("docs", "after-leave.txt") })
+	})
+
+	step("unkeep", func(t *testing.T) {
+		var res node.UnkeepResult
+		if err := b.call(node.MethodUnkeep, node.FolderParams{Name: "photos"}, &res); err != nil {
+			t.Fatalf("unkeep: %v", err)
+		}
+		if res.Archive == "" {
+			t.Fatal("unkeep reported no archive")
+		}
+		for _, n := range []*testNode{a, b, cc} {
+			eventually(t, time.Minute, "keeper stops on "+n.name, func() error {
+				if _, err := n.keepStatus("photos"); err == nil {
+					return errors.New("still keeping photos")
+				}
+				return nil
+			})
+		}
+		// A file past grace and expire, made durable: nothing keeps it and
+		// nothing expires it.
+		old := time.Now().Add(-time.Hour)
+		a.write("photos", "old2.jpg", "unkept photo")
+		a.setMtime("photos", "old2.jpg", old)
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "old2.jpg reaches "+n.name, func() error { return n.hasContent("photos", "old2.jpg", "unkept photo") })
+		}
+		c.flush("")
+		holds(t, 10*time.Second, "old2.jpg stays and is not kept", func() error {
+			for _, n := range []*testNode{a, b, cc} {
+				if err := n.hasContent("photos", "old2.jpg", "unkept photo"); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if _, err := cc.restore(node.RestoreParams{Folder: "photos", Path: "old2.jpg", To: t.TempDir()}); err == nil {
+			t.Error("old2.jpg was kept after unkeep")
+		}
+		// The archive still restores, including the file that expired.
+		to := t.TempDir()
+		rr, err := cc.restore(node.RestoreParams{Folder: "photos", Path: "old.jpg", To: to})
+		if err != nil {
+			t.Fatalf("restore after unkeep: %v", err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(to, "old.jpg")); string(got) != "old photo" {
+			t.Fatalf("restored old.jpg holds %q (%+v)", got, rr)
+		}
+		// Keeping again continues the same tree.
+		var kr node.KeepResult
+		if err := a.call(node.MethodKeep, node.KeepParams{Folder: "photos", Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: time.Minute}, &kr); err != nil {
+			t.Fatalf("keep again: %v", err)
+		}
+		if kr.Permanode != res.Archive {
+			t.Fatalf("keep again made permanode %s, want the archive %s", kr.Permanode, res.Archive)
+		}
+		eventually(t, time.Minute, "old2.jpg kept after keep again", func() error { return wantState(a, "photos", "old2.jpg", keeper.StateKept) })
+		to = t.TempDir()
+		if _, err := cc.restore(node.RestoreParams{Folder: "photos", Path: "old.jpg", To: to}); err != nil {
+			t.Fatalf("restore old.jpg after keep again: %v", err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(to, "old.jpg")); string(got) != "old photo" {
+			t.Fatalf("old.jpg after keep again holds %q", got)
+		}
+	})
+
+	nodes := func() []*testNode { return []*testNode{a, b, cc} }
+	// conflict makes a real Syncthing conflict on rel in notes: loser edits
+	// while it is down, winner edits later, then loser comes back.
+	conflict := func(t *testing.T, winner, loser *testNode, rel string) {
+		loser.kill()
+		winner.write("notes", rel, "from "+winner.name+"\n")
+		loser.write("notes", rel, "from "+loser.name+"\n")
+		loser.setMtime("notes", rel, time.Now().Add(-time.Minute))
+		loser.start()
+	}
+
+	step("conflict-hook", func(t *testing.T) {
+		addFolder(t, a, "notes", b, cc)
+		keep(t, a, "notes", node.KeepParams{Grace: time.Hour, MaxDefer: 2 * time.Hour})
+		a.write("notes", "f.txt", "base\n")
+		a.setMtime("notes", "f.txt", time.Now().Add(-3*time.Hour))
+		a.write("notes", "fail-g.txt", "gbase\n")
+		a.setMtime("notes", "fail-g.txt", time.Now().Add(-3*time.Hour))
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "notes reach "+n.name, func() error { return n.hasContent("notes", "f.txt", "base\n") })
+		}
+		eventually(t, time.Minute, "base kept", func() error {
+			if err := wantState(a, "notes", "f.txt", keeper.StateKept); err != nil {
+				return err
+			}
+			return wantState(a, "notes", "fail-g.txt", keeper.StateKept)
+		})
+		keepers := folderKeepers(t, c, "notes")
+		var hookN, loser *testNode
+		for _, n := range nodes() {
+			if n.key == keepers[0] {
+				hookN = n
+			} else if loser == nil {
+				loser = n
+			}
+		}
+		t.Logf("hook node %s, conflicting edit from %s", hookN.name, loser.name)
+		conflict(t, hookN, loser, "f.txt")
+
+		for _, n := range nodes() {
+			eventually(t, 2*syncTimeout, "merge reaches "+n.name, func() error {
+				if err := n.hasContent("notes", "f.txt", "from "+hookN.name+"\nfrom "+loser.name+"\n"); err != nil {
+					return err
+				}
+				if cps := copies(n, "notes", "f.sync-conflict-*"); len(cps) > 0 {
+					return fmt.Errorf("conflict copies on %s: %v", n.name, cps)
+				}
+				return nil
+			})
+		}
+		holds(t, 3*time.Second, "hook ran once", func() error { return nil })
+		runs := c.hookRuns("f.txt")
+		if len(runs) == 0 {
+			t.Fatal("the hook never ran for f.txt")
+		}
+		for _, r := range runs {
+			if !strings.HasPrefix(r, hookN.name+" ") {
+				t.Errorf("hook run %q is not on %s (Keepers[0])", r, hookN.name)
+			}
+		}
+		// One conflict makes one copy, so the hook runs once.
+		const ncopies = 1
+		if len(runs) != ncopies {
+			t.Fatalf("hook runs for f.txt: %q, want exactly one", runs)
+		}
+		check := t.Errorf
+		for _, r := range runs {
+			f := strings.Fields(r)
+			if len(f) < 7 {
+				t.Fatalf("hook run %q: malformed", r)
+			}
+			if f[4] != "base=yes" {
+				check("hook run %q: want a base", r)
+			}
+			// The base was kept before both sides diverged and differs
+			// from both, so it is the exact common ancestor.
+			if f[5] != "exact=1" {
+				check("hook run %q: want KEEPSYNC_BASE_EXACT=1", r)
+			}
+			if f[3] != loser.name {
+				check("hook run %q: KEEPSYNC_CONFLICT_NODE is %q, want %q, whose change the copy holds", r, f[3], loser.name)
+			}
+			if b, err := os.ReadFile(filepath.Join(c.root, "hookbase-"+hookN.name+"-"+f[6])); err != nil || string(b) != "base\n" {
+				check("hook run %q: KEEPSYNC_BASE held %q (%v), want the last kept version", r, b, err)
+			}
+		}
+		// Both versions were kept before the merge; the merge itself is
+		// inside grace. The hook deleted the copy, so once the keeper marks
+		// it deleted in sync, restore skips it unless asked.
+		eventually(t, time.Minute, "the copy marked deleted in sync", func() error {
+			res, err := hookN.restore(node.RestoreParams{Folder: "notes", Path: "f.txt", To: t.TempDir()})
+			if err != nil {
+				return err
+			}
+			all, err := hookN.restore(node.RestoreParams{Folder: "notes", To: t.TempDir()})
+			if err != nil {
+				return err
+			}
+			if len(all.Deleted) != ncopies || !strings.HasPrefix(all.Deleted[0], "f.sync-conflict-") {
+				return fmt.Errorf("skipped as deleted: %v (f.txt alone: %v)", all.Deleted, res.Deleted)
+			}
+			return nil
+		})
+		to := t.TempDir()
+		if _, err := hookN.restore(node.RestoreParams{Folder: "notes", To: to, Deleted: true}); err != nil {
+			t.Fatalf("restore notes: %v", err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(to, "f.txt")); string(got) != "from "+hookN.name+"\n" {
+			t.Errorf("kept f.txt holds %q, want the winning version", got)
+		}
+		kc, _ := filepath.Glob(filepath.Join(to, "f.sync-conflict-*"))
+		if len(kc) != ncopies {
+			t.Errorf("kept conflict copies: %v, want %d", kc, ncopies)
+		}
+		for _, p := range kc {
+			if got, _ := os.ReadFile(p); string(got) != "from "+loser.name+"\n" {
+				t.Errorf("kept conflict copy %s holds %q, want the losing version", filepath.Base(p), got)
+			}
+		}
+		for _, n := range nodes() {
+			eventually(t, time.Minute, "no conflicts on "+n.name, func() error {
+				cs, err := n.conflicts()
+				if err != nil {
+					return err
+				}
+				var left []string
+				for _, ci := range cs {
+					if ci.Folder == "notes" && strings.HasPrefix(filepath.Base(ci.Original), "f.") {
+						left = append(left, ci.Path+" "+ci.State)
+					}
+				}
+				if len(left) > 0 {
+					return fmt.Errorf("%v", left)
+				}
+				return nil
+			})
+		}
+
+		// A failing hook leaves the copy for a human.
+		conflict(t, hookN, loser, "fail-g.txt")
+		for _, n := range nodes() {
+			eventually(t, 2*syncTimeout, "fail-g conflict copy reaches "+n.name, func() error {
+				if cps := copies(n, "notes", "fail-g.sync-conflict-*"); len(cps) != 1 {
+					return fmt.Errorf("copies %v", cps)
+				}
+				return nil
+			})
+		}
+		eventually(t, time.Minute, "failed hook shows in conflicts", func() error {
+			cs, err := hookN.conflicts()
+			if err != nil {
+				return err
+			}
+			for _, ci := range cs {
+				if strings.HasPrefix(filepath.Base(ci.Path), "fail-g.sync-conflict-") {
+					if ci.State != node.HookFailed {
+						return fmt.Errorf("state %s", ci.State)
+					}
+					return nil
+				}
+			}
+			return errors.New("not listed")
+		})
+		holds(t, 8*time.Second, "copy stays after the failed hook", func() error {
+			for _, n := range nodes() {
+				if cps := copies(n, "notes", "fail-g.sync-conflict-*"); len(cps) != 1 {
+					return fmt.Errorf("%s: copies %v", n.name, cps)
+				}
+			}
+			return nil
+		})
+		if runs := c.hookRuns("fail-g.txt"); len(runs) != 1 || !strings.HasPrefix(runs[0], hookN.name+" ") {
+			t.Errorf("hook runs for fail-g.txt: %q, want one on %s", runs, hookN.name)
+		}
+		for _, n := range nodes() {
+			if n == hookN {
+				continue
+			}
+			cs, err := n.conflicts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ci := range cs {
+				if strings.HasPrefix(filepath.Base(ci.Path), "fail-g.sync-conflict-") && ci.State != node.HookNotMine {
+					t.Errorf("%s shows %s for the fail-g copy, want %s", n.name, ci.State, node.HookNotMine)
+				}
+			}
+		}
+	})
+
+	step("keep-rules", func(t *testing.T) {
+		const folder = "rules"
+		addFolder(t, a, folder, b, cc)
+		// Expire is long enough that a file inside it can be kept, deleted
+		// and marked before it would be past expire.
+		keep(t, a, folder, node.KeepParams{Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: 90 * time.Second})
+		keepers := folderKeepers(t, c, folder)
+		byKey := map[api.NodeKey]*testNode{a.key: a, b.key: b, cc.key: cc}
+		k0, k1 := byKey[keepers[0]], byKey[keepers[1]]
+		var other *testNode
+		for _, n := range nodes() {
+			if !slices.Contains(keepers, n.key) {
+				other = n
+			}
+		}
+		// k0 reads the archive's attributes through its gateway.
+		if err := c.serverCall(server.MethodGrant, server.GrantParams{Name: k0.name, Scope: registry.ScopeRead}, nil); err != nil {
+			t.Fatal(err)
+		}
+		old := func(d time.Duration) time.Time { return time.Now().Add(-d) }
+		put := func(n *testNode, rel, content string, mtime time.Time) {
+			n.write(folder, rel, content)
+			n.setMtime(folder, rel, mtime)
+		}
+		synced := func(t *testing.T, rel, content string) {
+			t.Helper()
+			for _, n := range nodes() {
+				eventually(t, syncTimeout, rel+" reaches "+n.name, func() error { return n.hasContent(folder, rel, content) })
+			}
+		}
+		kept := func(t *testing.T, rel string) {
+			t.Helper()
+			eventually(t, time.Minute, rel+" kept", func() error { return wantState(k0, folder, rel, keeper.StateKept) })
+		}
+		restored := func(t *testing.T, n *testNode, p node.RestoreParams) (node.RestoreResult, string) {
+			t.Helper()
+			p.Folder = folder
+			p.To = t.TempDir()
+			res, err := n.restore(p)
+			if err != nil {
+				t.Fatalf("restore %+v: %v", p, err)
+			}
+			return res, p.To
+		}
+		keptContent := func(rel string) (string, error) {
+			res, err := k0.restore(node.RestoreParams{Folder: folder, Path: rel, To: t.TempDir(), Deleted: true})
+			if err != nil {
+				return "", err
+			}
+			b, err := os.ReadFile(filepath.Join(res.Dir, rel))
+			return string(b), err
+		}
+		goneMark := func(rel string) (string, error) {
+			a, err := k0.archiveAttrs(folder, rel)
+			if err != nil {
+				return "", err
+			}
+			return attr(a, "keepsyncGone"), nil
+		}
+
+		t.Run("recreate-with-old-mtime", func(t *testing.T) {
+			put(a, "r.txt", "r v1\n", old(time.Hour))
+			synced(t, "r.txt", "r v1\n")
+			kept(t, "r.txt")
+			c.flush("")
+			for _, n := range nodes() {
+				eventually(t, syncTimeout, "r.txt expires on "+n.name, func() error { return n.absent(folder, "r.txt") })
+			}
+			eventually(t, time.Minute, "r.txt marked expired", func() error {
+				g, err := goneMark("r.txt")
+				if err == nil && g != string(api.GoneExpired) {
+					err = fmt.Errorf("gone mark %q", g)
+				}
+				return err
+			})
+			// cp -p from an old copy: other content, an even older mtime.
+			put(other, "r.txt", "r v0 from an old copy\n", old(2*time.Hour))
+			synced(t, "r.txt", "r v0 from an old copy\n")
+			eventually(t, time.Minute, "recreated r.txt kept as a new version", func() error {
+				got, err := keptContent("r.txt")
+				if err != nil {
+					return err
+				}
+				if got != "r v0 from an old copy\n" {
+					return fmt.Errorf("kept content %q", got)
+				}
+				g, err := goneMark("r.txt")
+				if err == nil && g != "" {
+					err = fmt.Errorf("gone mark %q not cleared", g)
+				}
+				return err
+			})
+		})
+
+		t.Run("swap", func(t *testing.T) {
+			put(a, "x.txt", "X\n", old(10*time.Minute))
+			put(a, "y.txt", "Y\n", old(9*time.Minute))
+			synced(t, "x.txt", "X\n")
+			synced(t, "y.txt", "Y\n")
+			kept(t, "x.txt")
+			kept(t, "y.txt")
+			dir := other.dir(folder)
+			for _, mv := range [][2]string{{"x.txt", "swap.tmp"}, {"y.txt", "x.txt"}, {"swap.tmp", "y.txt"}} {
+				if err := os.Rename(filepath.Join(dir, mv[0]), filepath.Join(dir, mv[1])); err != nil {
+					t.Fatal(err)
+				}
+			}
+			synced(t, "x.txt", "Y\n")
+			synced(t, "y.txt", "X\n")
+			eventually(t, time.Minute, "both swapped versions kept", func() error {
+				for rel, want := range map[string]string{"x.txt": "Y\n", "y.txt": "X\n"} {
+					got, err := keptContent(rel)
+					if err != nil {
+						return err
+					}
+					if got != want {
+						return fmt.Errorf("kept %s holds %q, want %q", rel, got, want)
+					}
+				}
+				return nil
+			})
+		})
+
+		t.Run("file-to-directory", func(t *testing.T) {
+			put(a, "notes", "notes as a file\n", old(time.Hour))
+			synced(t, "notes", "notes as a file\n")
+			kept(t, "notes")
+			time.Sleep(time.Second)
+			before := time.Now()
+			time.Sleep(time.Second)
+			if err := os.Remove(a.path(folder, "notes")); err != nil {
+				t.Fatal(err)
+			}
+			put(a, "notes/a.md", "a inside notes\n", old(time.Hour))
+			synced(t, "notes/a.md", "a inside notes\n")
+			kept(t, "notes/a.md")
+			res, to := restored(t, k0, node.RestoreParams{Path: "notes", At: before})
+			fi, err := os.Lstat(filepath.Join(to, "notes"))
+			if err != nil || !fi.Mode().IsRegular() {
+				t.Fatalf("restore --at before the change: notes is %v (%v), want a file; result %+v", fi, err, res)
+			}
+			if got, _ := os.ReadFile(filepath.Join(to, "notes")); string(got) != "notes as a file\n" {
+				t.Errorf("notes as of before the change holds %q", got)
+			}
+			if got, err := keptContent("notes/a.md"); err != nil || got != "a inside notes\n" {
+				t.Errorf("kept notes/a.md: %q, %v", got, err)
+			}
+		})
+
+		t.Run("lagging-node", func(t *testing.T) {
+			put(a, "lag.txt", "lag v1\n", old(time.Hour))
+			synced(t, "lag.txt", "lag v1\n")
+			kept(t, "lag.txt")
+			// k1, a keeper, misses v2 while it is down, so it comes back
+			// holding v1 and must not claim it.
+			editor := k0
+			k1.kill()
+			put(editor, "lag.txt", "lag v2\n", old(30*time.Minute))
+			eventually(t, time.Minute, "v2 kept", func() error {
+				got, err := keptContent("lag.txt")
+				if err == nil && got != "lag v2\n" {
+					err = fmt.Errorf("kept %q", got)
+				}
+				return err
+			})
+			k1.start()
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) || k1.hasContent(folder, "lag.txt", "lag v2\n") != nil {
+				if got, err := keptContent("lag.txt"); err == nil && got != "lag v2\n" {
+					t.Fatalf("lagging %s rolled lag.txt back: kept %q", k1.name, got)
+				}
+				if time.Since(deadline) > syncTimeout {
+					t.Fatalf("%s never caught up on lag.txt", k1.name)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		})
+
+		t.Run("delete-versus-expiry", func(t *testing.T) {
+			// d.txt is inside expire; d-old.txt is past it but not durable
+			// (no flush since it was kept), so nothing can have expired it.
+			put(a, "d.txt", "deleted on purpose\n", old(5*time.Second))
+			put(a, "d-old.txt", "old, deleted on purpose\n", old(time.Hour))
+			put(a, "e.txt", "expires\n", old(time.Hour))
+			for _, rel := range []string{"d.txt", "d-old.txt", "e.txt"} {
+				eventually(t, syncTimeout, rel+" synced", func() error {
+					for _, n := range nodes() {
+						if _, err := os.Stat(n.path(folder, rel)); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				kept(t, rel)
+			}
+			for _, rel := range []string{"d.txt", "d-old.txt"} {
+				if err := os.Remove(other.path(folder, rel)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, n := range nodes() {
+				eventually(t, syncTimeout, "deletes reach "+n.name, func() error {
+					if err := n.absent(folder, "d.txt"); err != nil {
+						return err
+					}
+					return n.absent(folder, "d-old.txt")
+				})
+			}
+			mark := func(rel string) string {
+				var g string
+				eventually(t, time.Minute, rel+" marked gone", func() error {
+					var err error
+					g, err = goneMark(rel)
+					if err == nil && g == "" {
+						err = errors.New("no gone mark")
+					}
+					return err
+				})
+				return g
+			}
+			if g := mark("d.txt"); g != string(api.GoneDeleted) {
+				t.Fatalf("d.txt deleted by hand is marked %q, want %q", g, api.GoneDeleted)
+			}
+			if g := mark("d-old.txt"); g != string(api.GoneDeleted) {
+				t.Errorf("d-old.txt, deleted by hand past the expire window but never durable (so never expired), is marked %q, want %q", g, api.GoneDeleted)
+			}
+			c.flush("")
+			for _, n := range nodes() {
+				eventually(t, syncTimeout, "e.txt expires on "+n.name, func() error { return n.absent(folder, "e.txt") })
+			}
+			res, to := restored(t, other, node.RestoreParams{Path: "d.txt"})
+			if !slices.Contains(res.Deleted, "d.txt") || len(res.Restored) != 0 {
+				t.Errorf("plain restore of a deleted file: %+v, want it skipped as deleted", res)
+			}
+			if _, err := os.Lstat(filepath.Join(to, "d.txt")); err == nil {
+				t.Error("plain restore wrote d.txt")
+			}
+			res, to = restored(t, other, node.RestoreParams{Path: "d.txt", Deleted: true})
+			if got, _ := os.ReadFile(filepath.Join(to, "d.txt")); string(got) != "deleted on purpose\n" {
+				t.Errorf("restore --deleted: d.txt holds %q (%+v)", got, res)
+			}
+			res, to = restored(t, other, node.RestoreParams{Path: "e.txt"})
+			if got, _ := os.ReadFile(filepath.Join(to, "e.txt")); string(got) != "expires\n" {
+				t.Errorf("plain restore of an expired file: %q (%+v)", got, res)
+			}
+		})
+	})
+
+	step("status-usage", func(t *testing.T) {
+		var st server.Status
+		if err := c.serverCall(server.MethodStatus, nil, &st); err != nil {
+			t.Fatal(err)
+		}
+		d := st.Disk
+		t.Logf("server disk: %+v", d)
+		if d.Mode != e2eMode() || d.MeasuredAt.IsZero() || d.Err != "" {
+			t.Errorf("disk usage: mode %q (want %q), measured %v, err %q", d.Mode, e2eMode(), d.MeasuredAt, d.Err)
+		}
+		if d.IndexBytes == 0 || d.VolumeFree == 0 || d.CacheLimitBytes == 0 {
+			t.Errorf("disk usage missing: %+v", d)
+		}
+		if (e2eMode() == config.ModeStore) != (d.BlobsBytes > 0) {
+			t.Errorf("%s mode with %d bytes of local blobs", e2eMode(), d.BlobsBytes)
+		}
+		if d.Bucket.Err != "" || d.Bucket.MeasuredAt.IsZero() || d.Bucket.Bytes == 0 {
+			t.Errorf("bucket usage: %+v", d.Bucket)
+		}
+		if e2eMode() == config.ModeCache {
+			if _, err := os.Stat(filepath.Join(c.srvCfg.PerkeepDir(), "blobs", "packed")); err == nil {
+				t.Error("cache mode created a local blob store")
+			}
+		}
+		// Any member sees a short summary in its own status.
+		eventually(t, time.Minute, "server summary on a node", func() error {
+			ns, err := a.status()
+			if err != nil {
+				return err
+			}
+			s := ns.ServerSummary
+			if s == nil {
+				return fmt.Errorf("no summary: %s", ns.SummaryErr)
+			}
+			if s.Mode != e2eMode() || s.Nodes != 3 || s.Online == 0 || s.LastFlush.IsZero() || s.IndexBytes == 0 {
+				return fmt.Errorf("summary %+v", *s)
+			}
+			return nil
+		})
+	})
+
+	step("zerofs-restart", func(t *testing.T) {
+		// Kill the server's zerofs mid-run: the supervisor restarts it
+		// and reconnects, and keeping and flushing carry on.
+		cfgPath := filepath.Join(c.srvCfg.ZeroFSDir(), "zerofs.toml")
+		pidOf := func() string {
+			out, _ := exec.Command("pgrep", "-f", "run --config "+cfgPath).Output()
+			return strings.TrimSpace(string(out))
+		}
+		// A file kept since the last flush: its blobs are only in
+		// zerofs's memory, so the kill loses them. Store mode copies them
+		// back from local disk; in cache mode the server puts back the
+		// claims it signed, and the keeper puts the file again since the
+		// server doesn't report it durable. recover-drill checks the
+		// bucket has it.
+		a.write("docs", "before-kill.txt", "kept just before zerofs was killed")
+		eventually(t, time.Minute, "before-kill.txt kept", func() error { return wantState(a, "docs", "before-kill.txt", keeper.StateKept) })
+		pid := pidOf()
+		if pid == "" || strings.Contains(pid, "\n") {
+			t.Fatalf("zerofs pid %q", pid)
+		}
+		if err := exec.Command("kill", "-9", pid).Run(); err != nil {
+			t.Fatal(err)
+		}
+		killed := time.Now()
+		eventually(t, 2*time.Minute, "zerofs back up", func() error {
+			var st server.Status
+			if err := c.serverCall(server.MethodStatus, nil, &st); err != nil {
+				return err
+			}
+			if st.ZeroFS.State != zerofs.HealthUp || st.ZeroFS.Since.Before(killed) {
+				return fmt.Errorf("zerofs %+v", st.ZeroFS)
+			}
+			if p := pidOf(); p == "" || p == pid {
+				return fmt.Errorf("zerofs pid %q (was %s)", p, pid)
+			}
+			return nil
+		})
+		t.Logf("zerofs back %v after SIGKILL", time.Since(killed).Round(time.Millisecond))
+		a.write("docs", "after-restart.txt", "written after zerofs restarted")
+		eventually(t, time.Minute, "after-restart.txt kept", func() error { return wantState(a, "docs", "after-restart.txt", keeper.StateKept) })
+		// The baseline reads every kept file back, so it passes once
+		// before-kill.txt's content is on the server again.
+		eventually(t, time.Minute, "baseline after the restart", func() error {
+			return c.serverCall(server.MethodBaseline, server.BaselineParams{Path: filepath.Join(c.root, "baseline-flush.json")}, nil)
+		})
+		eventually(t, time.Minute, "node summary says zerofs up", func() error {
+			ns, err := a.status()
+			if err != nil {
+				return err
+			}
+			if s := ns.ServerSummary; s == nil || s.ZeroFS != zerofs.HealthUp || s.FlushErr != "" {
+				return fmt.Errorf("summary %+v (%s)", s, ns.SummaryErr)
+			}
+			return nil
+		})
+	})
+
+	step("recover-drill", func(t *testing.T) {
+		work := filepath.Join(c.root, "drill")
+		if err := os.MkdirAll(work, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		cli := buildCLI(t, work)
+		kitPath := filepath.Join(work, kit.FileName)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		pass, err := kit.Write(ctx, c.srvCfg, kitPath, c.srv.Addr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Baseline after a drain and flush, then copy the bucket.
+		base := filepath.Join(work, "baseline.json")
+		c.flush(base)
+		c.minio.MakeBucket(t, "drill")
+		n := c.minio.CopyBucket(t, c.bucket, "drill", c.prefix+"/")
+		t.Logf("copied %d objects to the drill bucket", n)
+
+		cmd := exec.CommandContext(ctx, cli, "recover", kitPath, "--drill",
+			"--bucket", "s3://drill/"+c.prefix, "--baseline", base)
+		cmd.Env = append(os.Environ(), "KEEPSYNC_KIT_PASSPHRASE="+pass, "KEEPSYNC_DIR="+filepath.Join(work, "home"))
+		out, err := cmd.CombinedOutput()
+		t.Logf("keepsync recover --drill:\n%s", trimLines(string(out), 40))
+		if err != nil {
+			t.Fatalf("drill failed: %v", err)
+		}
+		if !strings.Contains(string(out), "PASS") {
+			t.Fatal("drill report has no PASS")
+		}
+		// The drill must refuse the live bucket.
+		cmd = exec.CommandContext(ctx, cli, "recover", kitPath, "--drill", "--bucket", c.storage().URL)
+		cmd.Env = append(os.Environ(), "KEEPSYNC_KIT_PASSPHRASE="+pass, "KEEPSYNC_DIR="+filepath.Join(work, "home"))
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "live bucket") {
+			t.Errorf("drill against the live bucket: err=%v\n%s", err, out)
+		}
+	})
+
+	t.Run("keeper-reassignment", func(t *testing.T) {
+		before := folderKeepers(t, c, "photos")
+		if len(before) != 2 {
+			t.Fatalf("photos has keepers %v, want two", before)
+		}
+		var dead *testNode
+		for _, n := range []*testNode{a, b, cc} {
+			if n.key == before[0] {
+				dead = n
+			}
+		}
+		var spare *testNode
+		for _, n := range []*testNode{a, b, cc} {
+			if !slices.Contains(before, n.key) {
+				spare = n
+			}
+		}
+		if dead == nil || spare == nil {
+			t.Fatalf("keepers %v are not two of the three nodes", before)
+		}
+		t.Logf("killing keeper %s; expecting %s to take over", dead.name, spare.name)
+		dead.kill()
+		// registry.DefaultKeeperTimeout, plus the time to notice the drop.
+		eventually(t, registry.DefaultKeeperTimeout+90*time.Second, "keeper reassigned", func() error {
+			k := folderKeepers(t, c, "photos")
+			if slices.Contains(k, dead.key) || !slices.Contains(k, spare.key) || len(k) != 2 {
+				return fmt.Errorf("keepers %v", k)
+			}
+			return nil
+		})
+		// The new keeper keeps.
+		spare.write("photos", "after-reassign.jpg", "x")
+		eventually(t, time.Minute, "new keeper keeps", func() error {
+			return wantState(spare, "photos", "after-reassign.jpg", keeper.StateKept)
+		})
+	})
+}
+
+// addFolder creates folder on owner and joins it on the others.
+func addFolder(t *testing.T, owner *testNode, folder string, others ...*testNode) {
+	t.Helper()
+	if err := owner.call(node.MethodFolderAdd, node.FolderParams{Name: folder, Path: owner.dir(folder)}, nil); err != nil {
+		t.Fatalf("folder add %s on %s: %v", folder, owner.name, err)
+	}
+	for _, n := range others {
+		if err := n.call(node.MethodFolderJoin, node.FolderParams{Name: folder, Path: n.dir(folder)}, nil); err != nil {
+			t.Fatalf("folder join %s on %s: %v", folder, n.name, err)
+		}
+	}
+	eventually(t, time.Minute, folder+" has every member", func() error {
+		f, err := serverFolder(owner.c, folder)
+		if err != nil {
+			return err
+		}
+		if len(f.Members) != 1+len(others) {
+			return fmt.Errorf("members %v", f.Members)
+		}
+		return nil
+	})
+}
+
+func keep(t *testing.T, n *testNode, folder string, p node.KeepParams) {
+	t.Helper()
+	p.Folder = folder
+	var res node.KeepResult
+	if err := n.call(node.MethodKeep, p, &res); err != nil {
+		t.Fatalf("keep %s: %v", folder, err)
+	}
+	if res.Permanode == "" {
+		t.Fatalf("keep %s: no permanode", folder)
+	}
+	eventually(t, time.Minute, folder+" keeper running on "+n.name, func() error {
+		_, err := n.keepStatus(folder)
+		return err
+	})
+}
+
+func serverFolder(c *cluster, name string) (api.Folder, error) {
+	var st server.Status
+	if err := c.serverCall(server.MethodStatus, nil, &st); err != nil {
+		return api.Folder{}, err
+	}
+	for _, f := range st.Folders {
+		if f.Name == name {
+			return f, nil
+		}
+	}
+	return api.Folder{}, fmt.Errorf("no folder %s on the server", name)
+}
+
+func folderKeepers(t *testing.T, c *cluster, name string) []api.NodeKey {
+	t.Helper()
+	f, err := serverFolder(c, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Keep == nil {
+		t.Fatalf("%s is not kept", name)
+	}
+	return f.Keep.Keepers
+}
+
+func fileState(ks node.KeepStatus, rel string) (keeper.FileStatus, bool) {
+	for _, f := range ks.Status.Files {
+		if filepath.ToSlash(f.Path) == rel {
+			return f, true
+		}
+	}
+	return keeper.FileStatus{}, false
+}
+
+func wantState(n *testNode, folder, rel string, want keeper.State) error {
+	ks, err := n.keepStatus(folder)
+	if err != nil {
+		return err
+	}
+	f, ok := fileState(ks, rel)
+	if !ok {
+		return fmt.Errorf("%s not in %s's keep status", rel, n.name)
+	}
+	if f.State != want {
+		return fmt.Errorf("%s on %s is %s, want %s", rel, n.name, f.State, want)
+	}
+	return nil
+}
+
+// copies lists conflict copies matching pattern in folder's top level.
+func copies(n *testNode, folder, pattern string) []string {
+	m, _ := filepath.Glob(filepath.Join(n.dir(folder), pattern))
+	return m
+}
