@@ -48,9 +48,14 @@ type Config struct {
 type ServerSummary struct {
 	Mode      string    `json:"mode"`
 	LastFlush time.Time `json:"lastFlush,omitzero"`
-	FlushErr  string    `json:"flushErr,omitempty"`
-	Nodes     int       `json:"nodes"`
-	Online    int       `json:"online"`
+	// ZeroFS is the supervisor's state ("up", "reconnecting" or "down"),
+	// since when, and, when not up, what is wrong.
+	ZeroFS      string    `json:"zerofs,omitempty"`
+	ZeroFSSince time.Time `json:"zerofsSince,omitzero"`
+	ZeroFSErr   string    `json:"zerofsErr,omitempty"`
+	FlushErr    string    `json:"flushErr,omitempty"`
+	Nodes       int       `json:"nodes"`
+	Online      int       `json:"online"`
 	// Local disk, in bytes: the local blob store (store mode only), the
 	// index, ZeroFS's cache and its limit, and the volume's free space.
 	BlobsBytes      int64  `json:"blobsBytes"`

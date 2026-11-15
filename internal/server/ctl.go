@@ -10,6 +10,7 @@ import (
 	"github.com/progrium/keepsync/internal/ctl"
 	"github.com/progrium/keepsync/internal/kit"
 	"github.com/progrium/keepsync/internal/registry"
+	"github.com/progrium/keepsync/internal/zerofs"
 )
 
 // Control socket methods. The CLI calls these by name.
@@ -48,6 +49,7 @@ type Status struct {
 	LastFlush time.Time           `json:"lastFlush,omitzero"`
 	FlushErr  string              `json:"flushErr,omitempty"`
 	ZeroFSDir string              `json:"zerofsDir"`
+	ZeroFS    zerofs.Health       `json:"zerofs"`
 	Disk      DiskUsage           `json:"disk"`
 }
 
@@ -96,6 +98,7 @@ func (s *Server) handlers() {
 		}
 		s.mu.Unlock()
 		st.Disk = s.usage.get()
+		st.ZeroFS = s.zfs.Health()
 		return st, nil
 	})
 }

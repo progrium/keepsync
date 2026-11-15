@@ -183,6 +183,7 @@ func (e *env) serverStatus(args []string) error {
 		return err
 	}
 	fmt.Fprintf(e.stdout, "address: %s\nkey:     %s\n", st.Addr, st.Key)
+	fmt.Fprintf(e.stdout, "zerofs:  %s\n", zerofsLine(st.ZeroFS.State, st.ZeroFS.Since, st.ZeroFS.Error()))
 	if st.FlushErr != "" {
 		fmt.Fprintf(e.stdout, "flush:   FAILING: %s\n", st.FlushErr)
 	} else if !st.LastFlush.IsZero() {

@@ -198,12 +198,18 @@ func Run(ctx context.Context, cfg *config.Server, o Options) (err error) {
 
 	t := time.NewTicker(cfg.Flush())
 	defer t.Stop()
+	// The supervisor restarts and reconnects zerofs on its own. If it gives
+	// up, the server stays up (sync, the registry and status still work)
+	// and reports zerofs down until it is restarted.
+	gaveUp := s.zfs.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-s.zfs.Done():
-			return errors.New("server: zerofs exited")
+		case <-gaveUp:
+			gaveUp = nil
+			s.logf("server: %s", s.zfs.Health().Error())
+			s.flush(ctx) // records the failure for status
 		case <-t.C:
 			s.flush(ctx)
 		}
@@ -391,5 +397,7 @@ func (s *Server) summary(context.Context) (registry.ServerSummary, error) {
 		sum.FlushErr = s.flushErr.Error()
 	}
 	s.mu.Unlock()
+	h := s.zfs.Health()
+	sum.ZeroFS, sum.ZeroFSSince, sum.ZeroFSErr = h.State, h.Since, h.Error()
 	return sum, nil
 }

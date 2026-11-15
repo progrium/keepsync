@@ -7,6 +7,7 @@ import (
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/registry"
 	"github.com/progrium/keepsync/internal/server"
+	"github.com/progrium/keepsync/internal/zerofs"
 )
 
 // humanBytes prints n in decimal units, as disks and buckets are sold.
@@ -58,6 +59,24 @@ func localLine(mode string, blobs, index, cache, cacheLimit int64) string {
 	return fmt.Sprintf("blobs %s, index %s, cache %s", humanBytes(blobs), humanBytes(index), humanBytes(cache))
 }
 
+// zerofsLine describes the zerofs supervisor's health.
+func zerofsLine(state string, since time.Time, errText string) string {
+	switch state {
+	case zerofs.HealthUp:
+		if since.IsZero() {
+			return "up"
+		}
+		return "up since " + since.Format("2006-01-02 15:04:05")
+	case zerofs.HealthReconnecting:
+		return "RECONNECTING: " + errText
+	case zerofs.HealthDown:
+		return "DOWN: " + errText
+	case "":
+		return "unknown"
+	}
+	return state
+}
+
 // printServerSummary prints the server lines of a node's status.
 func printServerSummary(e *env, s *registry.ServerSummary, errText string) {
 	if s == nil {
@@ -67,10 +86,18 @@ func printServerSummary(e *env, s *registry.ServerSummary, errText string) {
 		return
 	}
 	health := "healthy"
-	if s.FlushErr != "" {
+	switch {
+	case s.ZeroFS == zerofs.HealthDown:
+		health = "DOWN (zerofs is gone and the server needs a restart; nothing new becomes durable)"
+	case s.ZeroFS == zerofs.HealthReconnecting:
+		health = "DEGRADED (reconnecting to zerofs; nothing new becomes durable meanwhile)"
+	case s.FlushErr != "":
 		health = "DEGRADED (flushes failing, so nothing new becomes durable)"
 	}
 	fmt.Fprintf(e.stdout, "  %s, %s mode, %d of %d nodes online\n", health, s.Mode, s.Online, s.Nodes)
+	if s.ZeroFS != "" && s.ZeroFS != zerofs.HealthUp {
+		fmt.Fprintf(e.stdout, "  zerofs: %s\n", zerofsLine(s.ZeroFS, s.ZeroFSSince, s.ZeroFSErr))
+	}
 	fmt.Fprintf(e.stdout, "  flush:  %s\n", flushLine(s.LastFlush, s.FlushErr))
 	fmt.Fprintf(e.stdout, "  disk:   %s, %s free\n", localLine(s.Mode, s.BlobsBytes, s.IndexBytes, s.CacheBytes, s.CacheLimitBytes), humanBytes(s.VolumeFree))
 	fmt.Fprintf(e.stdout, "  bucket: %s\n", bucketLine(s.BucketBytes, s.BucketAt, s.BucketErr))
