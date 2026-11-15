@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/ctl"
+	"github.com/progrium/keepsync/internal/kit"
 	"github.com/progrium/keepsync/internal/pkserver"
 	"github.com/progrium/keepsync/internal/registry"
 	"github.com/progrium/keepsync/internal/tcnet"
@@ -249,8 +251,16 @@ func (s *Server) start(ctx context.Context) error {
 		return fmt.Errorf("server: perkeep: %w", err)
 	}
 
+	store := &FileStore{
+		Path:   cfg.RegistryPath(),
+		Mirror: filepath.Join(zfs.Dir(), kit.BucketRegistryPath),
+		Logf:   s.logf,
+	}
+	if err := store.SyncMirror(); err != nil {
+		s.logf("registry: mirror to %s: %v", store.Mirror, err)
+	}
 	if s.reg, err = registry.NewServer(ctx, registry.Config{
-		Store:      &FileStore{Path: cfg.RegistryPath()},
+		Store:      store,
 		Signer:     s.pk,
 		Durability: s.pk,
 		Transport:  s.tr,
