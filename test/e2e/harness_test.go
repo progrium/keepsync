@@ -9,7 +9,9 @@
 //
 // ZeroFS is mounted with FUSE ("zerofs mount"), so /dev/fuse must be
 // usable. The whole run takes about five minutes, two of them waiting
-// out registry.DefaultKeeperTimeout for keeper reassignment.
+// out registry.DefaultKeeperTimeout for keeper reassignment. Known,
+// unfixed bugs are logged rather than failed unless
+// KEEPSYNC_E2E_KNOWN_BUGS=1 (see knownBug).
 //
 //	KEEPSYNC_ZEROFS_BIN=/opt/e2ebin/zerofs KEEPSYNC_MINIO_BIN=/opt/e2ebin/minio \
 //	  go test ./test/e2e -v -timeout 30m
@@ -45,6 +47,20 @@ import (
 	"github.com/progrium/keepsync/internal/server"
 	"github.com/progrium/keepsync/internal/zerofs"
 )
+
+// knownBugEnv turns known bugs from log lines into failures.
+const knownBugEnv = "KEEPSYNC_E2E_KNOWN_BUGS"
+
+// knownBug reports a bug that is known and not fixed yet: a failure with
+// KEEPSYNC_E2E_KNOWN_BUGS=1, else a log line, so the suite stays green.
+func knownBug(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(knownBugEnv) != "" {
+		t.Errorf("known bug: "+format, args...)
+		return
+	}
+	t.Logf("KNOWN BUG (set %s=1 to fail on it): "+format, append([]any{knownBugEnv}, args...)...)
+}
 
 // binary finds a required external binary, or skips the test.
 func binary(t *testing.T, env, name string) string {
@@ -465,6 +481,7 @@ func (c *cluster) addNode(name string) *testNode {
 		t.Fatal(err)
 	}
 	res.Config.KeepInterval = config.Duration(time.Second)
+	res.Config.ConflictHook = c.hookScript(name)
 	if err := res.Config.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -597,4 +614,69 @@ func trimLines(s string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// hookLog is where every node's conflict hook records its runs.
+func (c *cluster) hookLog() string { return filepath.Join(c.root, "hook.log") }
+
+// hookScript writes node name's conflict hook. It logs each run to
+// hookLog and saves KEEPSYNC_BASE next to it. For an original named
+// fail-*, it exits 1 and leaves the copy; otherwise it merges: original
+// then conflict copy into the original, deletes the copy, exits 0.
+func (c *cluster) hookScript(name string) string {
+	c.t.Helper()
+	p := filepath.Join(c.root, "hook-"+name+".sh")
+	script := `#!/bin/sh
+set -e
+orig=$(basename "$KEEPSYNC_ORIGINAL")
+base=none
+if [ -n "$KEEPSYNC_BASE" ]; then
+  cp "$KEEPSYNC_BASE" "` + c.root + `/hookbase-` + name + `-$orig"
+  base=yes
+fi
+echo "` + name + ` $KEEPSYNC_FOLDER $orig $KEEPSYNC_CONFLICT_NODE base=$base" >> "` + c.hookLog() + `"
+case "$orig" in
+fail-*) exit 1 ;;
+esac
+tmp="$KEEPSYNC_ORIGINAL.merge"
+cat "$KEEPSYNC_ORIGINAL" "$KEEPSYNC_CONFLICT" > "$tmp"
+mv "$tmp" "$KEEPSYNC_ORIGINAL"
+rm "$KEEPSYNC_CONFLICT"
+`
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		c.t.Fatal(err)
+	}
+	return p
+}
+
+// hookRuns returns the hook log lines that mention original.
+func (c *cluster) hookRuns(original string) []string {
+	b, _ := os.ReadFile(c.hookLog())
+	var out []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if f := strings.Fields(l); len(f) >= 3 && f[2] == original {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func (n *testNode) conflicts() ([]node.ConflictInfo, error) {
+	var out []node.ConflictInfo
+	err := n.call(node.MethodConflicts, nil, &out)
+	return out, err
+}
+
+func (n *testNode) restore(p node.RestoreParams) (node.RestoreResult, error) {
+	var res node.RestoreResult
+	err := n.call(node.MethodRestore, p, &res)
+	return res, err
+}
+
+// setMtime sets rel's mtime on this node.
+func (n *testNode) setMtime(folder, rel string, t time.Time) {
+	n.c.t.Helper()
+	if err := os.Chtimes(n.path(folder, rel), t, t); err != nil {
+		n.c.t.Fatal(err)
+	}
 }

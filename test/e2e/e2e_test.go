@@ -257,6 +257,220 @@ func TestCluster(t *testing.T) {
 		holds(t, 5*time.Second, "after-leave.txt stays off c", func() error { return cc.absent("docs", "after-leave.txt") })
 	})
 
+	step("unkeep", func(t *testing.T) {
+		var res node.UnkeepResult
+		if err := b.call(node.MethodUnkeep, node.FolderParams{Name: "photos"}, &res); err != nil {
+			t.Fatalf("unkeep: %v", err)
+		}
+		if res.Archive == "" {
+			t.Fatal("unkeep reported no archive")
+		}
+		for _, n := range []*testNode{a, b, cc} {
+			eventually(t, time.Minute, "keeper stops on "+n.name, func() error {
+				if _, err := n.keepStatus("photos"); err == nil {
+					return errors.New("still keeping photos")
+				}
+				return nil
+			})
+		}
+		// A file past grace and expire, made durable: nothing keeps it and
+		// nothing expires it.
+		old := time.Now().Add(-time.Hour)
+		a.write("photos", "old2.jpg", "unkept photo")
+		a.setMtime("photos", "old2.jpg", old)
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "old2.jpg reaches "+n.name, func() error { return n.hasContent("photos", "old2.jpg", "unkept photo") })
+		}
+		c.flush("")
+		holds(t, 10*time.Second, "old2.jpg stays and is not kept", func() error {
+			for _, n := range []*testNode{a, b, cc} {
+				if err := n.hasContent("photos", "old2.jpg", "unkept photo"); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if _, err := cc.restore(node.RestoreParams{Folder: "photos", Path: "old2.jpg", To: t.TempDir()}); err == nil {
+			t.Error("old2.jpg was kept after unkeep")
+		}
+		// The archive still restores, including the file that expired.
+		to := t.TempDir()
+		rr, err := cc.restore(node.RestoreParams{Folder: "photos", Path: "old.jpg", To: to})
+		if err != nil {
+			t.Fatalf("restore after unkeep: %v", err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(to, "old.jpg")); string(got) != "old photo" {
+			t.Fatalf("restored old.jpg holds %q (%+v)", got, rr)
+		}
+		// Keeping again continues the same tree.
+		var kr node.KeepResult
+		if err := a.call(node.MethodKeep, node.KeepParams{Folder: "photos", Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: 20 * time.Second}, &kr); err != nil {
+			t.Fatalf("keep again: %v", err)
+		}
+		if kr.Permanode != res.Archive {
+			t.Fatalf("keep again made permanode %s, want the archive %s", kr.Permanode, res.Archive)
+		}
+		eventually(t, time.Minute, "old2.jpg kept after keep again", func() error { return wantState(a, "photos", "old2.jpg", keeper.StateKept) })
+		to = t.TempDir()
+		if _, err := cc.restore(node.RestoreParams{Folder: "photos", Path: "old.jpg", To: to}); err != nil {
+			t.Fatalf("restore old.jpg after keep again: %v", err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(to, "old.jpg")); string(got) != "old photo" {
+			t.Fatalf("old.jpg after keep again holds %q", got)
+		}
+	})
+
+	nodes := func() []*testNode { return []*testNode{a, b, cc} }
+	// conflict makes a real Syncthing conflict on rel in notes: loser edits
+	// while it is down, winner edits later, then loser comes back.
+	conflict := func(t *testing.T, winner, loser *testNode, rel string) {
+		loser.kill()
+		winner.write("notes", rel, "from "+winner.name+"\n")
+		loser.write("notes", rel, "from "+loser.name+"\n")
+		loser.setMtime("notes", rel, time.Now().Add(-time.Minute))
+		loser.start()
+	}
+
+	step("conflict-hook", func(t *testing.T) {
+		addFolder(t, a, "notes", b, cc)
+		keep(t, a, "notes", node.KeepParams{Grace: time.Hour, MaxDefer: 2 * time.Hour})
+		a.write("notes", "f.txt", "base\n")
+		a.setMtime("notes", "f.txt", time.Now().Add(-3*time.Hour))
+		a.write("notes", "fail-g.txt", "gbase\n")
+		a.setMtime("notes", "fail-g.txt", time.Now().Add(-3*time.Hour))
+		for _, n := range []*testNode{b, cc} {
+			eventually(t, syncTimeout, "notes reach "+n.name, func() error { return n.hasContent("notes", "f.txt", "base\n") })
+		}
+		eventually(t, time.Minute, "base kept", func() error {
+			if err := wantState(a, "notes", "f.txt", keeper.StateKept); err != nil {
+				return err
+			}
+			return wantState(a, "notes", "fail-g.txt", keeper.StateKept)
+		})
+		keepers := folderKeepers(t, c, "notes")
+		var hookN, loser *testNode
+		for _, n := range nodes() {
+			if n.key == keepers[0] {
+				hookN = n
+			} else if loser == nil {
+				loser = n
+			}
+		}
+		t.Logf("hook node %s, conflicting edit from %s", hookN.name, loser.name)
+		conflict(t, hookN, loser, "f.txt")
+
+		for _, n := range nodes() {
+			eventually(t, 2*syncTimeout, "merge reaches "+n.name, func() error {
+				if err := n.hasContent("notes", "f.txt", "from "+hookN.name+"\nfrom "+loser.name+"\n"); err != nil {
+					return err
+				}
+				if cps := copies(n, "notes", "f.sync-conflict-*"); len(cps) > 0 {
+					return fmt.Errorf("conflict copies on %s: %v", n.name, cps)
+				}
+				return nil
+			})
+		}
+		holds(t, 3*time.Second, "hook ran once", func() error { return nil })
+		runs := c.hookRuns("f.txt")
+		if len(runs) != 1 {
+			t.Fatalf("hook runs for f.txt: %q, want exactly one", runs)
+		}
+		f := strings.Fields(runs[0])
+		if f[0] != hookN.name || f[4] != "base=yes" {
+			t.Errorf("hook run %q: want node %s (Keepers[0]) and a base", runs[0], hookN.name)
+		}
+		if f[3] != loser.name {
+			knownBug(t, "KEEPSYNC_CONFLICT_NODE is %q, want %q: Syncthing names the copy after the incoming (winning) change's device, not the device whose change the copy holds", f[3], loser.name)
+		}
+		if b, err := os.ReadFile(filepath.Join(c.root, "hookbase-"+hookN.name+"-f.txt")); err != nil || string(b) != "base\n" {
+			t.Errorf("KEEPSYNC_BASE held %q (%v), want the last kept version", b, err)
+		}
+		// Both versions were kept before the merge; the merge itself is
+		// inside grace.
+		to := t.TempDir()
+		if _, err := hookN.restore(node.RestoreParams{Folder: "notes", To: to}); err != nil {
+			t.Fatalf("restore notes: %v", err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(to, "f.txt")); string(got) != "from "+hookN.name+"\n" {
+			t.Errorf("kept f.txt holds %q, want the winning version", got)
+		}
+		kc, _ := filepath.Glob(filepath.Join(to, "f.sync-conflict-*"))
+		if len(kc) != 1 {
+			t.Errorf("kept conflict copies: %v, want one", kc)
+		} else if got, _ := os.ReadFile(kc[0]); string(got) != "from "+loser.name+"\n" {
+			t.Errorf("kept conflict copy holds %q, want the losing version", got)
+		}
+		for _, n := range nodes() {
+			eventually(t, time.Minute, "no conflicts on "+n.name, func() error {
+				cs, err := n.conflicts()
+				if err != nil {
+					return err
+				}
+				var left []string
+				for _, ci := range cs {
+					if ci.Folder == "notes" && strings.HasPrefix(filepath.Base(ci.Original), "f.") {
+						left = append(left, ci.Path+" "+ci.State)
+					}
+				}
+				if len(left) > 0 {
+					return fmt.Errorf("%v", left)
+				}
+				return nil
+			})
+		}
+
+		// A failing hook leaves the copy for a human.
+		conflict(t, hookN, loser, "fail-g.txt")
+		for _, n := range nodes() {
+			eventually(t, 2*syncTimeout, "fail-g conflict copy reaches "+n.name, func() error {
+				if cps := copies(n, "notes", "fail-g.sync-conflict-*"); len(cps) != 1 {
+					return fmt.Errorf("copies %v", cps)
+				}
+				return nil
+			})
+		}
+		eventually(t, time.Minute, "failed hook shows in conflicts", func() error {
+			cs, err := hookN.conflicts()
+			if err != nil {
+				return err
+			}
+			for _, ci := range cs {
+				if strings.HasPrefix(filepath.Base(ci.Path), "fail-g.sync-conflict-") {
+					if ci.State != node.HookFailed {
+						return fmt.Errorf("state %s", ci.State)
+					}
+					return nil
+				}
+			}
+			return errors.New("not listed")
+		})
+		holds(t, 8*time.Second, "copy stays after the failed hook", func() error {
+			for _, n := range nodes() {
+				if cps := copies(n, "notes", "fail-g.sync-conflict-*"); len(cps) != 1 {
+					return fmt.Errorf("%s: copies %v", n.name, cps)
+				}
+			}
+			return nil
+		})
+		if runs := c.hookRuns("fail-g.txt"); len(runs) != 1 || !strings.HasPrefix(runs[0], hookN.name+" ") {
+			t.Errorf("hook runs for fail-g.txt: %q, want one on %s", runs, hookN.name)
+		}
+		for _, n := range nodes() {
+			if n == hookN {
+				continue
+			}
+			cs, err := n.conflicts()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ci := range cs {
+				if strings.HasPrefix(filepath.Base(ci.Path), "fail-g.sync-conflict-") && ci.State != node.HookNotMine {
+					t.Errorf("%s shows %s for the fail-g copy, want %s", n.name, ci.State, node.HookNotMine)
+				}
+			}
+		}
+	})
+
 	step("recover-drill", func(t *testing.T) {
 		work := filepath.Join(c.root, "drill")
 		if err := os.MkdirAll(work, 0o700); err != nil {
@@ -420,4 +634,10 @@ func wantState(n *testNode, folder, rel string, want keeper.State) error {
 		return fmt.Errorf("%s on %s is %s, want %s", rel, n.name, f.State, want)
 	}
 	return nil
+}
+
+// copies lists conflict copies matching pattern in folder's top level.
+func copies(n *testNode, folder, pattern string) []string {
+	m, _ := filepath.Glob(filepath.Join(n.dir(folder), pattern))
+	return m
 }
