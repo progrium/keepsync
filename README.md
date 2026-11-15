@@ -4,7 +4,7 @@ keepsync keeps a set of folders synced across your machines and archives them pe
 
 A synced folder can hold just recent files (say the last 30 days) while the archive keeps every version forever. Files only leave sync once they are safely in the bucket, and you can restore any of them, as they are now or as they were at an earlier time.
 
-For how it works in detail, see the [spec](docs/design.md).
+For an overview of the pieces and why they were chosen, see the [architecture](docs/architecture.md). For how it works in detail, see the [spec](docs/design.md).
 
 ## Getting started
 
