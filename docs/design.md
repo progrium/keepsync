@@ -174,6 +174,26 @@ Syncthing is embedded as a library, with folder membership driven by the registr
 3. Index check: compare permanode counts and a few searches.
 4. Record restore time and bucket operation counts.
 
+## Perkeep gateway
+
+Every node can expose the server's Perkeep on localhost, so stock Perkeep tools (web UI, `pk`, `pk-get`, `pk-mount`, the search API) work against the archive with no extra ports or DNS. Phase 1 is read-only. Signed writes come in phase 2.
+
+**How it works.** `node run` listens on `127.0.0.1:3179` (`gateway.listen` in node.toml, empty to disable) and proxies HTTP to the server's perkeepd over tailcat on `api.PortPerkeep`, reusing the tcnet round tripper. It binds to localhost only.
+
+**Local auth.** The gateway requires a random per-node token (Perkeep userpass auth). `keepsync gateway config` writes a Perkeep client config pointing at the gateway with that token, so stock tools work without flags.
+
+**Access scopes.** The server grants each node a scope, and pkserver enforces it on every tunnelled connection, extending the per-connection grant it already applies to nodes.
+
+| Scope | Allows | How it is granted |
+| --- | --- | --- |
+| `blobs` | Upload and fetch blobs (what the keeper needs) | Every node, by default |
+| `read` | `blobs` plus search, web UI, `pk-get`, `pk-mount` | `keepsync server grant <name> read` |
+| `write` (phase 2) | `read` plus signed claims through the server's signer | `keepsync server grant <name> write` |
+
+**Phase 2 writes.** The server keeps the only identity. Web UI edits already sign through the server's signing handler, so `write` scope just opens that handler. CLI tools such as `pk put` sign locally with their own key, and Perkeep does not honour a second signer's claims on the server's permanodes by default. Phase 2 therefore either proxies CLI signing to the server through the gateway, or has the server trust a second signer. One identity is preferred; this is an open question.
+
+**Limits.** No scope can delete blobs. Purge stays a server-side admin step.
+
 ## CLI reference
 
 `init` and `run` commands work standalone. Every other command talks to the local running process over a control socket.
@@ -198,6 +218,8 @@ Syncthing is embedded as a library, with folder membership driven by the registr
 | `restore <folder> <path> [--at <time>]` | Node | Pulls files back out of Perkeep, including expired ones. |
 | `conflicts` / `conflicts resolve <path>` | Node | Lists conflicts, or reruns the hook. |
 | `recover <kit> [--drill --bucket <copy>]` | Any | Rebuilds the server from the bucket, or runs the drill. |
+| `server grant <name> <blobs\|read\|write>` | Server | Sets a node's Perkeep gateway scope. |
+| `gateway config` | Node | Writes a Perkeep client config pointing at the local gateway. |
 | `purge` (later) | Server | Rare manual physical delete. |
 
 ## Failure modes, testing and milestones
@@ -223,6 +245,7 @@ When the server is unreachable, sync keeps working and only keeping, expiry and 
 4. Recovery kit, `recover` and `--drill`.
 5. Conflict reporting and the conflict hook.
 6. ZeroFS 9P mode, and a native tailcat transport inside Syncthing.
+7. Perkeep gateway: read-only first, then signed writes.
 
 **Open questions**
 
