@@ -83,7 +83,7 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 	}
 	now := k.cfg.Clock.Now()
 	var expIdx []int
-	var expRefs []api.BlobRef
+	var expRefs [][]api.BlobRef
 	for _, f := range files {
 		fs := FileStatus{Path: f.rel, ModTime: f.mtime, Size: f.size}
 		e, inTree := tree[f.rel]
@@ -92,9 +92,9 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 			fs.State = StateKept
 			if k.policy.Expire > 0 {
 				fs.ExpireAt = f.mtime.Add(k.policy.Expire)
-				if !now.Before(fs.ExpireAt) && e.Claim != "" {
+				if !now.Before(fs.ExpireAt) && len(e.Claims) > 0 {
 					expIdx = append(expIdx, len(st.Files))
-					expRefs = append(expRefs, e.File, e.Claim)
+					expRefs = append(expRefs, recoverRefs(e))
 				}
 			}
 		case inTree && e.ModTime.After(f.mtime):
@@ -119,16 +119,16 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 		}
 		st.Files = append(st.Files, fs)
 	}
-	for start := 0; start < len(expRefs); start += 2 * durableBatch {
-		end := min(start+2*durableBatch, len(expRefs))
-		ok, err := k.cfg.Registry.Durable(ctx, expRefs[start:end])
-		if err != nil || len(ok) != end-start {
+	for start := 0; start < len(expRefs); start += durableBatch {
+		end := min(start+durableBatch, len(expRefs))
+		ok, err := k.allDurable(ctx, expRefs[start:end])
+		if err != nil {
 			st.DurabilityUnknown = true
 			break
 		}
-		for i := 0; i+1 < len(ok); i += 2 {
-			if ok[i] && ok[i+1] {
-				st.Files[expIdx[(start+i)/2]].State = StateExpirable
+		for i, d := range ok {
+			if d {
+				st.Files[expIdx[start+i]].State = StateExpirable
 			}
 		}
 	}

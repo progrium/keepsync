@@ -92,7 +92,10 @@ type Membership struct {
 	Folders []Folder
 }
 
-// PathClaim asks the server to set camliPath:<Path> on Permanode to File.
+// PathClaim asks the server to keep File at Path in the kept folder whose
+// root permanode is Permanode. Path is slash-separated and relative to the
+// folder. The server gives each file and directory its own permanode (see
+// "Kept tree layout" in docs/design.md); callers only ever name the root.
 type PathClaim struct {
 	Permanode BlobRef
 	Path      string
@@ -113,9 +116,12 @@ const (
 type PathEntry struct {
 	File    BlobRef
 	ModTime time.Time
-	// Claim is the signed claim blob that set this value. A path is only
-	// recoverable by name once both File and Claim are durable.
-	Claim BlobRef
+	// Claims are the blobs besides File that must be durable for this path
+	// to be recoverable by name: the claims that set the file's content and
+	// name it in its directory, and the permanodes of the file and of each
+	// directory between it and the root, with the claims naming them. Empty
+	// means the server could not say, and the path must not be expired.
+	Claims []BlobRef
 }
 
 // RegistryClient is what a node uses to talk to the server's registry.

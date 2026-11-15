@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -135,13 +137,13 @@ func TestSignPathsAndDurability(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := paths["dir/a.txt"]
-	if got.File != v2 || !got.ModTime.Equal(t0.Add(time.Hour)) || got.Claim == "" {
+	if got.File != v2 || !got.ModTime.Equal(t0.Add(time.Hour)) || len(got.Claims) == 0 {
 		t.Fatalf("paths: got %+v, want %s at %v with a claim", got, v2, t0.Add(time.Hour))
 	}
 
 	// Nothing is durable before a flush, and the file and its naming
 	// claim are durable after one, once replication has caught up.
-	refs := []api.BlobRef{v2, got.Claim, pn}
+	refs := append([]api.BlobRef{v2, pn}, got.Claims...)
 	d, err := e.srv.Durable(ctx, refs)
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +391,7 @@ func restartCheck(t *testing.T) {
 	}
 	for k, w := range c.Want {
 		g := got[k]
-		if g.File != w.File || g.Claim != w.Claim || !g.ModTime.Equal(w.ModTime) {
+		if g.File != w.File || !slices.Equal(g.Claims, w.Claims) || !g.ModTime.Equal(w.ModTime) {
 			t.Errorf("%s: got %+v, want %+v", k, g, w)
 		}
 	}
@@ -463,7 +465,7 @@ func TestPathsAt(t *testing.T) {
 		t.Errorf("before any claim: %v, want empty", m)
 	}
 	m := at(afterV1)
-	if m["a"].File != v1 || !m["a"].ModTime.Equal(t0) || m["a"].Claim == "" {
+	if m["a"].File != v1 || !m["a"].ModTime.Equal(t0) || len(m["a"].Claims) == 0 {
 		t.Errorf("after v1: a = %+v, want %s", m["a"], v1)
 	}
 	if _, ok := m["b"]; ok {
@@ -474,7 +476,7 @@ func TestPathsAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(m) != 2 || m["a"] != cur["a"] || m["b"] != cur["b"] {
+	if len(m) != 2 || !reflect.DeepEqual(m, cur) {
 		t.Errorf("after all: %v, want current %v", m, cur)
 	}
 	if _, err := e.srv.PathsAt(ctx, "sha224-00000000000000000000000000000000000000000000000000000000", afterAll); err == nil {

@@ -313,10 +313,10 @@ func TestExpiryNeedsClaimDurable(t *testing.T) {
 	e.write("a.txt", "a", 40*day)
 	e.pass()
 	ent := e.tree()["a.txt"]
-	if ent.Claim == "" {
-		t.Fatal("fake left Claim empty")
+	if len(ent.Claims) == 0 {
+		t.Fatal("fake left Claims empty")
 	}
-	cnd.claims[ent.Claim] = true
+	cnd.claims[ent.Claims[0]] = true
 	e.pk.MarkDurable()
 	if ok, _ := cnd.Durable(e.ctx, []api.BlobRef{ent.File}); !ok[0] {
 		t.Fatal("content should be durable")
@@ -328,7 +328,7 @@ func TestExpiryNeedsClaimDurable(t *testing.T) {
 	if st, _ := e.k.Status(e.ctx); st.Counts()[StateExpirable] != 0 {
 		t.Fatal("status reports expirable with claim not durable")
 	}
-	delete(cnd.claims, ent.Claim)
+	delete(cnd.claims, ent.Claims[0])
 	if rep = e.pass(); !slices.Equal(rep.Expired, []string{"a.txt"}) {
 		t.Fatalf("expired %v after claim durable", rep.Expired)
 	}

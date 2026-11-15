@@ -95,7 +95,7 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 		return 0, err
 	}
 	s.treeMu.Lock()
-	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claim: api.BlobRef(claim.String())}
+	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claims: []api.BlobRef{api.BlobRef(claim.String())}}
 	s.treeMu.Unlock()
 	return api.ClaimWritten, nil
 }
@@ -187,7 +187,7 @@ func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Ti
 		if !ok {
 			continue
 		}
-		e := api.PathEntry{File: api.BlobRef(v.v), Claim: api.BlobRef(v.claim.String())}
+		e := api.PathEntry{File: api.BlobRef(v.v), Claims: []api.BlobRef{api.BlobRef(v.claim.String())}}
 		if mt := attrs[mtimeAttrPrefix+p]; mt != nil {
 			if tm, err := time.Parse(time.RFC3339Nano, mt.v); err == nil {
 				e.ModTime = tm

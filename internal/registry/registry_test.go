@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -321,12 +322,12 @@ func TestClaimsAndDurability(t *testing.T) {
 	if e := paths["a.txt"]; e.File != "sha224-2" || !e.ModTime.Equal(t0.Add(time.Hour)) {
 		t.Fatalf("paths = %+v", paths)
 	}
-	// Every PathEntry field, Claim included, survives the wire.
+	// Every PathEntry field, Claims included, survives the wire.
 	direct, err := e.pk.Paths(ctx, pn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := paths["a.txt"], direct["a.txt"]; got.Claim == "" || got.Claim != want.Claim || got.File != want.File || !got.ModTime.Equal(want.ModTime) {
+	if got, want := paths["a.txt"], direct["a.txt"]; len(got.Claims) == 0 || !slices.Equal(got.Claims, want.Claims) || got.File != want.File || !got.ModTime.Equal(want.ModTime) {
 		t.Fatalf("over the wire %+v, direct %+v", got, want)
 	}
 	if e.pk.Claims != 2 {
@@ -692,7 +693,7 @@ func TestPathsAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := then["a.txt"]; got.File != "sha224-1" || got.Claim == "" {
+	if got := then["a.txt"]; got.File != "sha224-1" || len(got.Claims) == 0 {
 		t.Fatalf("a.txt at mid = %+v", got)
 	}
 	if _, ok := then["b.txt"]; ok {

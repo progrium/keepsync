@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -528,7 +529,7 @@ func phaseRun(t *testing.T, root string) {
 		t.Fatalf("recovered tree %v, want %v", got, c.Want)
 	}
 	for k, w := range c.Want {
-		if g := got[k]; g.File != w.File || g.Claim != w.Claim || !g.ModTime.Equal(w.ModTime) {
+		if g := got[k]; g.File != w.File || !slices.Equal(g.Claims, w.Claims) || !g.ModTime.Equal(w.ModTime) {
 			t.Errorf("%s: got %+v want %+v", k, g, w)
 		}
 	}
