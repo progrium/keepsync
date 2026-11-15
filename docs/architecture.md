@@ -135,7 +135,7 @@ keepsync wraps all of this up in a single binary, giving you both peer-to-peer f
 One machine runs `keepsync server run`. It holds:
 
 - **Perkeep** (`perkeepd`, embedded), the archive, and the only key that signs claims.
-- **ZeroFS**, supervised as a subprocess and flushed every minute.
+- **ZeroFS**, supervised as a subprocess and flushed every minute. If it exits or stops answering, the server restarts it and reconnects, for up to 5 minutes; past that it reports ZeroFS down and needs a restart.
 - **The registry**: the approved nodes, the folders and their members, keep policies, and which nodes are each folder's keepers.
 
 The server is the only machine that touches the bucket. Everything needed to rebuild it from the bucket fits in one encrypted **recovery kit**, and a recovered server comes back at the same tailcat address, so nodes reconnect on their own.

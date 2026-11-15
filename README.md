@@ -320,7 +320,7 @@ The server always talks to ZeroFS over 9P. By default it is the 9P client itself
 
 With `9p`, blobs are stored one file per blob, which writes far faster than the `diskpacked` packs the mount modes use for a new bucket (see [Testing](docs/design.md#testing)). A bucket keeps the layout it was created with, and one written as `diskpacked` needs a mount mode. Servers set up before `9p` keep `fuse`.
 
-Stick with `9p` unless you want to look at the server's files with ordinary tools while it runs, or have a `diskpacked` bucket. To switch later, set `mount` under `[zerofs]` in `server.toml` and restart the server. If ZeroFS restarts under a `9p` server, the connection is not re-established: `server status` shows flushes failing until you restart `keepsync server run`.
+Stick with `9p` unless you want to look at the server's files with ordinary tools while it runs, or have a `diskpacked` bucket. To switch later, set `mount` under `[zerofs]` in `server.toml` and restart the server. If ZeroFS exits or stops answering, the server restarts and reconnects it on its own, retrying for 5 minutes; `server status` shows `zerofs: RECONNECTING` meanwhile. If it stays down past that, `server status` and every node's status show `zerofs: DOWN`, and you have to restart `keepsync server run`.
 
 ### Command reference
 
