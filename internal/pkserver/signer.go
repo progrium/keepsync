@@ -163,7 +163,8 @@ func splitPath(p string) ([]string, error) {
 }
 
 // ClaimPath keeps c.File at c.Path under the root permanode c.Permanode.
-// It writes nothing if the file there already has c.File as content, and
+// It writes nothing if the file there already has c.File as content and
+// no gone mark (with a mark, see unmarkGone), and
 // rejects a claim that api.Supersedes says is not newer than the file's
 // current content. Each write is one signed multi claim: on the file's
 // permanode for a changed file; or, for a new file, setting its content
@@ -273,7 +274,10 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 // The caller holds claimMu.
 func (s *Server) updateFile(ctx context.Context, n *treeNode, file blob.Ref, c api.PathClaim) (api.ClaimResult, error) {
 	if n.content == file {
-		return api.ClaimUnchanged, nil
+		if n.gone == api.GoneNone {
+			return api.ClaimUnchanged, nil
+		}
+		return s.unmarkGone(ctx, n, c)
 	}
 	if !api.Supersedes(c, n.entry()) {
 		return api.ClaimRejectedOlder, nil
@@ -288,6 +292,43 @@ func (s *Server) updateFile(ctx context.Context, n *treeNode, file blob.Ref, c a
 	}
 	s.treeMu.Lock()
 	s.setContent(n, file, c, claim, date)
+	s.treeMu.Unlock()
+	return api.ClaimWritten, nil
+}
+
+// unmarkGone handles the content a file already has being kept again
+// while it has a gone mark, as when an expired file is restored: one claim
+// deletes the mark and, if api.Supersedes accepts c, also updates the
+// mtime and version, so later comparisons use the newest. The content
+// claim, and so KeptAt and History, stay as they were. The caller holds
+// claimMu.
+func (s *Server) unmarkGone(ctx context.Context, n *treeNode, c api.PathClaim) (api.ClaimResult, error) {
+	ops := []*schema.Builder{
+		schema.NewDelAttributeClaim(n.pn, goneAttr, ""),
+		schema.NewDelAttributeClaim(n.pn, goneAtAttr, ""),
+	}
+	newer := api.Supersedes(c, n.entry())
+	if newer {
+		ops = append(ops, schema.NewSetAttributeClaim(n.pn, mtimeAttr, schema.RFC3339FromTime(c.ModTime)))
+		if len(c.Version) > 0 {
+			ops = append(ops, schema.NewSetAttributeClaim(n.pn, versionAttr, c.Version.String()))
+		} else if len(n.version) > 0 {
+			ops = append(ops, schema.NewDelAttributeClaim(n.pn, versionAttr, ""))
+		}
+	}
+	multi, err := schema.NewMultiClaim(ops...)
+	if err != nil {
+		return 0, err
+	}
+	_, date, err := s.signClaim(ctx, multi.SetMultiClaimPermanode(n.pn), n.lastClaim)
+	if err != nil {
+		return 0, err
+	}
+	s.treeMu.Lock()
+	n.gone, n.goneAt, n.lastClaim = api.GoneNone, time.Time{}, date
+	if newer {
+		n.mtime, n.version = c.ModTime, c.Version
+	}
 	s.treeMu.Unlock()
 	return api.ClaimWritten, nil
 }

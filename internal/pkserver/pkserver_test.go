@@ -922,3 +922,63 @@ func TestHistory(t *testing.T) {
 		t.Error("History of a directory succeeded")
 	}
 }
+
+// TestRestoreAfterExpiryClearsMark: an expired file restored with the same
+// content is kept again, which clears its gone mark in one claim.
+func TestRestoreAfterExpiryClearsMark(t *testing.T) {
+	ctx := context.Background()
+	k := newKeptEnv(t)
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	f := k.put()
+	k.claim("r/f", f, t0, ver("A", 1))
+	kept := k.paths()["r/f"]
+	if err := k.srv.MarkGone(ctx, api.GoneClaim{Permanode: k.root, Path: "r/f", Reason: api.GoneExpired, File: f}); err != nil {
+		t.Fatal(err)
+	}
+	afterMark := tick()
+
+	// Restored with the same content and an older-or-equal version: only
+	// the mark goes.
+	n := k.srv.signedCount()
+	if r := k.claim("r/f", f, t0, ver("A", 1)); r != api.ClaimWritten {
+		t.Fatalf("restore: %v, want written", r)
+	}
+	if got := k.srv.signedCount() - n; got != 1 {
+		t.Errorf("restore signed %d, want 1", got)
+	}
+	e := k.paths()["r/f"]
+	if e.Gone != api.GoneNone || !e.GoneAt.IsZero() || e.File != f || e.Version.String() != "A:1" || !e.ModTime.Equal(t0) || !e.KeptAt.Equal(kept.KeptAt) {
+		t.Fatalf("after restore: %+v", e)
+	}
+	k.checkCache()
+	if e := k.pathsAt(afterMark)["r/f"]; e.Gone != api.GoneExpired {
+		t.Errorf("PathsAt between mark and restore: %+v", e)
+	}
+
+	// Without a mark, the same content is unchanged again.
+	n = k.srv.signedCount()
+	if r := k.claim("r/f", f, t0.Add(time.Hour), ver("A", 2)); r != api.ClaimUnchanged {
+		t.Fatalf("same content, no mark: %v", r)
+	}
+	if got := k.srv.signedCount() - n; got != 0 {
+		t.Errorf("unchanged signed %d", got)
+	}
+
+	// Marked again, and restored with a newer version and mtime: the same
+	// claim takes them, so later comparisons use the newest.
+	k.srv.MarkGone(ctx, api.GoneClaim{Permanode: k.root, Path: "r/f", Reason: api.GoneDeleted, File: f})
+	if r := k.claim("r/f", f, t0.Add(time.Hour), ver("A", 2)); r != api.ClaimWritten {
+		t.Fatalf("restore with a newer version: %v", r)
+	}
+	e = k.paths()["r/f"]
+	if e.Gone != api.GoneNone || e.Version.String() != "A:2" || !e.ModTime.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("after newer restore: %+v", e)
+	}
+	if r := k.claim("r/f", k.put(), t0.Add(2*time.Hour), ver("A", 1)); r != api.ClaimRejectedOlder {
+		t.Errorf("a version older than the restored one: %v, want rejected", r)
+	}
+	k.checkCache()
+	if h, err := k.srv.History(ctx, k.root, "r/f"); err != nil || len(h) != 1 {
+		t.Errorf("history after restores: %v %v, want the one content version", h, err)
+	}
+}
