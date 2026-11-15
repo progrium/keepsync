@@ -81,3 +81,27 @@ func TestGatewayListen(t *testing.T) {
 		t.Fatalf("disabled gateway did not round-trip: %v %v", got.Gateway.Listen, err)
 	}
 }
+
+func TestServerModeAndCache(t *testing.T) {
+	c := &Server{}
+	if c.StorageMode() != ModeStore || c.CacheSizeGB() != StoreCacheSizeGB || c.Validate() != nil {
+		t.Fatalf("store defaults: %s %g %v", c.StorageMode(), c.CacheSizeGB(), c.Validate())
+	}
+	c.Mode = ModeCache
+	if c.CacheSizeGB() != DefaultCacheModeGB {
+		t.Fatalf("cache default %g", c.CacheSizeGB())
+	}
+	c.ZeroFS.CacheSizeGB = 50
+	if c.CacheSizeGB() != 50 || c.Validate() != nil {
+		t.Fatal("explicit cache size")
+	}
+	c.ZeroFS.CacheSizeGB = 1
+	if c.Validate() == nil {
+		t.Fatal("cache below minimum accepted")
+	}
+	c.ZeroFS.CacheSizeGB = 0
+	c.Mode = "mirror"
+	if c.Validate() == nil {
+		t.Fatal("unknown mode accepted")
+	}
+}

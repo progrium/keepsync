@@ -81,6 +81,7 @@ func (e *env) status(args []string) error {
 	switch {
 	case st.Watching:
 		fmt.Fprintf(e.stdout, "server: connected (registry version %d)\n", st.Version)
+		printServerSummary(e, st.ServerSummary, st.SummaryErr)
 	case st.ServerErr != "":
 		since := ""
 		if !st.ServerSeen.IsZero() {

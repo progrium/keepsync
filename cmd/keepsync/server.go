@@ -28,6 +28,8 @@ func (e *env) serverInit(args []string) error {
 	fs.StringVar(&o.Mount, "mount", "", "ZeroFS mount mode: fuse (default), v9fs or external")
 	fs.StringVar(&o.MountDir, "mount-dir", "", "ZeroFS mount point (default <server dir>/zerofs/mnt)")
 	fs.BoolVar(&o.NoDownload, "no-download", false, "fail instead of downloading zerofs")
+	fs.StringVar(&o.Mode, "mode", config.ModeStore, "where blobs live: store (local disk, replicated to the bucket) or cache (the bucket only, with a local ZeroFS cache)")
+	fs.Float64Var(&o.CacheSizeGB, "cache-size", 0, fmt.Sprintf("ZeroFS disk cache in GB (default %d in store mode, %d in cache mode; minimum %d)", config.StoreCacheSizeGB, config.DefaultCacheModeGB, config.MinCacheSizeGB))
 	kitOut := fs.String("kit", "", "where to write the recovery kit (default ./"+kit.FileName+")")
 	netFlags(fs, &o.Network)
 	if _, err := parse(fs, args, 0, 0, "--bucket <url> [flags]"); err != nil {
@@ -41,7 +43,7 @@ func (e *env) serverInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.stdout, "server initialized in %s\n", o.Dir)
+	fmt.Fprintf(e.stdout, "server initialized in %s (%s mode, %g GB ZeroFS cache)\n", o.Dir, res.Config.StorageMode(), res.Config.CacheSizeGB())
 	fmt.Fprintf(e.stdout, "zerofs:  %s\n", res.ZeroFS)
 	fmt.Fprintf(e.stdout, "key:     %s\n", res.Key)
 	fmt.Fprintf(e.stdout, "address: %s\n\n", res.Addr)
@@ -188,6 +190,7 @@ func (e *env) serverStatus(args []string) error {
 	} else {
 		fmt.Fprintln(e.stdout, "flush:   none yet")
 	}
+	printDisk(e, st.Disk)
 	fmt.Fprintf(e.stdout, "registry version %d, %d folders\n\n", st.Version, len(st.Folders))
 	printNodes(e, st.Nodes)
 	return nil

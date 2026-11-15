@@ -37,6 +37,31 @@ type Config struct {
 	// IdleTimeout is how long a connection may stay silent (no request
 	// and no pong) before the server drops it. Default DefaultIdleTimeout.
 	IdleTimeout time.Duration
+	// Summary, if set, answers a member's ServerSummary call. The
+	// registry fills in the node counts itself.
+	Summary func(ctx context.Context) (ServerSummary, error)
+}
+
+// ServerSummary is the short view of the server that any member node may
+// fetch for its own status. Keys, scopes and the node list stay in the
+// server's own status.
+type ServerSummary struct {
+	Mode      string    `json:"mode"`
+	LastFlush time.Time `json:"lastFlush,omitzero"`
+	FlushErr  string    `json:"flushErr,omitempty"`
+	Nodes     int       `json:"nodes"`
+	Online    int       `json:"online"`
+	// Local disk, in bytes: the local blob store (store mode only), the
+	// index, ZeroFS's cache and its limit, and the volume's free space.
+	BlobsBytes      int64  `json:"blobsBytes"`
+	IndexBytes      int64  `json:"indexBytes"`
+	CacheBytes      int64  `json:"cacheBytes"`
+	CacheLimitBytes int64  `json:"cacheLimitBytes"`
+	VolumeFree      uint64 `json:"volumeFree"`
+	// The bucket, as of BucketAt (it is listed every few minutes).
+	BucketBytes int64     `json:"bucketBytes"`
+	BucketAt    time.Time `json:"bucketAt,omitzero"`
+	BucketErr   string    `json:"bucketErr,omitempty"`
 }
 
 // Server is the registry: the membership list, folders, keep policies and
@@ -643,6 +668,21 @@ func (s *Server) call(ctx context.Context, peer api.NodeKey, req request) (any, 
 			return nil, err
 		}
 		return s.cfg.Durability.Durable(ctx, p.Refs)
+	case mSummary:
+		if s.cfg.Summary == nil {
+			return nil, errors.New("registry: this server has no summary")
+		}
+		sum, err := s.cfg.Summary(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range s.Nodes() {
+			sum.Nodes++
+			if n.Online {
+				sum.Online++
+			}
+		}
+		return sum, nil
 	default:
 		return nil, fmt.Errorf("%w: unknown method %q", ErrBadRequest, req.Method)
 	}

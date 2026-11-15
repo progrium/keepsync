@@ -48,6 +48,7 @@ type Status struct {
 	LastFlush time.Time           `json:"lastFlush,omitzero"`
 	FlushErr  string              `json:"flushErr,omitempty"`
 	ZeroFSDir string              `json:"zerofsDir"`
+	Disk      DiskUsage           `json:"disk"`
 }
 
 func (s *Server) handlers() {
@@ -94,6 +95,7 @@ func (s *Server) handlers() {
 			st.FlushErr = s.flushErr.Error()
 		}
 		s.mu.Unlock()
+		st.Disk = s.usage.get()
 		return st, nil
 	})
 }

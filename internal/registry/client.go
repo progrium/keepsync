@@ -320,6 +320,13 @@ func (c *Client) Paths(ctx context.Context, pn api.BlobRef) (map[string]api.Path
 	return out, err
 }
 
+// ServerSummary fetches the server's short status (see ServerSummary).
+func (c *Client) ServerSummary(ctx context.Context) (ServerSummary, error) {
+	var out ServerSummary
+	err := c.call(ctx, mSummary, nil, &out)
+	return out, err
+}
+
 func (c *Client) Durable(ctx context.Context, refs []api.BlobRef) ([]bool, error) {
 	var out []bool
 	err := c.call(ctx, mDurable, refsParams{Refs: refs}, &out)

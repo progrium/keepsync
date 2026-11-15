@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +40,11 @@ type InitOptions struct {
 	MountDir string
 	// NoDownload fails instead of downloading the pinned zerofs.
 	NoDownload bool
-	Logf       func(format string, args ...any)
+	// Mode is config.ModeStore (default) or config.ModeCache.
+	Mode string
+	// CacheSizeGB sets ZeroFS's disk cache; 0 takes the mode's default.
+	CacheSizeGB float64
+	Logf        func(format string, args ...any)
 }
 
 // InitResult is what `server init` prints.
@@ -67,14 +72,21 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	if o.Storage.URL == "" {
 		return nil, errors.New("server: a bucket URL is required (--bucket s3://bucket/prefix)")
 	}
-	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
-		return nil, err
-	}
 	cfg := &config.Server{
 		Dir:     o.Dir,
+		Mode:    o.Mode,
 		Network: o.Network,
 		Storage: o.Storage,
-		ZeroFS:  config.ZeroFS{Binary: o.ZeroFS, Mount: o.Mount, MountDir: o.MountDir},
+		ZeroFS:  config.ZeroFS{Binary: o.ZeroFS, Mount: o.Mount, MountDir: o.MountDir, CacheSizeGB: o.CacheSizeGB},
+	}
+	if cfg.Mode == config.ModeStore {
+		cfg.Mode = "" // the default; keeps server.toml minimal
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
+		return nil, err
 	}
 	res := &InitResult{Config: cfg}
 
@@ -124,6 +136,9 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	res.Addr, res.Key = tr.Addr(), tr.Key()
 	tr.Close()
 
+	if err := writeModeMarker(cfg); err != nil {
+		return nil, err
+	}
 	if err := cfg.Save(); err != nil {
 		return nil, err
 	}
@@ -141,6 +156,8 @@ type Server struct {
 	reg *registry.Server
 	ctl *ctl.Server
 	up  atomic.Bool // set once start has finished
+
+	usage *usageTracker
 
 	mu        sync.Mutex
 	lastFlush time.Time
@@ -192,6 +209,12 @@ func Run(ctx context.Context, cfg *config.Server, o Options) (err error) {
 
 func (s *Server) start(ctx context.Context) error {
 	cfg := s.cfg
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := checkModeMarker(cfg); err != nil {
+		return err
+	}
 	// Claim the control socket first, so a second `server run` fails
 	// before it touches ZeroFS.
 	s.ctl = ctl.NewServer()
@@ -230,8 +253,8 @@ func (s *Server) start(ctx context.Context) error {
 		Password:      cfg.ZeroFS.Password,
 		Mount:         zerofs.MountMode(cfg.ZeroFS.Mount),
 		MountDir:      cfg.ZeroFS.MountDir,
-		CacheSizeGB:   cfg.ZeroFS.CacheSizeGB,
-		MemoryCacheGB: cfg.ZeroFS.MemoryCacheGB,
+		CacheSizeGB:   cfg.CacheSizeGB(),
+		MemoryCacheGB: cfg.MemoryCacheGB(),
 	})
 	if err != nil {
 		return err
@@ -246,6 +269,7 @@ func (s *Server) start(ctx context.Context) error {
 	// it is up, nodes may do nothing over api.PortPerkeep.
 	var reg atomic.Pointer[registry.Server]
 	if s.pk, err = pkserver.Start(ctx, pkserver.Config{
+		Mode:      cfg.StorageMode(),
 		Dir:       cfg.PerkeepDir(),
 		ZeroFS:    zfs,
 		Transport: s.tr,
@@ -273,10 +297,13 @@ func (s *Server) start(ctx context.Context) error {
 		Signer:     s.pk,
 		Durability: s.pk,
 		Transport:  s.tr,
+		Summary:    s.summary,
 	}); err != nil {
 		return fmt.Errorf("server: registry: %w", err)
 	}
 	reg.Store(s.reg)
+	s.usage = newUsageTracker(cfg, zfs.Dir())
+	go s.usage.run(ctx)
 	return s.reg.Serve()
 }
 
@@ -336,3 +363,56 @@ func (s *Server) Addr() api.Addr { return s.tr.Addr() }
 
 // Registry is the running registry.
 func (s *Server) Registry() *registry.Server { return s.reg }
+
+// modeFile records the mode a server directory was initialized with, so a
+// hand edit of server.toml cannot switch it: a store-mode server's blobs
+// are on local disk and a cache-mode server has none there.
+const modeFile = "mode"
+
+func writeModeMarker(cfg *config.Server) error {
+	return os.WriteFile(filepath.Join(cfg.Dir, modeFile), []byte(cfg.StorageMode()+"\n"), 0o600)
+}
+
+func checkModeMarker(cfg *config.Server) error {
+	b, err := os.ReadFile(filepath.Join(cfg.Dir, modeFile))
+	if errors.Is(err, os.ErrNotExist) {
+		// Initialized before modes existed: those were all store mode.
+		if cfg.StorageMode() != config.ModeStore {
+			return fmt.Errorf("server: %s was initialized in store mode; server.toml says %s", cfg.Dir, cfg.StorageMode())
+		}
+		return writeModeMarker(cfg)
+	}
+	if err != nil {
+		return err
+	}
+	if was := strings.TrimSpace(string(b)); was != cfg.StorageMode() {
+		return fmt.Errorf("server: %s was initialized in %s mode; server.toml says %s (the mode cannot change after init)", cfg.Dir, was, cfg.StorageMode())
+	}
+	return nil
+}
+
+// summary is what member nodes see of the server (registry.ServerSummary).
+func (s *Server) summary(context.Context) (registry.ServerSummary, error) {
+	if !s.up.Load() || s.usage == nil {
+		return registry.ServerSummary{}, errors.New("server is still starting")
+	}
+	u := s.usage.get()
+	sum := registry.ServerSummary{
+		Mode:            u.Mode,
+		BlobsBytes:      u.BlobsBytes,
+		IndexBytes:      u.IndexBytes,
+		CacheBytes:      u.CacheBytes,
+		CacheLimitBytes: u.CacheLimitBytes,
+		VolumeFree:      u.VolumeFree,
+		BucketBytes:     u.Bucket.Bytes,
+		BucketAt:        u.Bucket.MeasuredAt,
+		BucketErr:       u.Bucket.Err,
+	}
+	s.mu.Lock()
+	sum.LastFlush = s.lastFlush
+	if s.flushErr != nil {
+		sum.FlushErr = s.flushErr.Error()
+	}
+	s.mu.Unlock()
+	return sum, nil
+}

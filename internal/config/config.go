@@ -132,12 +132,77 @@ type Server struct {
 	// Dir is the server directory. It is not stored; Load sets it.
 	Dir string `toml:"-"`
 
+	// Mode is where Perkeep keeps blobs: ModeStore (default) or
+	// ModeCache. It is chosen at init and cannot change afterwards.
+	Mode    string  `toml:"mode,omitempty,omitzero"`
 	Network Network `toml:"network"`
 	Storage Storage `toml:"storage"`
 	ZeroFS  ZeroFS  `toml:"zerofs"`
 	// FlushInterval is how often the server flushes ZeroFS and advances
 	// the durability watermark. Default 1m.
 	FlushInterval Duration `toml:"flush_interval,omitempty,omitzero"`
+}
+
+// Server modes (Server.Mode).
+const (
+	// ModeStore keeps every blob on local disk and replicates it to the
+	// bucket through ZeroFS. ZeroFS's cache stays at its minimum.
+	ModeStore = "store"
+	// ModeCache keeps blobs only in the bucket, through ZeroFS; local disk
+	// holds ZeroFS's cache, sized by zerofs.cache_size_gb.
+	ModeCache = "cache"
+)
+
+// ZeroFS cache sizes, in GB. ZeroFS 2.3.7 never makes its disk cache
+// smaller than about 2 GB, so that is the floor in every mode.
+const (
+	MinCacheSizeGB       = 2
+	StoreCacheSizeGB     = 2  // store mode reads ZeroFS only for recovery
+	DefaultCacheModeGB   = 10 // cache mode default
+	DefaultMemoryCacheGB = 0.25
+)
+
+// StorageMode is Mode, defaulting to ModeStore.
+func (c *Server) StorageMode() string {
+	if c.Mode == "" {
+		return ModeStore
+	}
+	return c.Mode
+}
+
+// CacheSizeGB is the ZeroFS disk cache size for the mode in use.
+func (c *Server) CacheSizeGB() float64 {
+	if c.ZeroFS.CacheSizeGB > 0 {
+		return c.ZeroFS.CacheSizeGB
+	}
+	if c.StorageMode() == ModeCache {
+		return DefaultCacheModeGB
+	}
+	return StoreCacheSizeGB
+}
+
+// MemoryCacheGB is the ZeroFS memory cache size.
+func (c *Server) MemoryCacheGB() float64 {
+	if c.ZeroFS.MemoryCacheGB > 0 {
+		return c.ZeroFS.MemoryCacheGB
+	}
+	return DefaultMemoryCacheGB
+}
+
+// Validate checks the mode and cache sizes.
+func (c *Server) Validate() error {
+	switch c.StorageMode() {
+	case ModeStore, ModeCache:
+	default:
+		return fmt.Errorf("config: mode %q: want %s or %s", c.Mode, ModeStore, ModeCache)
+	}
+	if gb := c.ZeroFS.CacheSizeGB; gb != 0 && gb < MinCacheSizeGB {
+		return fmt.Errorf("config: zerofs cache_size_gb %g is below the minimum of %d GB (ZeroFS 2.3.7 never uses less)", gb, MinCacheSizeGB)
+	}
+	if c.ZeroFS.MemoryCacheGB < 0 || c.ZeroFS.CacheSizeGB < 0 {
+		return errors.New("config: zerofs cache sizes must not be negative")
+	}
+	return nil
 }
 
 // DefaultFlushInterval is the default Server.FlushInterval.
@@ -282,6 +347,9 @@ func LoadServer(dir string) (*Server, error) {
 		return nil, err
 	}
 	c.Dir = dir
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 

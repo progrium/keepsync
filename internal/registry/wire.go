@@ -46,6 +46,7 @@ const (
 	mLeave      = "leaveFolder"
 	mUnkeep     = "unkeep"
 	mPong       = "pong"
+	mSummary    = "serverSummary"
 )
 
 type request struct {

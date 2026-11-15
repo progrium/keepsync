@@ -102,6 +102,31 @@ type Status struct {
 	Version    uint64       `json:"version"`
 	Peers      []PeerInfo   `json:"peers"`
 	Folders    []FolderInfo `json:"folders"`
+	// ServerSummary is the server's short status, nil if it could not be
+	// fetched (SummaryErr says why).
+	ServerSummary *registry.ServerSummary `json:"serverSummary,omitempty"`
+	SummaryErr    string                  `json:"summaryErr,omitempty"`
+}
+
+// summaryTimeout bounds the status call's wait for the server summary, so
+// status stays quick when the server is unreachable.
+const summaryTimeout = 3 * time.Second
+
+func (n *Node) addServerSummary(ctx context.Context, st *Status) {
+	sc, ok := n.reg.(interface {
+		ServerSummary(context.Context) (registry.ServerSummary, error)
+	})
+	if !ok || !st.Watching {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, summaryTimeout)
+	defer cancel()
+	sum, err := sc.ServerSummary(ctx)
+	if err != nil {
+		st.SummaryErr = err.Error()
+		return
+	}
+	st.ServerSummary = &sum
 }
 
 // KeepStatus is the result of MethodKeepStatus.
@@ -129,7 +154,9 @@ func (n *Node) handlers() {
 		if err := ready(); err != nil {
 			return nil, err
 		}
-		return n.status(), nil
+		st := n.status()
+		n.addServerSummary(ctx, &st)
+		return st, nil
 	})
 	ctl.HandleFunc(n.ctl, MethodFolderAdd, func(ctx context.Context, p FolderParams) (any, error) {
 		if err := ready(); err != nil {
