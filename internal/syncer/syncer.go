@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -60,8 +61,11 @@ type Syncer struct {
 	mu      sync.Mutex
 	peers   map[protocol.DeviceID]api.Peer
 	folders []api.FolderConfig
-	bridges map[protocol.DeviceID]*outBridge
-	allowed map[api.NodeKey]bool
+	// Whether SetPeers / SetFolders have been called. Until then, Start
+	// restores both from the previous run's config.xml.
+	peersSet, foldersSet bool
+	bridges              map[protocol.DeviceID]*outBridge
+	allowed              map[api.NodeKey]bool
 
 	// set by Start
 	running    bool
@@ -158,6 +162,8 @@ func (s *Syncer) Start(ctx context.Context) error {
 	s.evLogger = events.NewLogger()
 	s.serve(s.evLogger.Serve)
 
+	s.restoreLocked()
+
 	// Bridges first, so peer devices get their loopback addresses.
 	if err := s.syncBridgesLocked(); err != nil {
 		s.cancel()
@@ -204,6 +210,49 @@ func (s *Syncer) Start(ctx context.Context) error {
 		s.pumpEvents(sub)
 	}()
 	return nil
+}
+
+// restoreLocked loads the folders and peer devices of the previous run from
+// config.xml, unless SetFolders / SetPeers already provided them. Without
+// this, Syncthing would start with no folders, drop their index ("Cleaning
+// metadata for dropped folder") and, once SetFolders adds them back, rescan
+// every file as a new version. A delete elsewhere then comes back as a
+// conflict copy instead of propagating. Restored peers have no tailcat
+// address or key until SetPeers supplies them, so they are not dialed.
+func (s *Syncer) restoreLocked() {
+	if s.peersSet && s.foldersSet {
+		return
+	}
+	f, err := os.Open(filepath.Join(s.cfg.Dir, "config.xml"))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	prev, _, err := config.ReadXML(f, s.id)
+	if err != nil {
+		slog.Warn("syncer: ignoring unreadable config.xml", "err", err)
+		return
+	}
+	if !s.peersSet {
+		shorts := map[string]api.DeviceID{s.id.Short().String(): s.DeviceID()}
+		for _, d := range prev.Devices {
+			if d.DeviceID == s.id {
+				continue
+			}
+			s.peers[d.DeviceID] = api.Peer{Name: d.Name, Device: api.DeviceID(d.DeviceID.String())}
+			shorts[d.DeviceID.Short().String()] = api.DeviceID(d.DeviceID.String())
+		}
+		s.shorts.Store(&shorts)
+	}
+	if !s.foldersSet {
+		for _, fc := range prev.Folders {
+			f := api.FolderConfig{ID: fc.ID, Path: fc.Path, ReceiveOnly: fc.Type == config.FolderTypeReceiveOnly}
+			for _, d := range fc.Devices {
+				f.Devices = append(f.Devices, api.DeviceID(d.DeviceID.String()))
+			}
+			s.folders = append(s.folders, f)
+		}
+	}
 }
 
 // baseOptions sets everything that is fixed for keepsync.
@@ -309,10 +358,12 @@ func (s *Syncer) applyLocked(ctx context.Context) error {
 	go func() { w.Wait(); close(done) }()
 	select {
 	case <-done:
-		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// Save now rather than on the wrapper's timer, so a crash right after
+	// a change still restarts with this folder list (see restoreLocked).
+	return s.wrapper.Save()
 }
 
 // SetPeers replaces the peer set. Each peer's key is allowed on the
@@ -337,6 +388,7 @@ func (s *Syncer) SetPeers(ctx context.Context, peers []api.Peer) error {
 		return errors.New("syncer: stopped")
 	}
 	s.peers = next
+	s.peersSet = true
 	shorts := map[string]api.DeviceID{s.id.Short().String(): s.DeviceID()}
 	for id := range next {
 		shorts[id.Short().String()] = api.DeviceID(id.String())
@@ -389,6 +441,7 @@ func (s *Syncer) SetFolders(ctx context.Context, folders []api.FolderConfig) err
 		return errors.New("syncer: stopped")
 	}
 	s.folders = slices.Clone(folders)
+	s.foldersSet = true
 	return s.applyLocked(ctx)
 }
 

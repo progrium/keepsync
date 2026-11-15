@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,18 +18,28 @@ type node struct {
 	t      *testing.T
 	s      *Syncer
 	tr     *fake.Transport
-	dir    string
+	dir    string // synced folder
+	stDir  string // Syncer.Config.Dir
+	name   string
 	mu     sync.Mutex
 	events []api.SyncEvent
 }
 
 func newNode(t *testing.T, n *fake.Network, name string) *node {
 	t.Helper()
-	tr := n.Transport(name)
+	nd := &node{t: t, tr: n.Transport(name), dir: t.TempDir(), stDir: t.TempDir(), name: name}
+	nd.start()
+	return nd
+}
+
+// start runs a Syncer on the node's directories, as node run does.
+func (n *node) start() {
+	t := n.t
+	t.Helper()
 	s, err := New(Config{
-		Dir:               t.TempDir(),
-		Name:              name,
-		Transport:         tr,
+		Dir:               n.stDir,
+		Name:              n.name,
+		Transport:         n.tr,
 		DisableWatcher:    true,
 		RescanInterval:    time.Hour,
 		ReconnectInterval: time.Second,
@@ -36,25 +47,29 @@ func newNode(t *testing.T, n *fake.Network, name string) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nd := &node{t: t, s: s, tr: tr, dir: t.TempDir()}
+	n.mu.Lock()
+	n.s = s
+	n.events = nil
+	n.mu.Unlock()
 	go func() {
 		for ev := range s.Events() {
-			nd.mu.Lock()
-			nd.events = append(nd.events, ev)
-			nd.mu.Unlock()
+			n.mu.Lock()
+			n.events = append(n.events, ev)
+			n.mu.Unlock()
 		}
 	}()
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := s.Stop(ctx); err != nil {
-			t.Error(err)
-		}
-	})
-	return nd
+	t.Cleanup(func() { n.stop(s) })
+}
+
+func (n *node) stop(s *Syncer) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.Stop(ctx); err != nil {
+		n.t.Error(err)
+	}
 }
 
 func (n *node) peer(name string) api.Peer {
@@ -270,5 +285,72 @@ func TestConflictNames(t *testing.T) {
 		if ok != c.ok || short != c.short || (ok && orig != c.orig) {
 			t.Errorf("%s: got %q %q %v", c.path, short, orig, ok)
 		}
+	}
+}
+
+// A restarted node must keep its index, or its files come back as new
+// versions and a delete elsewhere turns into a conflict copy (which would
+// resurrect every expired file).
+func TestRestartKeepsIndex(t *testing.T) {
+	a, b := pair(t)
+	ctx := context.Background()
+	devs := []api.DeviceID{a.s.DeviceID(), b.s.DeviceID()}
+
+	for i := range 5 {
+		a.write(fmt.Sprintf("old/%d.txt", i), fmt.Sprintf("file %d", i))
+	}
+	a.scan("docs")
+	for i := range 5 {
+		eventually(t, "file on b", fileIs(filepath.Join(b.dir, fmt.Sprintf("old/%d.txt", i)), fmt.Sprintf("file %d", i)))
+	}
+
+	// Restart b the way node run does: Start first, then peers and folders
+	// once the registry answers.
+	id := b.s.DeviceID()
+	b.stop(b.s)
+	time.Sleep(500 * time.Millisecond)
+	b.start()
+	if b.s.DeviceID() != id {
+		t.Fatalf("device ID changed across restart: %s -> %s", id, b.s.DeviceID())
+	}
+	time.Sleep(500 * time.Millisecond)
+	if err := b.s.SetPeers(ctx, []api.Peer{a.peer("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.s.SetFolders(ctx, []api.FolderConfig{{ID: "docs", Path: b.dir, Devices: devs}}); err != nil {
+		t.Fatal(err)
+	}
+	b.scan("docs")
+	eventually(t, "reconnect", func() bool {
+		return b.hasEvent(func(ev api.SyncEvent) bool {
+			return ev.Type == api.SyncPeerConnected && ev.Device == a.s.DeviceID()
+		})
+	})
+
+	// Expiry on a: delete everything.
+	if err := os.RemoveAll(filepath.Join(a.dir, "old")); err != nil {
+		t.Fatal(err)
+	}
+	a.scan("docs")
+	eventually(t, "deletes on b", func() bool {
+		for i := range 5 {
+			if _, err := os.Stat(filepath.Join(b.dir, fmt.Sprintf("old/%d.txt", i))); err == nil {
+				return false
+			}
+		}
+		return true
+	})
+	// Give any resurrection a chance to happen, then check both sides.
+	time.Sleep(2 * time.Second)
+	a.scan("docs")
+	b.scan("docs")
+	time.Sleep(2 * time.Second)
+	for _, n := range []*node{a, b} {
+		filepath.WalkDir(n.dir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && (IsConflict(p) || strings.Contains(p, "old/")) {
+				t.Errorf("%s: unexpected %s after delete", n.name, p)
+			}
+			return nil
+		})
 	}
 }

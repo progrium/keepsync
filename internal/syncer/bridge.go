@@ -112,6 +112,14 @@ func (s *Syncer) syncBridgesLocked() error {
 		}
 	}
 	for id, p := range s.peers {
+		if p.Addr == "" {
+			// Restored from config.xml; not dialable until SetPeers.
+			if b, ok := s.bridges[id]; ok {
+				b.close()
+				delete(s.bridges, id)
+			}
+			continue
+		}
 		if b, ok := s.bridges[id]; ok {
 			b.setTarget(p.Addr)
 			continue

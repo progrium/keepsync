@@ -15,8 +15,17 @@ Syncthing config file at startup.
   reporting, upgrades and the GUI are off; the only listen address is
   `tcp://127.0.0.1:<free port>`. Every `SetPeers`/`SetFolders` rebuilds the
   device and folder lists and applies them with `config.Wrapper.Modify`,
-  waiting until Syncthing has taken the change. Syncthing still writes
-  `config.xml` into `Dir`, but it is output only.
+  waiting until Syncthing has taken the change, then saves `config.xml` in
+  `Dir`.
+- **Restarts.** `Start` restores the previous run's folders and peer device
+  IDs from `config.xml`, unless `SetFolders`/`SetPeers` were already called.
+  This matters: Syncthing drops the index of any folder missing from its
+  config at startup, and a dropped index means every file is rescanned as a
+  new version, so a delete on another node (expiry) comes back as a conflict
+  copy. With the index kept (`Dir/index-v2`), version vectors survive.
+  Restored peers are not dialed until `SetPeers` gives their addresses. The
+  device ID comes from `cert.pem`; the folder ID is whatever the caller
+  passes (the registry's `Folder.ID`), so it must be stable too.
 - **Database.** `syncthing.OpenDatabase(Dir/index-v2)`, SQLite. With cgo it
   uses mattn/go-sqlite3, without cgo modernc.org/sqlite; both pass the tests.
 - **Transport bridge.** Inbound: the `api.PortSyncthing` handler checks the

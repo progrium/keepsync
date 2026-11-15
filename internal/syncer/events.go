@@ -164,4 +164,3 @@ func hasError(data any) bool {
 	e, ok := d["error"].(*string)
 	return ok && e != nil
 }
-
