@@ -335,8 +335,9 @@ func (n *Node) notKept(name string) error {
 // attach creates or joins a folder in the registry and attaches it at path.
 // checkJoinDir refuses to join a folder from a directory that already has
 // files, unless p.Merge: those files would sync into every member's copy
-// of the folder. Syncthing's and keepsync's own files don't count, and
-// rejoining a folder already attached at the same path is allowed.
+// of the folder. Syncthing's own files and the ignore files don't count
+// (.keepsync does: it would replace the folder's), and rejoining a folder
+// already attached at the same path is allowed.
 func (n *Node) checkJoinDir(p FolderParams) error {
 	if p.Merge || p.Path == "" {
 		return nil
