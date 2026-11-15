@@ -1,6 +1,7 @@
 package keeper
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -164,9 +165,10 @@ func TestUserDeleteMarksDeleted(t *testing.T) {
 func TestDeleteAfterExpireWindowCountsExpired(t *testing.T) {
 	e := newEnv(t)
 	e.write("a.txt", "a", 40*day)
-	e.pass() // kept; not durable yet, so this node does not expire it
-	// Another keeper flushed and expired it, and the delete synced here.
+	e.pass() // kept, and the next pass sees its claims
 	e.pk.MarkDurable()
+	// Another keeper expired it, and the delete synced here before this
+	// node's own pass got to it.
 	e.remove("a.txt")
 	e.state("a.txt", deleted())
 	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneExpired {
@@ -174,16 +176,67 @@ func TestDeleteAfterExpireWindowCountsExpired(t *testing.T) {
 	}
 }
 
-// A past-window file deleted before its kept version was durable was not
-// expired by any keeper (expiry needs durability), so it was deleted.
-func TestDeleteAfterExpireWindowNotDurableCountsDeleted(t *testing.T) {
+func TestHandDeleteBeforeFlushPastWindowCountsDeleted(t *testing.T) {
 	e := newEnv(t)
 	e.write("a.txt", "a", 40*day)
 	e.pass()
+	e.pass() // claims known; still not durable, so nobody can expire it
 	e.remove("a.txt")
 	e.state("a.txt", deleted())
 	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneDeleted {
 		t.Fatalf("rep %+v", rep)
+	}
+	if g := e.tree()["a.txt"].Gone; g != api.GoneDeleted {
+		t.Fatalf("tree Gone = %q", g)
+	}
+}
+
+func TestPastWindowDeleteWaitsWhenDurabilityUnknown(t *testing.T) {
+	e := newEnv(t)
+	down := &downRegistry{RegistryClient: e.client}
+	e.k = e.newKeeper("nodekey:a", down)
+	e.write("a.txt", "a", 40*day)
+	e.pass()
+	e.remove("a.txt")
+	e.state("a.txt", deleted())
+	down.durableErr = true
+	if rep := e.pass(); len(rep.Gone) != 0 {
+		t.Fatalf("marked with durability unknown: %v", rep.Gone)
+	}
+	down.durableErr = false
+	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneDeleted {
+		t.Fatalf("rep %+v", rep)
+	}
+}
+
+type failMark struct {
+	api.RegistryClient
+	fail bool
+}
+
+func (f *failMark) MarkGone(ctx context.Context, g api.GoneClaim) error {
+	if f.fail {
+		return errDown
+	}
+	return f.RegistryClient.MarkGone(ctx, g)
+}
+
+func TestFailedExpiredMarkIsRetried(t *testing.T) {
+	e := newEnv(t)
+	fm := &failMark{RegistryClient: e.client}
+	e.k = e.newKeeper("nodekey:a", fm)
+	e.write("a.txt", "a", 40*day)
+	e.pass()
+	e.pk.MarkDurable()
+	fm.fail = true
+	rep, _ := e.k.Pass(e.ctx)
+	if !slices.Equal(rep.Expired, []string{"a.txt"}) || len(rep.Gone) != 0 {
+		t.Fatalf("rep %+v", rep)
+	}
+	fm.fail = false
+	e.state("a.txt", deleted())
+	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneExpired {
+		t.Fatalf("retry rep %+v", rep)
 	}
 }
 
@@ -280,5 +333,18 @@ func TestRestoreInsideGraceIsReclaimedNow(t *testing.T) {
 	e.pass()
 	if g := e.tree()["a.txt"].Gone; g != api.GoneNone {
 		t.Fatalf("Gone = %q", g)
+	}
+}
+
+// A past-window file deleted before its kept version was durable was not
+// expired by any keeper (expiry needs durability), so it was deleted.
+func TestDeleteAfterExpireWindowNotDurableCountsDeleted(t *testing.T) {
+	e := newEnv(t)
+	e.write("a.txt", "a", 40*day)
+	e.pass()
+	e.remove("a.txt")
+	e.state("a.txt", deleted())
+	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneDeleted {
+		t.Fatalf("rep %+v", rep)
 	}
 }

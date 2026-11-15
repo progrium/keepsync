@@ -72,6 +72,9 @@ type Keeper struct {
 	// putCache remembers what this node uploaded and claimed, so an
 	// unchanged file costs a stat, not a hash.
 	putCache map[string]cached
+	// unmarked holds files this node expired whose expired mark has not
+	// reached the server yet, so a retry still says expired.
+	unmarked map[string]api.BlobRef
 }
 
 type cached struct {
@@ -106,6 +109,7 @@ func New(cfg Config) (*Keeper, error) {
 		policy:   cfg.Policy,
 		dirty:    map[string]time.Time{},
 		putCache: map[string]cached{},
+		unmarked: map[string]api.BlobRef{},
 	}, nil
 }
 
@@ -121,6 +125,7 @@ func (k *Keeper) SetPolicy(p api.KeepPolicy) error {
 		// A different archive: nothing we remember applies to it.
 		k.dirty = map[string]time.Time{}
 		k.putCache = map[string]cached{}
+		k.unmarked = map[string]api.BlobRef{}
 	}
 	k.policy = p
 	return nil
@@ -527,13 +532,15 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 				continue
 			}
 			rep.Expired = append(rep.Expired, c.f.rel)
-			k.markGone(ctx, c.f.rel, c.file, api.GoneExpired, rep)
+			if !k.markGone(ctx, c.f.rel, c.file, api.GoneExpired, rep) {
+				k.unmarked[c.f.rel] = c.file
+			}
 		}
 	}
 }
 
 // markGone records in the kept tree why path left sync.
-func (k *Keeper) markGone(ctx context.Context, rel string, ref api.BlobRef, why api.GoneReason, rep *Report) {
+func (k *Keeper) markGone(ctx context.Context, rel string, ref api.BlobRef, why api.GoneReason, rep *Report) bool {
 	err := k.cfg.Registry.MarkGone(ctx, api.GoneClaim{
 		Permanode: k.policy.Permanode,
 		Path:      rel,
@@ -542,33 +549,46 @@ func (k *Keeper) markGone(ctx context.Context, rel string, ref api.BlobRef, why 
 	})
 	if err != nil {
 		rep.Errors = append(rep.Errors, fmt.Errorf("keeper: mark %s %s: %w", rel, why, err))
-		return
+		return false
 	}
 	if rep.Gone == nil {
 		rep.Gone = map[string]api.GoneReason{}
 	}
 	rep.Gone[rel] = why
+	return true
 }
 
 // markDeleted marks kept paths that have left sync. A path counts only when
 // it is missing on disk and Syncthing's current version is a delete, so a
-// node that is behind, or has no Syncer, marks nothing. A path whose kept
-// version is past the expire window and durable may have been expired by
-// another keeper, so it is marked expired; any other is marked deleted,
-// since expiry never removes a file that is not durable. If durability
-// cannot be checked, past-window paths wait for the next pass.
+// node that is behind, or has no Syncer, marks nothing.
+//
+// The reason is expired only when a keeper could have expired the file:
+// this node did, or the kept version is past the expire window and the
+// server reports it durable, which expiry requires. A file deleted by hand
+// past the window but before its flush is a delete, so a plain restore does
+// not bring it back. If durability is unknown, those paths wait a pass.
 func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry, seen map[string]bool, now time.Time, rep *Report) {
+	for rel, ref := range k.unmarked {
+		e, ok := tree[rel]
+		if seen[rel] || !ok || e.File != ref || e.Gone != api.GoneNone {
+			delete(k.unmarked, rel)
+			continue
+		}
+		if k.markGone(ctx, rel, ref, api.GoneExpired, rep) {
+			delete(k.unmarked, rel)
+		}
+	}
 	if k.cfg.Syncer == nil {
 		return
 	}
 	rels := make([]string, 0)
 	for rel, e := range tree {
-		if !seen[rel] && e.Gone == api.GoneNone && e.File != "" {
+		if !seen[rel] && e.Gone == api.GoneNone && e.File != "" && k.unmarked[rel] == "" {
 			rels = append(rels, rel)
 		}
 	}
 	sort.Strings(rels)
-	var pastWindow []string
+	var deleted, pastWindow []string
 	for _, rel := range rels {
 		if ctx.Err() != nil {
 			return
@@ -582,11 +602,14 @@ func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry,
 			continue
 		}
 		e := tree[rel]
-		if k.policy.Expire > 0 && now.Sub(e.ModTime) >= k.policy.Expire {
+		if k.policy.Expire > 0 && now.Sub(e.ModTime) >= k.policy.Expire && len(e.Claims) > 0 {
 			pastWindow = append(pastWindow, rel)
-			continue
+		} else {
+			deleted = append(deleted, rel)
 		}
-		k.markGone(ctx, rel, e.File, api.GoneDeleted, rep)
+	}
+	for _, rel := range deleted {
+		k.markGone(ctx, rel, tree[rel].File, api.GoneDeleted, rep)
 	}
 	for start := 0; start < len(pastWindow); start += durableBatch {
 		batch := pastWindow[start:min(start+durableBatch, len(pastWindow))]
@@ -596,7 +619,7 @@ func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry,
 		}
 		ok, err := k.allDurable(ctx, groups)
 		if err != nil {
-			k.logf("keeper %s: gone marks wait: %v", k.cfg.Folder, err)
+			k.logf("keeper %s: gone marks paused: %v", k.cfg.Folder, err)
 			return
 		}
 		for i, rel := range batch {
