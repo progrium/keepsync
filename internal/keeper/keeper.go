@@ -367,7 +367,13 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 	}
 	if keptVersion(f, st, tree) {
 		delete(k.dirty, f.rel)
-		return
+		if tree[f.rel].Gone == api.GoneNone {
+			return
+		}
+		// Back on disk after being marked gone (a restore): the content is
+		// already archived, so claim it again now, skipping grace, to tell
+		// the server it is back. The server clears the mark.
+		force = true
 	}
 	if laggingVersion(f, st, tree) && !force {
 		rep.Lagging = append(rep.Lagging, f.rel)

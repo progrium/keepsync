@@ -222,3 +222,49 @@ func TestNoMarksWithoutSyncerOrWhenExcluded(t *testing.T) {
 		t.Fatalf("gone %v", rep.Gone)
 	}
 }
+
+func TestRestoreClearsGone(t *testing.T) {
+	e := newEnv(t)
+	e.write("a.txt", "a", 40*day)
+	e.state("a.txt", current(ver("A", 1)))
+	e.pass()
+	e.pk.MarkDurable()
+	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneExpired {
+		t.Fatalf("not expired: %+v", rep)
+	}
+	// Restored with the same content and mtime; Syncthing bumps the version.
+	e.write("a.txt", "a", 40*day)
+	e.state("a.txt", current(ver("A", 2)))
+	e.pk.MarkDurable()
+	p := e.policy
+	p.Expire = 0 // keep it around so the mark's state is visible
+	e.k.SetPolicy(p)
+	rep := e.pass()
+	if !slices.Contains(rep.Kept, "a.txt") {
+		t.Fatalf("restored file not reclaimed: %+v", rep)
+	}
+	ent := e.tree()["a.txt"]
+	if ent.Gone != api.GoneNone {
+		t.Fatalf("Gone = %q after restore", ent.Gone)
+	}
+	claims := e.pk.Claims
+	if rep = e.pass(); len(rep.Kept) != 0 || e.pk.Claims != claims {
+		t.Fatalf("reclaimed again: %+v", rep)
+	}
+}
+
+func TestRestoreInsideGraceIsReclaimedNow(t *testing.T) {
+	e := newEnv(t)
+	e.write("a.txt", "a", 3*day)
+	e.pass()
+	e.remove("a.txt")
+	e.state("a.txt", deleted())
+	e.pass()
+	// Restored right away with the kept mtime and content; mtime matches.
+	e.write("a.txt", "a", 3*day)
+	e.state("a.txt", api.FileState{Known: true, Current: true})
+	e.pass()
+	if g := e.tree()["a.txt"].Gone; g != api.GoneNone {
+		t.Fatalf("Gone = %q", g)
+	}
+}
