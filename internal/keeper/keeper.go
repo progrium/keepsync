@@ -75,7 +75,24 @@ type Keeper struct {
 	// unmarked holds files this node expired whose expired mark has not
 	// reached the server yet, so a retry still says expired.
 	unmarked map[string]api.BlobRef
+	// unconfirmed holds files this node kept that the server has not yet
+	// reported durable (see confirm).
+	unconfirmed map[string]*keptFile
 }
+
+// keptFile is a version this node kept, waiting to be reported durable.
+type keptFile struct {
+	mtime time.Time
+	size  int64
+	ref   api.BlobRef
+	kept  time.Time     // when it was kept
+	next  time.Time     // earliest time to put it again
+	wait  time.Duration // backoff before the put after next
+}
+
+// maxReputWait caps the backoff between puts of a file that stays not
+// durable, as during a long server or bucket outage.
+const maxReputWait = time.Hour
 
 type cached struct {
 	mtime  time.Time
@@ -110,6 +127,8 @@ func New(cfg Config) (*Keeper, error) {
 		dirty:    map[string]time.Time{},
 		putCache: map[string]cached{},
 		unmarked: map[string]api.BlobRef{},
+
+		unconfirmed: map[string]*keptFile{},
 	}, nil
 }
 
@@ -162,6 +181,9 @@ type Report struct {
 	InGrace []string // paths with an unkept version still inside grace
 	Lagging []string // not the current version (per Syncthing or the archive); left for Syncthing
 	Expired []string // paths removed from sync this pass
+	// Reput holds kept paths put again this pass because the server
+	// still did not report them durable (see Keeper.confirm).
+	Reput []string
 	// Gone holds the paths marked gone in the kept tree this pass, with why.
 	Gone map[string]api.GoneReason
 	// ExpiryPaused is set when expiry could not run (server unreachable).
@@ -239,6 +261,7 @@ func (k *Keeper) Pass(ctx context.Context) (Report, error) {
 			delete(k.putCache, rel)
 		}
 	}
+	k.confirm(ctx, files, tree, now, &rep)
 	if k.policy.Expire > 0 {
 		k.expire(ctx, files, tree, now, &rep)
 	}
@@ -436,6 +459,7 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 			tree[f.rel] = api.PathEntry{File: ref, ModTime: f.mtime, Version: st.Version}
 		}
 		delete(k.dirty, f.rel)
+		k.unconfirmed[f.rel] = &keptFile{mtime: f.mtime, size: f.size, ref: ref, kept: now, next: now, wait: k.cfg.Interval}
 		rep.Kept = append(rep.Kept, f.rel)
 		if forced {
 			rep.Forced = append(rep.Forced, f.rel)
@@ -443,6 +467,74 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 		}
 	case api.ClaimRejectedOlder:
 		rep.Lagging = append(rep.Lagging, f.rel)
+	}
+}
+
+// confirm asks the server, on the passes after a file was kept, whether
+// it is durable yet, and puts it again while it is not. A server whose
+// ZeroFS died before flushing loses what it had not flushed, content
+// included, and only the nodes still have it; putting the file again
+// uploads whatever the server lacks (and nothing else). The first check
+// waits a pass, giving the server's flush time to run; after that the
+// file is put again at most once per wait, doubling up to maxReputWait,
+// so an outage doesn't rehash every recent file on every pass. A file
+// that changed or went away is dropped: its new version, if any, is
+// kept and confirmed on its own.
+func (k *Keeper) confirm(ctx context.Context, files []file, tree map[string]api.PathEntry, now time.Time, rep *Report) {
+	if len(k.unconfirmed) == 0 {
+		return
+	}
+	cur := make(map[string]file, len(files))
+	for _, f := range files {
+		cur[f.rel] = f
+	}
+	var rels []string
+	for rel, c := range k.unconfirmed {
+		f, ok := cur[rel]
+		e, inTree := tree[rel]
+		if !ok || !f.mtime.Equal(c.mtime) || f.size != c.size || (inTree && e.File != c.ref) {
+			delete(k.unconfirmed, rel)
+			continue
+		}
+		if !c.kept.Before(now) || !inTree || len(e.Claims) == 0 {
+			continue // kept this pass, or its claims aren't listed yet
+		}
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels) // stable order for reports and logs
+	groups := make([][]api.BlobRef, len(rels))
+	for i, rel := range rels {
+		groups[i] = recoverRefs(tree[rel])
+	}
+	for start := 0; start < len(rels); start += durableBatch {
+		end := min(start+durableBatch, len(rels))
+		ok, err := k.allDurable(ctx, groups[start:end])
+		if err != nil {
+			return // server unreachable: try again next pass
+		}
+		for i, rel := range rels[start:end] {
+			c := k.unconfirmed[rel]
+			if ok[i] {
+				delete(k.unconfirmed, rel)
+				continue
+			}
+			if now.Before(c.next) {
+				continue
+			}
+			c.next = now.Add(c.wait)
+			c.wait = min(2*c.wait, maxReputWait)
+			f := cur[rel]
+			ref, err := k.cfg.Putter.PutFile(ctx, f.abs)
+			if err != nil {
+				rep.Errors = append(rep.Errors, fmt.Errorf("keeper: put %s again: %w", rel, err))
+				continue
+			}
+			if ref != c.ref {
+				delete(k.unconfirmed, rel) // changed in place; the next pass keeps it
+				continue
+			}
+			rep.Reput = append(rep.Reput, rel)
+		}
 	}
 }
 

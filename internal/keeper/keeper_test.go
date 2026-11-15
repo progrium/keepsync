@@ -637,3 +637,62 @@ func TestKeepRecordsMode(t *testing.T) {
 		t.Fatalf("kept mode %v, want 0755", m)
 	}
 }
+
+// countingPutter counts puts per file.
+type countingPutter struct {
+	api.BlobPutter
+	puts map[string]int
+}
+
+func (p *countingPutter) PutFile(ctx context.Context, path string) (api.BlobRef, error) {
+	p.puts[filepath.Base(path)]++
+	return p.BlobPutter.PutFile(ctx, path)
+}
+
+// TestKeptFileIsPutAgainUntilDurable checks that a kept file the server
+// does not report durable by the next pass is put again, with backoff, and
+// left alone once it is durable.
+func TestKeptFileIsPutAgainUntilDurable(t *testing.T) {
+	e := newEnv(t)
+	cp := &countingPutter{BlobPutter: e.pk, puts: map[string]int{}}
+	k, err := New(Config{
+		Folder: "docs", FolderID: "fake-docs", Dir: e.dir, Self: "nodekey:a", Policy: e.policy,
+		Registry: e.client, Putter: cp, Clock: e.clock, Syncer: e.scans, Interval: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.k = k
+	e.write("a.txt", "a", 3*day)
+	if rep := e.pass(); !slices.Equal(rep.Kept, []string{"a.txt"}) || cp.puts["a.txt"] != 1 {
+		t.Fatalf("kept %v, puts %d", rep.Kept, cp.puts["a.txt"])
+	}
+	if rep := e.pass(); len(rep.Reput) != 0 {
+		t.Fatalf("put again in the pass it was kept: %v", rep.Reput)
+	}
+
+	// Not durable a pass later (a ZeroFS crash lost it): put it again.
+	e.clock.Advance(5 * time.Minute)
+	if rep := e.pass(); !slices.Equal(rep.Reput, []string{"a.txt"}) || cp.puts["a.txt"] != 2 {
+		t.Fatalf("reput %v, puts %d", rep.Reput, cp.puts["a.txt"])
+	}
+	// Backoff: the next put waits one interval, the one after two.
+	e.clock.Advance(time.Minute)
+	if rep := e.pass(); len(rep.Reput) != 0 {
+		t.Fatalf("put again within the backoff: %v", rep.Reput)
+	}
+	e.clock.Advance(5 * time.Minute)
+	if rep := e.pass(); !slices.Equal(rep.Reput, []string{"a.txt"}) {
+		t.Fatalf("not put again after the backoff: %v", rep.Reput)
+	}
+	e.clock.Advance(5 * time.Minute)
+	if rep := e.pass(); len(rep.Reput) != 0 {
+		t.Fatalf("backoff did not double: %v", rep.Reput)
+	}
+
+	e.pk.MarkDurable()
+	e.clock.Advance(time.Hour)
+	if rep := e.pass(); len(rep.Reput) != 0 || len(k.unconfirmed) != 0 {
+		t.Fatalf("durable file put again (%v) or still tracked (%d)", rep.Reput, len(k.unconfirmed))
+	}
+}
