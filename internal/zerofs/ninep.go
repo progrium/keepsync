@@ -128,14 +128,32 @@ const maxWalk = 16
 
 // walk returns a new fid for the file at the path elements names.
 func (n *NineP) walk(names []string) (p9.File, error) {
-	_, f, err := n.root.Walk(names[:min(len(names), maxWalk)])
+	f, err := walkOne(n.root, names[:min(len(names), maxWalk)])
 	for names = names[min(len(names), maxWalk):]; err == nil && len(names) > 0; names = names[min(len(names), maxWalk):] {
 		var next p9.File
-		_, next, err = f.Walk(names[:min(len(names), maxWalk)])
+		next, err = walkOne(f, names[:min(len(names), maxWalk)])
 		f.Close()
 		f = next
 	}
 	return f, err
+}
+
+// walkOne walks from f to names (at most maxWalk of them). In 9P a walk
+// whose first name exists but a later one does not succeeds with fewer
+// QIDs than names and no new fid; the p9 client returns a File for it
+// anyway, so that case is turned into ENOENT here.
+func walkOne(f p9.File, names []string) (p9.File, error) {
+	qids, nf, err := f.Walk(names)
+	if err != nil {
+		return nil, err
+	}
+	if len(qids) < len(names) {
+		// The server made no fid; the clunk fails, and the client drops
+		// the fid number rather than reuse it.
+		clunkAsync(nf)
+		return nil, linux.ENOENT
+	}
+	return nf, nil
 }
 
 // walkParent returns a fid for name's parent directory, and name's base.
@@ -437,16 +455,23 @@ func (n *NineP) ReadDir(dir string) ([]fs.DirEntry, error) {
 			if e.Name == "." || e.Name == ".." {
 				continue
 			}
-			var typ fs.FileMode
-			switch {
-			case e.Type&p9.TypeDir != 0:
-				typ = fs.ModeDir
-			case e.Type&p9.TypeSymlink != 0:
-				typ = fs.ModeSymlink
-			}
+			typ := direntType(e)
 			out = append(out, &dirEntry{n: n, path: path.Join(dir, e.Name), name: e.Name, typ: typ})
 		}
 	}
+}
+
+// direntType is a directory entry's type, from its QID. The entry's own
+// type byte is not reliable: zerofs sends a Linux DT_* value there, and
+// the p9 package's servers a QID type.
+func direntType(e p9.Dirent) fs.FileMode {
+	switch {
+	case e.QID.Type&p9.TypeDir != 0:
+		return fs.ModeDir
+	case e.QID.Type&p9.TypeSymlink != 0:
+		return fs.ModeSymlink
+	}
+	return 0
 }
 
 type dirEntry struct {

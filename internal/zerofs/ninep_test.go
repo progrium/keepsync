@@ -299,3 +299,36 @@ func TestSupervisorNineP(t *testing.T) {
 		t.Errorf("events = %v", got)
 	}
 }
+
+// partialWalkFile answers every walk as zerofs does when only the first
+// name exists: one QID, no error.
+type partialWalkFile struct{ p9.File }
+
+func (f partialWalkFile) Walk(names []string) ([]p9.QID, p9.File, error) {
+	return []p9.QID{{}}, closeFile{}, nil
+}
+
+type closeFile struct{ p9.File }
+
+func (closeFile) Close() error { return nil }
+
+func TestWalkPartialIsNotExist(t *testing.T) {
+	if _, err := walkOne(partialWalkFile{}, []string{"a"}); err != nil {
+		t.Fatalf("whole walk: %v", err)
+	}
+	_, err := walkOne(partialWalkFile{}, []string{"a", "b"})
+	n := &NineP{}
+	if !errors.Is(n.pathErr("stat", "a/b", err), fs.ErrNotExist) {
+		t.Fatalf("partial walk: %v", err)
+	}
+}
+
+func TestDirentType(t *testing.T) {
+	// zerofs puts DT_DIR (4) in the entry's type byte; the QID says dir.
+	if typ := direntType(p9.Dirent{Type: 4, QID: p9.QID{Type: p9.TypeDir}}); !typ.IsDir() {
+		t.Errorf("zerofs dir entry: %v", typ)
+	}
+	if typ := direntType(p9.Dirent{Type: 8, QID: p9.QID{Type: p9.TypeRegular}}); typ != 0 {
+		t.Errorf("regular entry: %v", typ)
+	}
+}
