@@ -30,6 +30,7 @@ Server:
   server status                        show the running server
   server kit [--out <path>]            regenerate the recovery kit
   server baseline <out.json>           flush and snapshot, for a recovery drill
+  server grant <name> <blobs|read>     set a node's Perkeep gateway scope
 
 Node:
   node init --server <tc… or name>     create this node, print its key
@@ -42,8 +43,10 @@ Node:
   keep <folder> [--grace 48h] [--max-defer 7d] [--expire 30d]
                                        mark a folder kept
   keep status <folder>                 files in grace, kept, expirable
-  restore <folder> [<path>] [--to <dir>] [--force]
-                                       pull kept files back, including expired
+  restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]
+                                       pull kept files back, including expired;
+                                       --at is when the server kept them
+  gateway config [--path <file>]       point Perkeep tools at this node's gateway
 
 Any:
   recover <kit>                        rebuild the server from the bucket
@@ -115,6 +118,8 @@ func run(e *env, args []string) error {
 			return e.serverKit(a)
 		case "baseline":
 			return e.serverBaseline(a)
+		case "grant":
+			return e.serverGrant(a)
 		}
 	case "node":
 		s, a := sub()
@@ -143,6 +148,11 @@ func run(e *env, args []string) error {
 			return e.keepStatus(rest[1:])
 		}
 		return e.keep(rest)
+	case "gateway":
+		s, a := sub()
+		if s == "config" {
+			return e.gatewayConfig(a)
+		}
 	case "unkeep":
 		return notYet("unkeep", 2)
 	case "restore":

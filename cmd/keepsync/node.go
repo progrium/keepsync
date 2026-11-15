@@ -11,6 +11,7 @@ import (
 
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/ctl"
+	"github.com/progrium/keepsync/internal/gateway"
 	"github.com/progrium/keepsync/internal/node"
 )
 
@@ -278,13 +279,15 @@ func (e *env) restore(args []string) error {
 	var p node.RestoreParams
 	fs.StringVar(&p.To, "to", "", "restore into this directory instead of the folder")
 	fs.BoolVar(&p.Force, "force", false, "overwrite local files that differ from the kept version")
-	at := fs.String("at", "", "restore the tree as of a time (not supported yet)")
-	pos, err := parse(fs, args, 1, 2, "<folder> [<path>] [--to <dir>] [--force]")
+	at := fs.String("at", "", "restore the archive as the server had kept it at this time (when versions were kept, not file mtimes): RFC 3339, YYYY-MM-DD[ HH:MM] local time, or an age such as 3d or 12h")
+	pos, err := parse(fs, args, 1, 2, "<folder> [<path>] [--at <time>] [--to <dir>] [--force]")
 	if err != nil {
 		return err
 	}
 	if *at != "" {
-		return errors.New("--at is not supported yet: the server only answers for the current tree")
+		if p.At, err = parseAt(*at, time.Now()); err != nil {
+			return err
+		}
 	}
 	p.Folder = pos[0]
 	if len(pos) == 2 {
@@ -303,13 +306,68 @@ func (e *env) restore(args []string) error {
 	for _, f := range res.Errors {
 		fmt.Fprintf(e.stdout, "error     %s\n", f)
 	}
-	fmt.Fprintf(e.stdout, "%d restored, %d already present, %d skipped, %d errors into %s\n",
-		len(res.Restored), len(res.Unchanged), len(res.Skipped), len(res.Errors), res.Dir)
+	asOf := ""
+	if !p.At.IsZero() {
+		asOf = " (as kept at " + p.At.Format("2006-01-02 15:04:05 MST") + ")"
+	}
+	fmt.Fprintf(e.stdout, "%d restored, %d already present, %d skipped, %d errors into %s%s\n",
+		len(res.Restored), len(res.Unchanged), len(res.Skipped), len(res.Errors), res.Dir, asOf)
 	if res.Reexpire {
 		fmt.Fprintln(e.stdout, "note: some restored files are past the folder's expire window and will be removed from sync again on the next keeper pass; use --to to restore outside the folder")
 	}
 	if len(res.Errors) > 0 {
 		return errors.New("some files were not restored")
 	}
+	return nil
+}
+
+// parseAt reads restore --at: an RFC 3339 time, a local date or date and
+// time, or an age before now ("3d", "12h").
+func parseAt(s string, now time.Time) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02T15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	if d, err := config.ParseDuration(s); err == nil && d > 0 {
+		return now.Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("--at %q: want RFC 3339, YYYY-MM-DD[ HH:MM], or an age like 3d", s)
+}
+
+func (e *env) gatewayConfig(args []string) error {
+	fs := newFlags(e, "gateway config")
+	path := fs.String("path", "", "Perkeep client config to write (default: Perkeep's own client-config.json)")
+	if _, err := parse(fs, args, 0, 0, "[--path <client-config.json>]"); err != nil {
+		return err
+	}
+	var gi node.GatewayInfo
+	if err := e.nodeCall(node.MethodGateway, nil, &gi); err != nil {
+		return err
+	}
+	if !gi.Enabled {
+		return errors.New("the gateway is off on this node (gateway.listen in node.toml is empty, or it failed to start; see the node log)")
+	}
+	p := *path
+	if p == "" {
+		var err error
+		if p, err = gateway.DefaultClientConfigPath(); err != nil {
+			return err
+		}
+	}
+	isDefault, err := gateway.WriteClientConfig(p, gi.URL, gi.Token)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(e.stdout, "wrote server %q (%s) to %s\n", gateway.ServerAlias, gi.URL, p)
+	if isDefault {
+		fmt.Fprintln(e.stdout, "it is the default server, so pk-get, pk-mount and the rest work without flags")
+	} else {
+		fmt.Fprintf(e.stdout, "another server is the default: pass -server=%s to Perkeep tools\n", gateway.ServerAlias)
+	}
+	fmt.Fprintln(e.stdout, "search and the web UI need read scope: on the server, keepsync server grant <this node> read")
 	return nil
 }

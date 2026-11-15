@@ -187,10 +187,34 @@ type Node struct {
 	Network Network `toml:"network"`
 	// KeepInterval is how often the keeper walks kept folders. Default 5m.
 	KeepInterval Duration `toml:"keep_interval,omitempty,omitzero"`
+	// Gateway configures the local Perkeep gateway.
+	Gateway Gateway `toml:"gateway"`
 	// ConflictHook is the global conflict hook script (milestone 5).
 	ConflictHook string   `toml:"conflict_hook,omitempty,omitzero"`
 	Folders      []Folder `toml:"folder"`
 }
+
+// Gateway configures a node's local, read-only Perkeep gateway.
+type Gateway struct {
+	// Listen is the loopback address the gateway serves on. Unset means
+	// DefaultGatewayListen; an empty string disables the gateway.
+	Listen *string `toml:"listen,omitempty"`
+}
+
+// DefaultGatewayListen is where the gateway listens unless node.toml says
+// otherwise (gateway.DefaultListen).
+const DefaultGatewayListen = "127.0.0.1:3179"
+
+// GatewayListen is the gateway address, or "" when it is disabled.
+func (c *Node) GatewayListen() string {
+	if c.Gateway.Listen == nil {
+		return DefaultGatewayListen
+	}
+	return *c.Gateway.Listen
+}
+
+// GatewayTokenPath holds the gateway's per-node token.
+func (c *Node) GatewayTokenPath() string { return filepath.Join(c.Dir, "gateway-token") }
 
 // KeyPath is the node's tailcat identity.
 func (c *Node) KeyPath() string { return filepath.Join(c.Dir, KeyFile) }

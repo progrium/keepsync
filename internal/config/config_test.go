@@ -64,3 +64,20 @@ func TestParseDuration(t *testing.T) {
 		t.Error("want error")
 	}
 }
+
+func TestGatewayListen(t *testing.T) {
+	dir := t.TempDir()
+	n := &Node{Dir: dir}
+	if n.GatewayListen() != DefaultGatewayListen {
+		t.Fatal(n.GatewayListen())
+	}
+	off := ""
+	n.Gateway.Listen = &off
+	if err := n.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadNode(dir)
+	if err != nil || got.GatewayListen() != "" {
+		t.Fatalf("disabled gateway did not round-trip: %v %v", got.Gateway.Listen, err)
+	}
+}

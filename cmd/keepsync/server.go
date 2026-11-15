@@ -110,6 +110,19 @@ func (e *env) serverRemove(args []string) error {
 	return nil
 }
 
+func (e *env) serverGrant(args []string) error {
+	fs := newFlags(e, "server grant")
+	pos, err := parse(fs, args, 2, 2, "<name> <blobs|read>")
+	if err != nil {
+		return err
+	}
+	if err := e.serverCall(server.MethodGrant, server.GrantParams{Name: pos[0], Scope: pos[1]}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(e.stdout, "%s now has gateway scope %s\n", pos[0], pos[1])
+	return nil
+}
+
 func (e *env) serverNodes(args []string) error {
 	fs := newFlags(e, "server nodes")
 	if _, err := parse(fs, args, 0, 0, ""); err != nil {
@@ -129,7 +142,7 @@ func printNodes(e *env, nodes []registry.NodeInfo) {
 		return
 	}
 	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tSTATE\tKEY\tDEVICE")
+	fmt.Fprintln(tw, "NAME\tSTATE\tSCOPE\tKEY\tDEVICE")
 	for _, n := range nodes {
 		state := "approved"
 		switch {
@@ -146,7 +159,11 @@ func printNodes(e *env, nodes []registry.NodeInfo) {
 		if len(dev) > 7 {
 			dev = dev[:7]
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", name, state, n.Key, dev)
+		scope := n.Scope
+		if scope == "" {
+			scope = registry.ScopeBlobs
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, state, scope, n.Key, dev)
 	}
 	tw.Flush()
 }

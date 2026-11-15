@@ -18,12 +18,19 @@ const (
 	MethodRemove = "server.remove"
 	MethodNodes  = "server.nodes"
 	MethodStatus = "server.status"
+	MethodGrant  = "server.grant"
 )
 
 // AddParams is the body of MethodAdd.
 type AddParams struct {
 	Key  api.NodeKey `json:"key"`
 	Name string      `json:"name,omitempty"`
+}
+
+// GrantParams is the body of MethodGrant.
+type GrantParams struct {
+	Name  string `json:"name"`  // name or key
+	Scope string `json:"scope"` // registry.ScopeBlobs or registry.ScopeRead
 }
 
 // RemoveParams is the body of MethodRemove.
@@ -62,6 +69,12 @@ func (s *Server) handlers() {
 			return nil, err
 		}
 		return nil, s.reg.Remove(ctx, p.Name)
+	})
+	ctl.HandleFunc(s.ctl, MethodGrant, func(ctx context.Context, p GrantParams) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		return nil, s.reg.Grant(ctx, p.Name, p.Scope)
 	})
 	ctl.HandleFunc(s.ctl, MethodNodes, func(ctx context.Context, _ struct{}) (any, error) {
 		if err := ready(); err != nil {

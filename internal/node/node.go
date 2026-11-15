@@ -22,6 +22,7 @@ import (
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/ctl"
+	"github.com/progrium/keepsync/internal/gateway"
 	"github.com/progrium/keepsync/internal/keeper"
 	"github.com/progrium/keepsync/internal/pkserver"
 	"github.com/progrium/keepsync/internal/registry"
@@ -61,7 +62,8 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 		}
 		name, _, _ = strings.Cut(name, ".")
 	}
-	cfg := &config.Node{Dir: o.Dir, Name: name, Server: string(addr), Network: o.Network}
+	listen := config.DefaultGatewayListen
+	cfg := &config.Node{Dir: o.Dir, Name: name, Server: string(addr), Network: o.Network, Gateway: config.Gateway{Listen: &listen}}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -119,6 +121,8 @@ type Node struct {
 	putter *pkserver.Putter
 	sy     *syncer.Syncer
 	ctl    *ctl.Server
+	gw     *gateway.Gateway
+	gwTok  string
 	up     atomic.Bool
 
 	mu         sync.Mutex
@@ -188,6 +192,7 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 		return fmt.Errorf("node: syncthing: %w", err)
 	}
 	go n.events()
+	n.startGateway()
 
 	// Sync with the last known peers until the server answers.
 	if m, ok := n.loadMembership(); ok {
@@ -239,9 +244,37 @@ func (n *Node) health(ctx context.Context) {
 	}
 }
 
+// startGateway serves the server's Perkeep on localhost (read-only, by
+// the scope the server grants). A gateway that cannot start is logged and
+// the node runs without it.
+func (n *Node) startGateway() {
+	listen := n.cfg.GatewayListen()
+	if listen == "" {
+		return
+	}
+	tok, err := gateway.LoadToken(n.cfg.GatewayTokenPath())
+	if err != nil {
+		n.logf("gateway: %v", err)
+		return
+	}
+	g, err := gateway.New(gateway.Config{Listen: listen, Transport: n.tr, Server: api.Addr(n.cfg.Server), Token: tok, Logf: n.logf})
+	if err == nil {
+		err = g.Start()
+	}
+	if err != nil {
+		n.logf("gateway on %s: %v (set gateway.listen in node.toml, or \"\" to disable)", listen, err)
+		return
+	}
+	n.gw, n.gwTok = g, tok
+	n.logf("gateway at %s", g.URL())
+}
+
 func (n *Node) shutdown() {
 	if n.ctl != nil {
 		n.ctl.Close()
+	}
+	if n.gw != nil {
+		n.gw.Close()
 	}
 	n.mu.Lock()
 	for name, k := range n.keepers {

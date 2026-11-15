@@ -23,6 +23,7 @@ const (
 	MethodKeep       = "keep"
 	MethodKeepStatus = "keep.status"
 	MethodRestore    = "restore"
+	MethodGateway    = "gateway"
 )
 
 // FolderParams is the body of MethodFolderAdd, MethodFolderJoin and
@@ -30,6 +31,13 @@ const (
 type FolderParams struct {
 	Name string `json:"name"`
 	Path string `json:"path,omitempty"`
+}
+
+// GatewayInfo is the result of MethodGateway.
+type GatewayInfo struct {
+	Enabled bool   `json:"enabled"`
+	URL     string `json:"url,omitempty"`
+	Token   string `json:"token,omitempty"`
 }
 
 // RmResult is the result of MethodFolderRm.
@@ -179,6 +187,15 @@ func (n *Node) handlers() {
 		}
 		pol.Permanode = pn
 		return KeepResult{Permanode: pn, Policy: pol}, nil
+	})
+	ctl.HandleFunc(n.ctl, MethodGateway, func(ctx context.Context, _ struct{}) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		if n.gw == nil {
+			return GatewayInfo{}, nil
+		}
+		return GatewayInfo{Enabled: true, URL: n.gw.URL(), Token: n.gwTok}, nil
 	})
 	ctl.HandleFunc(n.ctl, MethodRestore, func(ctx context.Context, p RestoreParams) (any, error) {
 		if err := ready(); err != nil {
