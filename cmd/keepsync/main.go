@@ -37,7 +37,8 @@ Node:
   node run                             run the node
   status                               server connection, peers, folders
   folder add <name> <path>             create a synced folder
-  folder join <name> <path>            attach an existing folder here
+  folder join <name> <path> [--merge] attach an existing folder here;
+                                       --merge if <path> already has files
   folder ls                            list folders
   folder rm <name>                     stop syncing a folder here (files stay)
   keep <folder> [--grace 48h] [--max-defer 7d] [--expire 30d]

@@ -147,7 +147,15 @@ func printFolders(e *env, folders []node.FolderInfo) {
 
 func (e *env) folderAttach(args []string, name string, add bool) error {
 	fs := newFlags(e, name)
-	pos, err := parse(fs, args, 2, 2, "<name> <path>")
+	var merge *bool
+	if !add {
+		merge = fs.Bool("merge", false, "join from a directory that already has files, syncing them both ways with the folder")
+	}
+	usage := "<name> <path>"
+	if !add {
+		usage += " [--merge]"
+	}
+	pos, err := parse(fs, args, 2, 2, usage)
 	if err != nil {
 		return err
 	}
@@ -156,7 +164,7 @@ func (e *env) folderAttach(args []string, name string, add bool) error {
 		method = node.MethodFolderAdd
 	}
 	var fi node.FolderInfo
-	if err := e.nodeCall(method, node.FolderParams{Name: pos[0], Path: pos[1]}, &fi); err != nil {
+	if err := e.nodeCall(method, node.FolderParams{Name: pos[0], Path: pos[1], Merge: merge != nil && *merge}, &fi); err != nil {
 		return err
 	}
 	verb := "joined"

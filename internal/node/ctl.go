@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"time"
 
@@ -35,6 +36,10 @@ const (
 type FolderParams struct {
 	Name string `json:"name"`
 	Path string `json:"path,omitempty"`
+	// Merge lets folder join attach a directory that already has files,
+	// which then sync both ways with the folder's other members. Without
+	// it, join refuses a non-empty directory.
+	Merge bool `json:"merge,omitempty"`
 }
 
 // GatewayInfo is the result of MethodGateway.
@@ -131,6 +136,9 @@ func (n *Node) handlers() {
 	})
 	ctl.HandleFunc(n.ctl, MethodFolderJoin, func(ctx context.Context, p FolderParams) (any, error) {
 		if err := ready(); err != nil {
+			return nil, err
+		}
+		if err := n.checkJoinDir(p); err != nil {
 			return nil, err
 		}
 		return n.attach(ctx, p, n.reg.JoinFolder)
@@ -325,6 +333,38 @@ func (n *Node) notKept(name string) error {
 }
 
 // attach creates or joins a folder in the registry and attaches it at path.
+// checkJoinDir refuses to join a folder from a directory that already has
+// files, unless p.Merge: those files would sync into every member's copy
+// of the folder. Syncthing's and keepsync's own files don't count, and
+// rejoining a folder already attached at the same path is allowed.
+func (n *Node) checkJoinDir(p FolderParams) error {
+	if p.Merge || p.Path == "" {
+		return nil
+	}
+	dir, err := absDir(p.Path)
+	if err != nil {
+		return err
+	}
+	n.cfgMu.Lock()
+	f, ok := n.cfg.Folder(p.Name)
+	n.cfgMu.Unlock()
+	if ok && f.Path == dir {
+		return nil
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		switch e.Name() {
+		case ".stfolder", ".stversions", ".stignore", ".keepignore":
+			continue
+		}
+		return fmt.Errorf("%s is not empty: joining would merge its files into folder %s on every node. Use --merge to do that, or join with an empty directory", dir, p.Name)
+	}
+	return nil
+}
+
 func (n *Node) attach(ctx context.Context, p FolderParams, call func(context.Context, string) (api.Folder, error)) (any, error) {
 	if p.Name == "" {
 		return nil, errors.New("a folder name is required")

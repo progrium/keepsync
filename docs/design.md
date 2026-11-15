@@ -126,7 +126,7 @@ The registry runs on the server on port 1. It holds the approved nodes, folders,
 
 **Heartbeat.** The server pings every connection every 10 s, and the client answers with a pong. Either side drops a connection that has been silent for 30 s, because a tailcat connection to a vanished peer never resets. So a node stops counting as online within 30 s of going silent.
 
-**Folders.** `folder add` creates a folder with a random Syncthing-style ID (`abcde-fghij`) and makes the caller its first member. `folder join` adds the caller to an existing folder. `folder rm` calls LeaveFolder, which removes the node from the folder's members and keepers. Files on disk stay.
+**Folders.** `folder add` creates a folder with a random Syncthing-style ID (`abcde-fghij`) and makes the caller its first member. `folder join` adds the caller to an existing folder. It refuses a local directory that already has files (Syncthing's and keepsync's own files aside), because those files would sync into every member's copy. `--merge` joins anyway and syncs both ways. Rejoining a folder at the path it is already attached at is allowed. `folder rm` calls LeaveFolder, which removes the node from the folder's members and keepers. Files on disk stay.
 
 **Keepers.** Each kept folder gets up to two keepers, chosen from its connected members, with send-receive nodes ahead of receive-only ones. A keeper disconnected for 2 minutes is replaced if another connected member can take over. `Keepers[0]` stays first while it is healthy; it is the node meant to run the conflict hook.
 
@@ -320,7 +320,7 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 | `node run` | Node | Runs tailcat, Syncthing, the keepers and the gateway. |
 | `status` | Node | Server connection (or how long it has been unreachable), peers, folders. |
 | `folder add <name> <path>` | Node | Creates a synced folder in the registry and attaches it here. |
-| `folder join <name> <path>` | Node | Attaches an existing folder here. |
+| `folder join <name> <path> [--merge]` | Node | Attaches an existing folder here. A directory with files needs `--merge`. |
 | `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here. Files stay. |
 | `keep <folder> [--grace] [--max-defer] [--expire]` | Node | Marks a folder kept. Creates the permanode and `.keepsync`. |
 | `keep status <folder> [-v]` | Node | Files in grace, kept, lagging and expirable. |

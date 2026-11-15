@@ -115,6 +115,12 @@ On every other node that should sync it, join it:
 keepsync folder join docs ~/Documents
 ```
 
+`folder join` refuses a directory that already has files, because they would sync into every node's copy of the folder. To do that on purpose, add `--merge`:
+
+```sh
+keepsync folder join docs ~/Documents --merge
+```
+
 `keepsync folder ls` lists folders and their members. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk.
 
 At this point the folder syncs between nodes but isn't archived yet.
