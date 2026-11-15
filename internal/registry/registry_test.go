@@ -757,3 +757,45 @@ func TestGrantScope(t *testing.T) {
 		t.Fatalf("back to blobs: %q", got)
 	}
 }
+
+func TestUnkeep(t *testing.T) {
+	e := newEnv(t)
+	ctx := ctx(t)
+	a, b := e.node("a"), e.node("b")
+	a.c.AddFolder(ctx, "docs")
+	pn, err := a.c.Keep(ctx, "docs", policy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.c.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: "a.txt", File: "sha224-1", ModTime: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.c.Unkeep(ctx, "docs"); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("non-member Unkeep: %v", err)
+	}
+	if err := a.c.Unkeep(ctx, "docs"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.c.Unkeep(ctx, "docs"); err != nil {
+		t.Fatalf("second Unkeep: %v", err)
+	}
+	f, err := a.c.JoinFolder(ctx, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Keep != nil || f.Archive != pn {
+		t.Fatalf("after unkeep: keep %+v archive %q, want nil and %q", f.Keep, f.Archive, pn)
+	}
+	// The archive can still be read back.
+	if paths, err := a.c.Paths(ctx, pn); err != nil || paths["a.txt"].File != "sha224-1" {
+		t.Fatalf("paths after unkeep: %v %v", paths, err)
+	}
+	// Keeping again continues the same tree.
+	again, err := a.c.Keep(ctx, "docs", policy())
+	if err != nil || again != pn {
+		t.Fatalf("keep again = %q, %v; want %q", again, err, pn)
+	}
+	if f, _ := a.c.JoinFolder(ctx, "docs"); f.Keep == nil || len(f.Keep.Keepers) == 0 {
+		t.Fatalf("keep again: %+v", f.Keep)
+	}
+}

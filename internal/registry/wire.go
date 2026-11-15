@@ -42,6 +42,7 @@ const (
 	mPathsAt    = "paths_at"
 	mDurable    = "durable"
 	mLeave      = "leaveFolder"
+	mUnkeep     = "unkeep"
 	mPong       = "pong"
 )
 

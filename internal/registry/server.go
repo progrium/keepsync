@@ -578,6 +578,12 @@ func (s *Server) call(ctx context.Context, peer api.NodeKey, req request) (any, 
 			return nil, err
 		}
 		return nil, s.leaveFolder(ctx, peer, p.Name)
+	case mUnkeep:
+		var p folderParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return nil, s.unkeep(ctx, peer, p.Name)
 	case mKeep:
 		var p keepParams
 		if err := decode(&p); err != nil {
@@ -708,6 +714,28 @@ func (s *Server) leaveFolder(ctx context.Context, peer api.NodeKey, name string)
 	})
 }
 
+// unkeep stops keeping a folder. The policy and keepers go; the archive
+// and Folder.Archive stay. Unkeeping a folder that is not kept is a no-op.
+func (s *Server) unkeep(ctx context.Context, peer api.NodeKey, name string) error {
+	return s.mutate(ctx, func(st *State) error {
+		f := st.folder(name)
+		if f == nil {
+			return fmt.Errorf("%w: folder %q", ErrNotFound, name)
+		}
+		if !contains(f.Members, peer) {
+			return fmt.Errorf("%w: %s in %q", ErrNotMember, peer, name)
+		}
+		if f.Keep == nil {
+			return errNoChange
+		}
+		if f.Archive == "" {
+			f.Archive = f.Keep.Permanode
+		}
+		f.Keep = nil
+		return nil
+	})
+}
+
 // keep marks a folder kept. The first call creates the folder's permanode
 // (or adopts p.Permanode, for a folder that already has a .keepsync file);
 // later calls update the timings and keep the permanode. Keepers are always
@@ -730,8 +758,11 @@ func (s *Server) keep(ctx context.Context, peer api.NodeKey, folder string, p ap
 	s.mu.Lock()
 	f, err := check(&s.state)
 	var pn api.BlobRef
-	if err == nil && f.Keep != nil {
-		pn = f.Keep.Permanode
+	if err == nil {
+		pn = f.Archive
+		if f.Keep != nil {
+			pn = f.Keep.Permanode
+		}
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -768,6 +799,7 @@ func (s *Server) keep(ctx context.Context, peer api.NodeKey, folder string, p ap
 			return errNoChange
 		}
 		f.Keep = &next
+		f.Archive = next.Permanode
 		s.assignKeepersLocked(st)
 		return nil
 	})

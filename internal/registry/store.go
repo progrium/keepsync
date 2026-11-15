@@ -122,7 +122,8 @@ func (s *State) folder(name string) *api.Folder {
 
 func (s *State) keptFolder(pn api.BlobRef) *api.Folder {
 	for i := range s.Folders {
-		if k := s.Folders[i].Keep; k != nil && k.Permanode == pn {
+		f := &s.Folders[i]
+		if f.Archive == pn || (f.Keep != nil && f.Keep.Permanode == pn) {
 			return &s.Folders[i]
 		}
 	}

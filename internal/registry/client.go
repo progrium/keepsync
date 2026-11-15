@@ -267,6 +267,11 @@ func (c *Client) JoinFolder(ctx context.Context, name string) (api.Folder, error
 	return f, err
 }
 
+// Unkeep stops keeping a folder. The archive stays.
+func (c *Client) Unkeep(ctx context.Context, name string) error {
+	return c.call(ctx, mUnkeep, folderParams{Name: name}, nil)
+}
+
 // LeaveFolder stops this node being a member of a folder. Its keeper slot,
 // if it had one, goes to another connected member. Files are untouched.
 func (c *Client) LeaveFolder(ctx context.Context, name string) error {

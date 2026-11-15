@@ -387,6 +387,25 @@ func (c *registryClient) JoinFolder(ctx context.Context, name string) (api.Folde
 	return *c.folderLocked(name), nil
 }
 
+func (c *registryClient) Unkeep(ctx context.Context, name string) error {
+	c.r.mu.Lock()
+	defer c.r.mu.Unlock()
+	f := c.folderLocked(name)
+	if f == nil {
+		return fmt.Errorf("fake: no folder %q", name)
+	}
+	if !contains(f.Members, c.self) {
+		return fmt.Errorf("fake: %s not in %q", c.self, name)
+	}
+	if f.Keep == nil {
+		return nil
+	}
+	f.Archive = f.Keep.Permanode
+	f.Keep = nil
+	c.r.publishLocked()
+	return nil
+}
+
 func (c *registryClient) LeaveFolder(ctx context.Context, name string) error {
 	c.r.mu.Lock()
 	defer c.r.mu.Unlock()
@@ -437,6 +456,9 @@ func (c *registryClient) Keep(ctx context.Context, folder string, p api.KeepPoli
 		c.r.mu.Unlock()
 		return "", fmt.Errorf("fake: no folder %q", folder)
 	}
+	if f.Archive != "" {
+		p.Permanode = f.Archive
+	}
 	if f.Keep != nil {
 		p.Permanode = f.Keep.Permanode
 	}
@@ -459,6 +481,7 @@ func (c *registryClient) Keep(ctx context.Context, folder string, p api.KeepPoli
 		p.Keepers = append([]api.NodeKey(nil), f.Members[:n]...)
 	}
 	f.Keep = &p
+	f.Archive = p.Permanode
 	c.r.publishLocked()
 	return p.Permanode, nil
 }

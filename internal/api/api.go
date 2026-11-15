@@ -82,6 +82,10 @@ type Folder struct {
 	Members     []NodeKey
 	ReceiveOnly []NodeKey
 	Keep        *KeepPolicy // nil if not kept
+	// Archive is the root permanode of the folder's kept tree. It is set
+	// when the folder is first kept and stays after Unkeep, so the archive
+	// can still be restored and keeping again continues the same tree.
+	Archive BlobRef
 }
 
 // Membership is the registry's view of the network, versioned so watchers
@@ -137,6 +141,9 @@ type RegistryClient interface {
 	LeaveFolder(ctx context.Context, name string) error
 	// Keep marks a folder kept, creating its permanode on first use.
 	Keep(ctx context.Context, folder string, p KeepPolicy) (BlobRef, error)
+	// Unkeep stops keeping a folder: its policy and keepers are cleared.
+	// The archive stays, and Folder.Archive still names it.
+	Unkeep(ctx context.Context, folder string) error
 	ClaimPath(ctx context.Context, c PathClaim) (ClaimResult, error)
 	Paths(ctx context.Context, permanode BlobRef) (map[string]PathEntry, error)
 	// PathsAt is Paths as of time at: only claims the server signed at or
