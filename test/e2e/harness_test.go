@@ -646,10 +646,10 @@ set -e
 orig=$(basename "$KEEPSYNC_ORIGINAL")
 base=none
 if [ -n "$KEEPSYNC_BASE" ]; then
-  cp "$KEEPSYNC_BASE" "` + c.root + `/hookbase-` + name + `-$orig"
+  cp "$KEEPSYNC_BASE" "` + c.root + `/hookbase-` + name + `-$(basename "$KEEPSYNC_CONFLICT")"
   base=yes
 fi
-echo "` + name + ` $KEEPSYNC_FOLDER $orig $KEEPSYNC_CONFLICT_NODE base=$base exact=${KEEPSYNC_BASE_EXACT-unset}" >> "` + c.hookLog() + `"
+echo "` + name + ` $KEEPSYNC_FOLDER $orig $KEEPSYNC_CONFLICT_NODE base=$base exact=${KEEPSYNC_BASE_EXACT-unset} $(basename "$KEEPSYNC_CONFLICT")" >> "` + c.hookLog() + `"
 case "$orig" in
 fail-*) exit 1 ;;
 esac
