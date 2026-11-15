@@ -55,6 +55,8 @@ type BucketUsage struct {
 const (
 	localUsageEvery  = time.Minute
 	bucketUsageEvery = 10 * time.Minute
+	// A status call re-measures local usage if it is older than this.
+	localUsageFresh = 15 * time.Second
 )
 
 // usageTracker keeps the latest DiskUsage, refreshed in the background.
@@ -63,8 +65,9 @@ type usageTracker struct {
 	mountDir string // never walked: it is the bucket
 	hc       *http.Client
 
-	mu sync.Mutex
-	u  DiskUsage
+	walkMu sync.Mutex // one local walk at a time
+	mu     sync.Mutex
+	u      DiskUsage
 }
 
 func newUsageTracker(cfg *config.Server, mountDir string) *usageTracker {
@@ -95,13 +98,23 @@ func (t *usageTracker) run(ctx context.Context) {
 	}
 }
 
+// get returns the latest usage, re-measuring local disk first if the last
+// measurement is stale.
 func (t *usageTracker) get() DiskUsage {
+	t.mu.Lock()
+	stale := time.Since(t.u.MeasuredAt) > localUsageFresh
+	t.mu.Unlock()
+	if stale {
+		t.refreshLocal()
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.u
 }
 
 func (t *usageTracker) refreshLocal() {
+	t.walkMu.Lock()
+	defer t.walkMu.Unlock()
 	pk := t.cfg.PerkeepDir()
 	var errs []error
 	size := func(p string) int64 {

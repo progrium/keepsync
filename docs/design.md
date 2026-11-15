@@ -72,10 +72,11 @@ The base directory is `--dir`, else `$KEEPSYNC_DIR`, else `$XDG_DATA_HOME/keepsy
 
 | Path | Holds |
 | --- | --- |
-| `server.toml` | `[network]` (DERP map, region), `[storage]` (bucket URL, endpoint, region, keys, `allow_http`), `[zerofs]` (binary, password, mount mode, mount dir, cache sizes), `flush_interval` (default 1m) |
+| `server.toml` | `mode` (store or cache), `[network]` (DERP map, region), `[storage]` (bucket URL, endpoint, region, keys, `allow_http`), `[zerofs]` (binary, password, mount mode, mount dir, cache sizes), `flush_interval` (default 1m) |
 | `tailcat.key.json` | The server's tailcat identity |
-| `perkeep/` | Perkeep identity, local blobs (`packRelated`), `index.leveldb` |
+| `perkeep/` | Perkeep identity, local blobs (`packRelated`, store mode only), `index.leveldb` |
 | `zerofs/` | ZeroFS config, cache, sockets, default mount point `zerofs/mnt`, and keepsync's own copy of the binary |
+| `mode` | The mode the directory was initialized with |
 | `registry.json` | Registry state |
 | `ctl.sock` | Control socket |
 
@@ -137,9 +138,18 @@ The registry runs on the server on port 1. It holds the approved nodes, folders,
 
 ## Keep server
 
-The server runs perkeepd, configured like the proof of concept: `packRelated` local storage, a `diskpacked` storage named `zerofs` on the ZeroFS mount, and `replicateTo` it, which is an asynchronous sync handler. It is the only machine that holds the Perkeep identity key and the only one that runs ZeroFS.
+The server runs perkeepd. It is the only machine that holds the Perkeep identity key and the only one that runs ZeroFS. Where perkeepd keeps blobs depends on the server's mode, chosen at `server init --mode` and fixed after that:
 
-**Startup and shutdown.** `server run` starts ZeroFS, waits for its sockets, mounts it, then starts perkeepd, the registry and the tailcat listener. On stop it drains the replication queue, flushes, closes perkeepd, then stops ZeroFS, which flushes again. A clean stop means everything is in the bucket.
+| Mode | Blobs | Local disk | Reads |
+| --- | --- | --- | --- |
+| `store` (default) | `packRelated` local storage, replicated asynchronously (`replicateTo`) to a `diskpacked` storage named `zerofs` on the ZeroFS mount, as in the proof of concept | Every blob, the index, and a minimal ZeroFS cache (2 GB) | Local |
+| `cache` | The `diskpacked` store on the ZeroFS mount is perkeepd's primary storage. There is no local blob store and no replication | The index and the ZeroFS cache, sized with `--cache-size` (default 10 GB, minimum 2 GB) | From the ZeroFS cache, else from the bucket |
+
+In both modes the Perkeep index (`index.leveldb`), the identity and perkeepd's small queues and caches stay local, and the bucket holds the same `diskpacked` layout, so a server recovers into either mode (see Recovery kit). The mode is recorded in the server directory's `mode` file, so a hand edit of `server.toml` cannot switch it under existing data.
+
+Cache mode suits a server with little disk: the archive can be far larger than the machine. The cost is that reading old blobs (restores, the gateway, search on file contents) fetches them from the bucket, and nothing is readable while the bucket is unreachable. Writes are unaffected: ZeroFS buffers them in RAM and PUTs them to the bucket, and the durability watermark works the same way, so expiry still waits until blobs are flushed to the bucket.
+
+**Startup and shutdown.** `server run` starts ZeroFS, waits for its sockets, mounts it, then starts perkeepd, the registry and the tailcat listener. On stop it drains the replication queue (store mode; cache mode has none), flushes, closes perkeepd, then stops ZeroFS, which flushes again. A clean stop means everything is in the bucket.
 
 **ZeroFS.** keepsync pins ZeroFS v2.3.7 and checks SHA-256 for both the release tarball and the platform binary. Builds exist for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and freebsd/amd64. The binary is looked up as `--zerofs`, then on PATH, then in `zerofs/` in the server directory. If none is found, `server init` downloads the pin, unless `--no-download` is given. `run` never downloads. A binary that does not match the pin produces a warning, never an upgrade.
 
@@ -153,11 +163,13 @@ The supervisor writes `zerofs.toml` with 9P and RPC on private Unix sockets only
 
 The original design said mount mode needs root. The FUSE mode removed that.
 
-**ZeroFS cache.** The replica is written far more than it is read: reads are diskpacked's index lookups, the durability check's stats, and recovery. So `server.toml` defaults to `cache_size_gb = 2` and `memory_cache_gb = 0.25`, which are ZeroFS 2.3.7's floors (it gives each half of the disk cache at least 1 GiB and each half of the memory cache at least 32 MiB, whatever is configured). The cache is read-only in effect: writes are buffered in RAM (up to about 1.25 GiB while a burst is being uploaded) and PUT straight to the bucket, so the cache size changes neither write buffering nor what a flush has to do. A read that misses the cache is a GET from the bucket, so recovery on a fresh machine with an empty cache reads everything from the bucket, and a small cache only means older data is fetched again rather than served locally.
+**ZeroFS cache.** In store mode the replica is written far more than it is read: reads are diskpacked's index lookups, the durability check's stats, and recovery. So store mode defaults to `cache_size_gb = 2` and `memory_cache_gb = 0.25`, which are ZeroFS 2.3.7's floors (it gives each half of the disk cache at least 1 GiB and each half of the memory cache at least 32 MiB, whatever is configured). In cache mode the disk cache is every read's local copy, so it defaults to 10 GB and the user sets it with `--cache-size` (`cache_size_gb`); below 2 GB is rejected, because ZeroFS would not use less. ZeroFS gives a tenth of it (at least 1 GiB, at most 16 GiB) to metadata and the rest to data. The cache is a read cache in effect: writes are buffered in RAM (up to about 1.25 GiB while a burst is being uploaded) and PUT straight to the bucket, so the cache size changes neither write buffering nor what a flush has to do. A read that misses the cache is a GET from the bucket, so recovery on a fresh machine with an empty cache reads everything from the bucket, and a small cache only means older data is fetched again rather than served locally.
 
 **ZeroFS password.** `server init` generates it from 32 random bytes and stores it in `server.toml` and the recovery kit. `--zerofs-password-file` adopts an existing bucket's password instead.
 
 **Durability watermark.** Every `flush_interval` (default 1m) the server flushes ZeroFS. A blob is durable once it was seen in the diskpacked replica before a flush started, and that flush succeeded. Only blobs someone asked about are tracked: `Durable` queues the unseen ones, and each flush checks the queue against the replica first. A ref counts as durable only if its whole closure is: a file's parts, recursively; a claim's permanodes; and, for a claim or permanode, the server's public key, which a reindex needs to verify it. A ref the server doesn't have is not durable. `server status` shows the last flush, or that flushing is failing.
+
+**Disk use.** `server status` shows the mode and what it uses. In store mode: the local blob store, the index and the ZeroFS cache. In cache mode: the ZeroFS cache against its limit, and the index. Both show the whole server directory, the volume's free space, and the bucket's size and object count. Local sizes are measured by walking the directories (at most every 15 seconds, never into the mount). The bucket is listed with S3 ListObjectsV2 at startup and every 10 minutes, one request per 1000 objects, so its figure can be up to 10 minutes old. ZeroFS packs data into large segments, so the listing stays short. Every member node can fetch a short summary over the registry: health (flushes working or failing), the last flush, local disk use for the mode, the volume's free space, the bucket size and how many nodes are online. `keepsync status` on a node prints it under the server line. Node keys, scopes and the node table stay in `server status`.
 
 **Signing.** Nodes upload file blobs, which are content-addressed and unsigned. Then they ask the registry to keep a fileref at a path in a kept folder, with the file's Syncthing version, and the server signs the claims (see "Kept tree layout"). Signing is serialised. The server writes nothing if the path already holds that ref (`ClaimUnchanged`). Otherwise it decides with version vectors (`api.Supersedes`):
 
@@ -305,9 +317,9 @@ What a node can reach through the gateway is its scope (see "Node scopes"). With
 **`keepsync recover <kit>`**
 
 1. Mounts ZeroFS on the kit's bucket.
-2. Starts perkeepd on fresh local storage and a fresh index.
-3. Copies every blob of the bucket's diskpacked replica into it, which reindexes them.
-4. Installs the tailcat key, config and registry. It prefers the registry mirrored in the bucket, and falls back to the kit's copy.
+2. Starts perkeepd on a fresh index, in the kit's mode or the one given with `--mode`.
+3. In store mode, copies every blob of the bucket's diskpacked replica into fresh local storage, which reindexes them. In cache mode it copies nothing: it reads every blob from the bucket, checks its hash and feeds it to the index.
+4. Records the mode it recovered in, and installs the tailcat key, config and registry. It prefers the registry mirrored in the bucket, and falls back to the kit's copy.
 
 Then `server run` brings the server back at the same address and nodes reconnect on their own. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. `--access-key`/`--secret-key` supply write credentials when the kit holds a read-only token, and `--mount` picks the mount mode. ZeroFS is single-writer, so never recover while the old server may still be running against the bucket.
 
@@ -325,18 +337,18 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 
 | Command | Role | What it does |
 | --- | --- | --- |
-| `server init --bucket <url> [flags]` | Server | Creates the tailcat key, Perkeep identity and ZeroFS config, finds or downloads ZeroFS, writes the kit, prints the address. Flags: `--endpoint`, `--region`, `--access-key`, `--secret-key` (default `$AWS_*`), `--allow-http`, `--zerofs`, `--zerofs-password-file`, `--mount`, `--mount-dir`, `--no-download`, `--kit`, `--derp-map`, `--derp-region`. |
+| `server init --bucket <url> [flags]` | Server | Creates the tailcat key, Perkeep identity and ZeroFS config, finds or downloads ZeroFS, writes the kit, prints the address. Flags: `--endpoint`, `--region`, `--access-key`, `--secret-key` (default `$AWS_*`), `--allow-http`, `--zerofs`, `--zerofs-password-file`, `--mode store|cache`, `--cache-size <GB>`, `--mount`, `--mount-dir`, `--no-download`, `--kit`, `--derp-map`, `--derp-region`. |
 | `server run` | Server | Supervises ZeroFS, perkeepd, the registry and tailcat. Drains and flushes on stop. |
 | `server add <nodekey> [--name]` | Server | Approves a node. The name defaults to the one the node registers with. |
 | `server remove <name>` | Server | Removes a node. |
 | `server nodes` | Server | Lists members. |
-| `server status` | Server | Address, key, last flush or flush failure, folders. |
+| `server status` | Server | Address, key, last flush or flush failure, mode, local disk and bucket use, volume free space, folders, nodes. |
 | `server kit [--out]` | Server | Regenerates the recovery kit. |
 | `server baseline <out.json>` | Server | Flushes and snapshots the server for a drill. |
 | `server grant <name> <blobs\|read>` | Server | Sets a node's Perkeep scope. |
 | `node init --server <tc… or DNS name> [--name]` | Node | Writes config and keys, prints the node key, exits. The name defaults to the hostname. |
 | `node run` | Node | Runs tailcat, Syncthing, the keepers and the gateway. |
-| `status` | Node | Server connection (or how long it has been unreachable), peers, folders. |
+| `status` | Node | Server connection (or how long it has been unreachable) with a short server summary (health, last flush, disk use, nodes online), peers, folders. |
 | `folder add <name> <path>` | Node | Creates a synced folder in the registry and attaches it here. |
 | `folder join <name> <path> [--merge]` | Node | Attaches an existing folder here. A directory with files needs `--merge`. |
 | `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here. Files stay. |
@@ -346,7 +358,7 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 | `restore <folder> [<path>] [--at] [--to] [--force] [--deleted]` | Node | Pulls kept files back, including expired ones, and from unkept folders. |
 | `conflicts` / `conflicts resolve <path>` | Node | Lists conflict copies and hook state, or runs the hook now. |
 | `gateway config [--path]` | Node | Writes a Perkeep client config for the local gateway. |
-| `recover <kit> [--drill --bucket <copy> --baseline <file>]` | Any | Rebuilds the server from the bucket, or runs the drill. |
+| `recover <kit> [--mode store\|cache] [--drill --bucket <copy> --baseline <file>]` | Any | Rebuilds the server from the bucket, in the kit's mode or `--mode`, or runs the drill. |
 
 `purge` exists as a command but reports "not implemented yet".
 

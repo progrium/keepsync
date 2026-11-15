@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/progrium/keepsync/internal/api"
+	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/keeper"
 	"github.com/progrium/keepsync/internal/kit"
 	"github.com/progrium/keepsync/internal/node"
@@ -787,6 +788,47 @@ func TestCluster(t *testing.T) {
 			if got, _ := os.ReadFile(filepath.Join(to, "e.txt")); string(got) != "expires\n" {
 				t.Errorf("plain restore of an expired file: %q (%+v)", got, res)
 			}
+		})
+	})
+
+	step("status-usage", func(t *testing.T) {
+		var st server.Status
+		if err := c.serverCall(server.MethodStatus, nil, &st); err != nil {
+			t.Fatal(err)
+		}
+		d := st.Disk
+		t.Logf("server disk: %+v", d)
+		if d.Mode != e2eMode() || d.MeasuredAt.IsZero() || d.Err != "" {
+			t.Errorf("disk usage: mode %q (want %q), measured %v, err %q", d.Mode, e2eMode(), d.MeasuredAt, d.Err)
+		}
+		if d.IndexBytes == 0 || d.VolumeFree == 0 || d.CacheLimitBytes == 0 {
+			t.Errorf("disk usage missing: %+v", d)
+		}
+		if (e2eMode() == config.ModeStore) != (d.BlobsBytes > 0) {
+			t.Errorf("%s mode with %d bytes of local blobs", e2eMode(), d.BlobsBytes)
+		}
+		if d.Bucket.Err != "" || d.Bucket.MeasuredAt.IsZero() || d.Bucket.Bytes == 0 {
+			t.Errorf("bucket usage: %+v", d.Bucket)
+		}
+		if e2eMode() == config.ModeCache {
+			if _, err := os.Stat(filepath.Join(c.srvCfg.PerkeepDir(), "blobs", "packed")); err == nil {
+				t.Error("cache mode created a local blob store")
+			}
+		}
+		// Any member sees a short summary in its own status.
+		eventually(t, time.Minute, "server summary on a node", func() error {
+			ns, err := a.status()
+			if err != nil {
+				return err
+			}
+			s := ns.ServerSummary
+			if s == nil {
+				return fmt.Errorf("no summary: %s", ns.SummaryErr)
+			}
+			if s.Mode != e2eMode() || s.Nodes != 3 || s.Online == 0 || s.LastFlush.IsZero() || s.IndexBytes == 0 {
+				return fmt.Errorf("summary %+v", *s)
+			}
+			return nil
 		})
 	})
 

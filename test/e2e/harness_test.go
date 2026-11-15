@@ -13,6 +13,9 @@
 //
 //	KEEPSYNC_ZEROFS_BIN=/opt/e2ebin/zerofs KEEPSYNC_MINIO_BIN=/opt/e2ebin/minio \
 //	  go test ./test/e2e -v -timeout 30m
+//
+// KEEPSYNC_E2E_MODE=cache runs the same suite with the server in cache
+// mode (no local blob store).
 package e2e
 
 import (
@@ -381,6 +384,16 @@ func newCluster(t *testing.T) *cluster {
 	return c
 }
 
+// e2eMode is the server mode under test, from KEEPSYNC_E2E_MODE (store or
+// cache; default store). perkeepd runs once per process, so each mode is a
+// separate `go test` run.
+func e2eMode() string {
+	if m := os.Getenv("KEEPSYNC_E2E_MODE"); m != "" {
+		return m
+	}
+	return config.ModeStore
+}
+
 func (c *cluster) storage() config.Storage {
 	return config.Storage{
 		URL:             "s3://" + c.bucket + "/" + c.prefix,
@@ -404,6 +417,7 @@ func (c *cluster) startServer() {
 		Storage:    c.storage(),
 		ZeroFS:     c.zfsBin,
 		Mount:      string(zerofs.MountFUSE),
+		Mode:       e2eMode(),
 		NoDownload: true,
 		Logf:       lf,
 	})

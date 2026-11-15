@@ -52,6 +52,8 @@ keepsync server init \
 
 For AWS S3, drop `--endpoint` and pass your `--region`. For a local MinIO over plain HTTP, add `--allow-http`.
 
+`server init` takes `--mode store` (the default) or `--mode cache`. A **store** server keeps every archived blob on its own disk and copies it to the bucket; reads are local. A **cache** server keeps no blob store on disk: Perkeep writes straight to the bucket through ZeroFS, and local disk holds only the index and ZeroFS's cache, which you size with `--cache-size <GB>` (default 10, minimum 2). Use cache mode when the archive is bigger than the server's disk; reading old files then fetches them from the bucket. The mode can't change after init, but a recovery can pick either (see [Recover a lost server](#recover-a-lost-server)).
+
 `server init` creates the server's tailcat key, its Perkeep identity and the ZeroFS config, finds or downloads ZeroFS, and writes the **recovery kit** to `./keepsync-recovery.zip.age` (or `--kit <path>`). It prints:
 
 - the server's address (`tc…`), which nodes need to join;
@@ -70,7 +72,7 @@ It mounts ZeroFS, starts Perkeep and the registry, and flushes to the bucket eve
 Check on it with:
 
 ```sh
-keepsync server status   # address, last flush (or why flushing fails), nodes
+keepsync server status   # address, last flush (or why flushing fails), mode, disk and bucket use, nodes
 ```
 
 ### 2. Join a node
@@ -95,7 +97,7 @@ Then start the node and leave it running:
 keepsync node run
 ```
 
-Check it with `keepsync status`, which shows the server connection, peers and folders. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
+Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
 
 Repeat for every machine. The approved nodes find and connect to each other on their own.
 
@@ -276,7 +278,7 @@ keepsync recover keepsync-recovery.zip.age
 keepsync server run
 ```
 
-`recover` mounts ZeroFS on the bucket, copies every archived blob into a fresh Perkeep and reindexes it, then installs the key, config and registry. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. Nodes reconnect on their own, because the address is the same.
+`recover` mounts ZeroFS on the bucket and rebuilds the Perkeep index from it, then installs the key, config and registry. A store-mode server also gets every archived blob copied back to local disk; a cache-mode one reads them from the bucket as needed. `--mode store|cache` recovers into a different mode from the one the kit was made with. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. Nodes reconnect on their own, because the address is the same.
 
 ZeroFS allows only one writer, so **never recover while the old server could still be running against the bucket.**
 
