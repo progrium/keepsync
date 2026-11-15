@@ -9,6 +9,7 @@ require (
 	github.com/tailscale/tailcat v0.7.1-0.20261105151022-e00cdde6ff78
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/sys v0.49.0
+	golang.org/x/term v0.47.0
 	perkeep.org v0.0.0-20261115024055-257aaa416e0c
 	tailscale.com v1.105.0-pre.0.20261013225543-fb79793d99f5
 )
@@ -162,7 +163,6 @@ require (
 	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	golang.org/x/tools v0.51.0 // indirect
