@@ -51,10 +51,17 @@ type Config struct {
 	// Start is called (Start does not start ZeroFS), and Flush is called
 	// by Server.Flush to advance the durability watermark.
 	ZeroFS api.ZeroFS
-	// Transport, if set, serves perkeepd to nodes on api.PortPerkeep. Nodes
-	// may upload, stat and fetch blobs, but not sign, search or reach the
-	// debug handlers.
+	// Transport, if set, serves perkeepd to nodes on api.PortPerkeep, each
+	// within its scope (see Scope).
 	Transport api.Transport
+	// Scope, if set, returns a node's scope, ScopeBlobs or ScopeRead, and
+	// anything else for a node that may do nothing (registry.Server.Scope
+	// fits). It is asked on every request, so a grant applies at once.
+	// With the blobs scope a node may upload, stat and fetch blobs; read
+	// adds search, enumeration, the web UI, status and help. No scope may
+	// sign, remove blobs or reach the debug handlers. Nil gives every
+	// node the blobs scope.
+	Scope func(peer api.NodeKey) string
 	// Logf, if set, receives log lines. Defaults to log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -129,6 +136,7 @@ type Server struct {
 	signer   *schema.Signer
 	pubKey   string
 	pubRef   blob.Ref
+	roots    roots // handler prefixes, for node scopes
 	ln       *pipeListener
 	hs       *http.Server
 	shutdown interface{ Close() error }
@@ -203,8 +211,11 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 
 	s.ln = newPipeListener()
 	s.hs = &http.Server{
-		Handler: peerFilter(mux),
+		Handler: s.filter(mux),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if gc, ok := c.(*grantConn); ok && gc.peer != "" {
+				ctx = context.WithValue(ctx, peerKeyCtx{}, gc.peer)
+			}
 			return auth.GrantCtxKey.WithValue(ctx, grantFor(c))
 		},
 		ErrorLog: log.New(logWriter{s.logf}, "pkserver: http: ", 0),
@@ -226,9 +237,13 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		s.Close()
 		return nil, fmt.Errorf("pkserver: uploading public key: %w", err)
 	}
+	if err := s.loadRoots(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
 	if cfg.Transport != nil {
 		cfg.Transport.Handle(api.PortPerkeep, func(conn net.Conn, peer api.NodeKey) {
-			s.ln.push(&grantConn{Conn: conn, grant: nodeGrant})
+			s.ln.push(&grantConn{Conn: conn, grant: nodeGrant, peer: peer})
 		})
 	}
 	return s, nil
@@ -299,22 +314,6 @@ func (s *Server) Close() error {
 		errs = append(errs, s.shutdown.Close())
 	}
 	return errors.Join(errs...)
-}
-
-// nodeGrant is what a node may do over tailcat: upload, stat and fetch
-// blobs, plus discovery, which upload needs. Not sign, enumerate or remove.
-const nodeGrant = auth.OpVivify
-
-// peerFilter keeps nodes away from handlers that check no operation, such
-// as /debug/.
-func peerFilter(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if g, _ := auth.GrantCtxKey.ValueOk(r.Context()); g != auth.OpAll && strings.HasPrefix(r.URL.Path, "/debug/") {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		h.ServeHTTP(w, r)
-	})
 }
 
 type logWriter struct{ logf func(string, ...any) }

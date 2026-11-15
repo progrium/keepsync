@@ -186,17 +186,9 @@ func (s *Server) Add(ctx context.Context, key api.NodeKey, name string) error {
 func (s *Server) Remove(ctx context.Context, nameOrKey string) error {
 	var key api.NodeKey
 	err := s.mutate(ctx, func(st *State) error {
-		i := -1
-		for j, n := range st.Nodes {
-			if string(n.Key) == nameOrKey || (n.Name != "" && n.Name == nameOrKey) {
-				if i >= 0 {
-					return fmt.Errorf("%w: %q matches more than one node", ErrBadRequest, nameOrKey)
-				}
-				i = j
-			}
-		}
-		if i < 0 {
-			return fmt.Errorf("%w: node %q", ErrNotFound, nameOrKey)
+		i, err := st.findNode(nameOrKey)
+		if err != nil {
+			return err
 		}
 		key = st.Nodes[i].Key
 		st.Nodes = append(st.Nodes[:i], st.Nodes[i+1:]...)
@@ -226,6 +218,58 @@ func (s *Server) Remove(ctx context.Context, nameOrKey string) error {
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+// Perkeep gateway scopes (see docs/design.md, "Perkeep gateway"). A
+// node's scope decides what pkserver lets it do over api.PortPerkeep.
+const (
+	// ScopeBlobs allows uploading and fetching blobs, which is what the
+	// keeper needs. Every node has it by default.
+	ScopeBlobs = "blobs"
+	// ScopeRead adds search, the web UI, pk-get and pk-mount: everything
+	// that reads the archive. It still cannot sign or delete.
+	ScopeRead = "read"
+)
+
+// Grant sets the Perkeep gateway scope of a node, by name or key (`server
+// grant <name> <scope>`). There is no write scope yet.
+func (s *Server) Grant(ctx context.Context, nameOrKey, scope string) error {
+	switch scope {
+	case ScopeBlobs, ScopeRead:
+	case "write":
+		return fmt.Errorf("%w: the write scope is not supported yet", ErrBadRequest)
+	default:
+		return fmt.Errorf("%w: unknown scope %q (want %s or %s)", ErrBadRequest, scope, ScopeBlobs, ScopeRead)
+	}
+	if scope == ScopeBlobs {
+		scope = "" // the default
+	}
+	return s.mutate(ctx, func(st *State) error {
+		i, err := st.findNode(nameOrKey)
+		if err != nil {
+			return err
+		}
+		if st.Nodes[i].Scope == scope {
+			return errNoChange
+		}
+		st.Nodes[i].Scope = scope
+		return nil
+	})
+}
+
+// Scope returns the Perkeep gateway scope of an approved node, or "" if
+// key is not approved. pkserver calls it for every request a node makes.
+func (s *Server) Scope(key api.NodeKey) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.state.node(key)
+	if n == nil {
+		return ""
+	}
+	if n.Scope == "" {
+		return ScopeBlobs
+	}
+	return n.Scope
 }
 
 // SetReceiveOnly marks a member of a folder receive-only, or clears it.

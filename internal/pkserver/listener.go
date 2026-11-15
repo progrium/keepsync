@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"perkeep.org/pkg/auth"
+
+	"github.com/progrium/keepsync/internal/api"
 )
 
 // grantConn is a connection carrying the operations its requests are
@@ -13,6 +15,7 @@ import (
 type grantConn struct {
 	net.Conn
 	grant auth.Operation
+	peer  api.NodeKey // the node it came from over tailcat, if any
 }
 
 func grantFor(c net.Conn) auth.Operation {

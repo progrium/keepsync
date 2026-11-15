@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -16,6 +17,9 @@ type NodeRecord struct {
 	// NamedByAdmin is set when the name came from `server add --name`, in
 	// which case Register does not overwrite it.
 	NamedByAdmin bool `json:"namedByAdmin,omitempty"`
+	// Scope is the node's Perkeep gateway scope (`server grant`): empty
+	// or ScopeBlobs for the default, or ScopeRead.
+	Scope string `json:"scope,omitempty"`
 }
 
 // State is everything the registry persists: the allow list (approved
@@ -88,6 +92,23 @@ func (s *State) node(key api.NodeKey) *NodeRecord {
 		}
 	}
 	return nil
+}
+
+// findNode returns the index of the node whose key or name is nameOrKey.
+func (s *State) findNode(nameOrKey string) (int, error) {
+	i := -1
+	for j, n := range s.Nodes {
+		if string(n.Key) == nameOrKey || (n.Name != "" && n.Name == nameOrKey) {
+			if i >= 0 {
+				return -1, fmt.Errorf("%w: %q matches more than one node", ErrBadRequest, nameOrKey)
+			}
+			i = j
+		}
+	}
+	if i < 0 {
+		return -1, fmt.Errorf("%w: node %q", ErrNotFound, nameOrKey)
+	}
+	return i, nil
 }
 
 func (s *State) folder(name string) *api.Folder {

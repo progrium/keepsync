@@ -17,6 +17,7 @@ require (
 
 require (
 	9fans.net/go v0.0.8-0.20250307142834-96bdba94b63f // indirect
+	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5 // indirect
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2 // indirect
 	buf.build/go/protovalidate v1.4.0 // indirect
 	cel.dev/cel-go v0.32.0 // indirect
@@ -187,3 +188,8 @@ require (
 )
 
 replace github.com/syncthing/syncthing => ./third_party/syncthing
+
+tool (
+	perkeep.org/cmd/pk-get
+	perkeep.org/cmd/pk-mount
+)

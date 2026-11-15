@@ -706,3 +706,53 @@ func TestPathsAt(t *testing.T) {
 		t.Fatalf("non-member PathsAt: %v", err)
 	}
 }
+
+func TestGrantScope(t *testing.T) {
+	e := newEnv(t)
+	ctx := ctx(t)
+	a := e.node("a")
+	key := a.t.Key()
+
+	if got := e.srv.Scope(key); got != ScopeBlobs {
+		t.Fatalf("default scope %q, want %q", got, ScopeBlobs)
+	}
+	if got := e.srv.Scope("nodekey:unknown"); got != "" {
+		t.Fatalf("unapproved node scope %q, want empty", got)
+	}
+	if err := e.srv.Grant(ctx, "a", ScopeRead); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.srv.Scope(key); got != ScopeRead {
+		t.Fatalf("after grant: %q", got)
+	}
+	for _, bad := range []string{"write", "owner", ""} {
+		if err := e.srv.Grant(ctx, "a", bad); !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("grant %q: %v, want ErrBadRequest", bad, err)
+		}
+	}
+	if err := e.srv.Grant(ctx, "nobody", ScopeRead); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("grant unknown: %v", err)
+	}
+
+	// The scope is persisted, and survives a restart.
+	e.srv.Close()
+	e.start()
+	if got := e.srv.Scope(key); got != ScopeRead {
+		t.Fatalf("after restart: %q", got)
+	}
+	var found bool
+	for _, n := range e.srv.Nodes() {
+		if n.Key == key {
+			found = n.Scope == ScopeRead
+		}
+	}
+	if !found {
+		t.Fatal("Nodes() does not report the read scope")
+	}
+	if err := e.srv.Grant(ctx, string(key), ScopeBlobs); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.srv.Scope(key); got != ScopeBlobs {
+		t.Fatalf("back to blobs: %q", got)
+	}
+}

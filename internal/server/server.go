@@ -242,11 +242,20 @@ func (s *Server) start(ctx context.Context) error {
 	}
 	s.zfs = zfs
 
+	// Node scopes live in the registry, which needs pkserver first. Until
+	// it is up, nodes may do nothing over api.PortPerkeep.
+	var reg atomic.Pointer[registry.Server]
 	if s.pk, err = pkserver.Start(ctx, pkserver.Config{
 		Dir:       cfg.PerkeepDir(),
 		ZeroFS:    zfs,
 		Transport: s.tr,
-		Logf:      s.logf,
+		Scope: func(k api.NodeKey) string {
+			if r := reg.Load(); r != nil {
+				return r.Scope(k)
+			}
+			return ""
+		},
+		Logf: s.logf,
 	}); err != nil {
 		return fmt.Errorf("server: perkeep: %w", err)
 	}
@@ -267,6 +276,7 @@ func (s *Server) start(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("server: registry: %w", err)
 	}
+	reg.Store(s.reg)
 	return s.reg.Serve()
 }
 
