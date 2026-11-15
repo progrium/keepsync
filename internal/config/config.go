@@ -69,9 +69,9 @@ func RoleDir(base, role string) string { return filepath.Join(base, role) }
 type Network struct {
 	// DERPMapURL overrides tailcat's default DERP map, for a self-hosted
 	// derper. It may be an http(s) URL or a path to a local JSON file.
-	DERPMapURL string `toml:"derp_map_url,omitempty"`
+	DERPMapURL string `toml:"derp_map_url,omitempty,omitzero"`
 	// RegionID pins the bootstrap DERP region from the map.
-	RegionID int `toml:"derp_region_id,omitempty"`
+	RegionID int `toml:"derp_region_id,omitempty,omitzero"`
 }
 
 // Storage is the S3-compatible bucket ZeroFS persists to.
@@ -79,26 +79,26 @@ type Storage struct {
 	// URL is the bucket and prefix, such as "s3://my-bucket/keepsync", or
 	// "file:///path" for local storage (testing).
 	URL             string `toml:"url"`
-	Endpoint        string `toml:"endpoint,omitempty"`
-	Region          string `toml:"region,omitempty"`
-	AccessKeyID     string `toml:"access_key_id,omitempty"`
-	SecretAccessKey string `toml:"secret_access_key,omitempty"`
-	AllowHTTP       bool   `toml:"allow_http,omitempty"`
+	Endpoint        string `toml:"endpoint,omitempty,omitzero"`
+	Region          string `toml:"region,omitempty,omitzero"`
+	AccessKeyID     string `toml:"access_key_id,omitempty,omitzero"`
+	SecretAccessKey string `toml:"secret_access_key,omitempty,omitzero"`
+	AllowHTTP       bool   `toml:"allow_http,omitempty,omitzero"`
 }
 
 // ZeroFS configures the server's ZeroFS supervisor.
 type ZeroFS struct {
 	// Binary is an explicit zerofs path (the --zerofs flag). Empty means
 	// look on PATH, then in the server dir.
-	Binary string `toml:"binary,omitempty"`
+	Binary string `toml:"binary,omitempty,omitzero"`
 	// Password is the ZeroFS encryption password.
 	Password string `toml:"password"`
 	// Mount is the mount mode: "fuse" (default), "v9fs" or "external".
-	Mount string `toml:"mount,omitempty"`
+	Mount string `toml:"mount,omitempty,omitzero"`
 	// MountDir overrides the mount point (default <server dir>/zerofs/mnt).
-	MountDir      string  `toml:"mount_dir,omitempty"`
-	CacheSizeGB   float64 `toml:"cache_size_gb,omitempty"`
-	MemoryCacheGB float64 `toml:"memory_cache_gb,omitempty"`
+	MountDir      string  `toml:"mount_dir,omitempty,omitzero"`
+	CacheSizeGB   float64 `toml:"cache_size_gb,omitempty,omitzero"`
+	MemoryCacheGB float64 `toml:"memory_cache_gb,omitempty,omitzero"`
 }
 
 // Duration is a time.Duration that reads and writes as "48h", "30s".
@@ -137,7 +137,7 @@ type Server struct {
 	ZeroFS  ZeroFS  `toml:"zerofs"`
 	// FlushInterval is how often the server flushes ZeroFS and advances
 	// the durability watermark. Default 1m.
-	FlushInterval Duration `toml:"flush_interval,omitempty"`
+	FlushInterval Duration `toml:"flush_interval,omitempty,omitzero"`
 }
 
 // DefaultFlushInterval is the default Server.FlushInterval.
@@ -172,7 +172,7 @@ type Folder struct {
 	Name string `toml:"name"`
 	Path string `toml:"path"`
 	// ID is the Syncthing folder ID, from the registry.
-	ID string `toml:"id,omitempty"`
+	ID string `toml:"id,omitempty,omitzero"`
 }
 
 // Node is node.toml.
@@ -186,9 +186,9 @@ type Node struct {
 	Server  string  `toml:"server"`
 	Network Network `toml:"network"`
 	// KeepInterval is how often the keeper walks kept folders. Default 5m.
-	KeepInterval Duration `toml:"keep_interval,omitempty"`
+	KeepInterval Duration `toml:"keep_interval,omitempty,omitzero"`
 	// ConflictHook is the global conflict hook script (milestone 5).
-	ConflictHook string   `toml:"conflict_hook,omitempty"`
+	ConflictHook string   `toml:"conflict_hook,omitempty,omitzero"`
 	Folders      []Folder `toml:"folder"`
 }
 
