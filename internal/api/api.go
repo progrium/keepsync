@@ -133,6 +133,9 @@ type RegistryClient interface {
 	Keep(ctx context.Context, folder string, p KeepPolicy) (BlobRef, error)
 	ClaimPath(ctx context.Context, c PathClaim) (ClaimResult, error)
 	Paths(ctx context.Context, permanode BlobRef) (map[string]PathEntry, error)
+	// PathsAt is Paths as of time at: only claims the server signed at or
+	// before at count. at is when the server kept a version, not file mtime.
+	PathsAt(ctx context.Context, permanode BlobRef, at time.Time) (map[string]PathEntry, error)
 	Durable(ctx context.Context, refs []BlobRef) ([]bool, error)
 }
 
@@ -143,6 +146,8 @@ type Signer interface {
 	// rejects a claim whose ModTime is not newer than the current entry.
 	ClaimPath(ctx context.Context, c PathClaim) (ClaimResult, error)
 	Paths(ctx context.Context, permanode BlobRef) (map[string]PathEntry, error)
+	// PathsAt is Paths counting only claims signed at or before at.
+	PathsAt(ctx context.Context, permanode BlobRef, at time.Time) (map[string]PathEntry, error)
 }
 
 // Durability answers whether blobs have reached the bucket.

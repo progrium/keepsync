@@ -132,11 +132,12 @@ func (t *Transport) Close() error {
 // store. Blobs become durable only when MarkDurable is called, standing in
 // for a ZeroFS flush.
 type Perkeep struct {
-	mu     sync.Mutex
-	blobs  map[api.BlobRef]bool // ref -> durable
-	trees  map[api.BlobRef]map[string]api.PathEntry
-	nextPN int
-	Claims int // number of claims written, for assertions
+	mu      sync.Mutex
+	blobs   map[api.BlobRef]bool // ref -> durable
+	trees   map[api.BlobRef]map[string]api.PathEntry
+	history map[api.BlobRef][]historyEntry
+	nextPN  int
+	Claims  int // number of claims written, for assertions
 }
 
 func NewPerkeep() *Perkeep {
@@ -193,6 +194,10 @@ func (p *Perkeep) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResu
 	claim := api.BlobRef(fmt.Sprintf("sha224-claim%04d", p.Claims))
 	p.blobs[claim] = false
 	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claim: claim}
+	if p.history == nil {
+		p.history = map[api.BlobRef][]historyEntry{}
+	}
+	p.history[c.Permanode] = append(p.history[c.Permanode], historyEntry{at: time.Now(), path: c.Path, entry: tree[c.Path]})
 	return api.ClaimWritten, nil
 }
 
@@ -206,6 +211,27 @@ func (p *Perkeep) Paths(ctx context.Context, permanode api.BlobRef) (map[string]
 	out := make(map[string]api.PathEntry, len(tree))
 	for k, v := range tree {
 		out[k] = v
+	}
+	return out, nil
+}
+
+type historyEntry struct {
+	at    time.Time
+	path  string
+	entry api.PathEntry
+}
+
+func (p *Perkeep) PathsAt(ctx context.Context, permanode api.BlobRef, at time.Time) (map[string]api.PathEntry, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.trees[permanode]; !ok {
+		return nil, fmt.Errorf("fake: unknown permanode %s", permanode)
+	}
+	out := map[string]api.PathEntry{}
+	for _, h := range p.history[permanode] {
+		if !h.at.After(at) {
+			out[h.path] = h.entry
+		}
 	}
 	return out, nil
 }
@@ -443,6 +469,10 @@ func (c *registryClient) ClaimPath(ctx context.Context, cl api.PathClaim) (api.C
 
 func (c *registryClient) Paths(ctx context.Context, pn api.BlobRef) (map[string]api.PathEntry, error) {
 	return c.r.pk.Paths(ctx, pn)
+}
+
+func (c *registryClient) PathsAt(ctx context.Context, pn api.BlobRef, at time.Time) (map[string]api.PathEntry, error) {
+	return c.r.pk.PathsAt(ctx, pn, at)
 }
 
 func (c *registryClient) Durable(ctx context.Context, refs []api.BlobRef) ([]bool, error) {

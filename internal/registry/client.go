@@ -279,6 +279,15 @@ func (c *Client) Keep(ctx context.Context, folder string, p api.KeepPolicy) (api
 	return ref, err
 }
 
+func (c *Client) PathsAt(ctx context.Context, pn api.BlobRef, at time.Time) (map[string]api.PathEntry, error) {
+	var out map[string]api.PathEntry
+	err := c.call(ctx, mPathsAt, pathsAtParams{Permanode: pn, At: at}, &out)
+	if out == nil && err == nil {
+		out = map[string]api.PathEntry{}
+	}
+	return out, err
+}
+
 func (c *Client) ClaimPath(ctx context.Context, cl api.PathClaim) (api.ClaimResult, error) {
 	var r api.ClaimResult
 	err := c.call(ctx, mClaimPath, cl, &r)

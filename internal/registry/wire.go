@@ -39,6 +39,7 @@ const (
 	mKeep       = "keep"
 	mClaimPath  = "claimPath"
 	mPaths      = "paths"
+	mPathsAt    = "paths_at"
 	mDurable    = "durable"
 	mLeave      = "leaveFolder"
 	mPong       = "pong"
@@ -73,6 +74,11 @@ type keepParams struct {
 
 type permanodeParams struct {
 	Permanode api.BlobRef `json:"permanode"`
+}
+
+type pathsAtParams struct {
+	Permanode api.BlobRef `json:"permanode"`
+	At        time.Time   `json:"at"`
 }
 
 type refsParams struct {

@@ -552,6 +552,15 @@ func (s *Server) call(ctx context.Context, peer api.NodeKey, req request) (any, 
 			return nil, err
 		}
 		return s.paths(ctx, peer, p.Permanode)
+	case mPathsAt:
+		var p pathsAtParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		if err := s.authorizePermanode(peer, p.Permanode); err != nil {
+			return nil, err
+		}
+		return s.cfg.Signer.PathsAt(ctx, p.Permanode, p.At)
 	case mDurable:
 		var p refsParams
 		if err := decode(&p); err != nil {

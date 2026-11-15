@@ -668,3 +668,41 @@ func TestClientDropsSilentServer(t *testing.T) {
 		}
 	}
 }
+
+func TestPathsAt(t *testing.T) {
+	e := newEnv(t)
+	ctx := ctx(t)
+	a, b := e.node("a"), e.node("b")
+	a.c.AddFolder(ctx, "docs")
+	pn, err := a.c.Keep(ctx, "docs", policy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Unix(1_700_000_000, 0).UTC()
+	if _, err := a.c.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: "a.txt", File: "sha224-1", ModTime: t0}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	mid := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	a.c.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: "a.txt", File: "sha224-2", ModTime: t0.Add(time.Hour)})
+	a.c.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: "b.txt", File: "sha224-3", ModTime: t0})
+
+	then, err := a.c.PathsAt(ctx, pn, mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := then["a.txt"]; got.File != "sha224-1" || got.Claim == "" {
+		t.Fatalf("a.txt at mid = %+v", got)
+	}
+	if _, ok := then["b.txt"]; ok {
+		t.Fatal("b.txt present before it was claimed")
+	}
+	now, _ := a.c.PathsAt(ctx, pn, time.Now())
+	if now["a.txt"].File != "sha224-2" || now["b.txt"].File != "sha224-3" {
+		t.Fatalf("paths now = %+v", now)
+	}
+	if _, err := b.c.PathsAt(ctx, pn, mid); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("non-member PathsAt: %v", err)
+	}
+}
