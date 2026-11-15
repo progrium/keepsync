@@ -42,6 +42,8 @@ Node:
   keep <folder> [--grace 48h] [--max-defer 7d] [--expire 30d]
                                        mark a folder kept
   keep status <folder>                 files in grace, kept, expirable
+  restore <folder> [<path>] [--to <dir>] [--force]
+                                       pull kept files back, including expired
 
 Any:
   recover <kit>                        rebuild the server from the bucket
@@ -144,7 +146,7 @@ func run(e *env, args []string) error {
 	case "unkeep":
 		return notYet("unkeep", 2)
 	case "restore":
-		return notYet("restore", 3)
+		return e.restore(rest)
 	case "conflicts":
 		return notYet("conflicts", 5)
 	case "recover":

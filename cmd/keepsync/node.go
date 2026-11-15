@@ -272,3 +272,44 @@ func (e *env) keepStatus(args []string) error {
 	}
 	return nil
 }
+
+func (e *env) restore(args []string) error {
+	fs := newFlags(e, "restore")
+	var p node.RestoreParams
+	fs.StringVar(&p.To, "to", "", "restore into this directory instead of the folder")
+	fs.BoolVar(&p.Force, "force", false, "overwrite local files that differ from the kept version")
+	at := fs.String("at", "", "restore the tree as of a time (not supported yet)")
+	pos, err := parse(fs, args, 1, 2, "<folder> [<path>] [--to <dir>] [--force]")
+	if err != nil {
+		return err
+	}
+	if *at != "" {
+		return errors.New("--at is not supported yet: the server only answers for the current tree")
+	}
+	p.Folder = pos[0]
+	if len(pos) == 2 {
+		p.Path = pos[1]
+	}
+	var res node.RestoreResult
+	if err := e.nodeCall(node.MethodRestore, p, &res); err != nil {
+		return err
+	}
+	for _, f := range res.Restored {
+		fmt.Fprintf(e.stdout, "restored  %s\n", f)
+	}
+	for _, f := range res.Skipped {
+		fmt.Fprintf(e.stdout, "skipped   %s (differs locally; --force to overwrite)\n", f)
+	}
+	for _, f := range res.Errors {
+		fmt.Fprintf(e.stdout, "error     %s\n", f)
+	}
+	fmt.Fprintf(e.stdout, "%d restored, %d already present, %d skipped, %d errors into %s\n",
+		len(res.Restored), len(res.Unchanged), len(res.Skipped), len(res.Errors), res.Dir)
+	if res.Reexpire {
+		fmt.Fprintln(e.stdout, "note: some restored files are past the folder's expire window and will be removed from sync again on the next keeper pass; use --to to restore outside the folder")
+	}
+	if len(res.Errors) > 0 {
+		return errors.New("some files were not restored")
+	}
+	return nil
+}

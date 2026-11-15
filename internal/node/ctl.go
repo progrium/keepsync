@@ -22,6 +22,7 @@ const (
 	MethodFolderRm   = "folder.rm"
 	MethodKeep       = "keep"
 	MethodKeepStatus = "keep.status"
+	MethodRestore    = "restore"
 )
 
 // FolderParams is the body of MethodFolderAdd, MethodFolderJoin and
@@ -178,6 +179,12 @@ func (n *Node) handlers() {
 		}
 		pol.Permanode = pn
 		return KeepResult{Permanode: pn, Policy: pol}, nil
+	})
+	ctl.HandleFunc(n.ctl, MethodRestore, func(ctx context.Context, p RestoreParams) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		return n.restore(ctx, p)
 	})
 	ctl.HandleFunc(n.ctl, MethodKeepStatus, func(ctx context.Context, p FolderParams) (any, error) {
 		if err := ready(); err != nil {
