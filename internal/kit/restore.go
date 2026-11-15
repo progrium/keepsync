@@ -19,6 +19,7 @@ import (
 	"perkeep.org/pkg/auth"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/client"
+	"perkeep.org/pkg/schema"
 
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/pkserver"
@@ -28,6 +29,13 @@ import (
 // replicaPrefix is the handler of the diskpacked storage on ZeroFS, as
 // pkserver configures perkeepd.
 const replicaPrefix = "/sto-zerofs/"
+
+// BucketRegistryPath is where, relative to the ZeroFS mount, the server
+// mirrors its registry state on every change, so recovery gets the
+// current members and folders from the bucket rather than the kit's copy
+// from when it was made. It sits beside the diskpacked packs, which
+// diskpacked ignores.
+const BucketRegistryPath = ".keepsync/registry.json"
 
 // NewZeroFS makes the ZeroFS supervisor a restore runs. The default is
 // zerofs.New; tests substitute a fake.
@@ -57,15 +65,21 @@ type RestoreStats struct {
 	Copy time.Duration
 	// Total is the whole restore, ZeroFS start to index caught up.
 	Total time.Duration
+	// Registry is where Recover took the registry state from: "bucket",
+	// "kit" or "" for nowhere.
+	Registry string
 }
 
 // restoreEnv is a running restored server: ZeroFS on the bucket and
 // perkeepd on a fresh local dir.
 type restoreEnv struct {
-	zfs   api.ZeroFS
-	srv   *pkserver.Server
-	owner *client.Client
-	stats RestoreStats
+	zfs api.ZeroFS
+	srv *pkserver.Server
+	// registry is the registry state the server mirrored into the
+	// bucket, or nil if there is none.
+	registry []byte
+	owner    *client.Client
+	stats    RestoreStats
 }
 
 type restoreParams struct {
@@ -135,6 +149,9 @@ func restore(ctx context.Context, k *Kit, p restoreParams) (_ *restoreEnv, err e
 		}
 	}()
 	e.stats.ZeroFSStart = time.Since(start)
+	if b, err := os.ReadFile(filepath.Join(z.Dir(), BucketRegistryPath)); err == nil {
+		e.registry = b
+	}
 
 	e.srv, err = pkserver.Start(ctx, pkserver.Config{Dir: p.perkeepDir, ZeroFS: z, Logf: p.logf})
 	if err != nil {
@@ -175,18 +192,17 @@ func (e *restoreEnv) close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// copyBlobs copies every blob of from into to. Data blobs go first and
+// schema blobs (files, permanodes, claims) after, so that when perkeepd
+// sees a file it already has its chunks: blobpacked can pack the file and
+// the index can resolve it without waiting.
 func copyBlobs(ctx context.Context, from, to *client.Client, workers int, st *RestoreStats) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	refs := make(chan blob.SizedRef, 256)
-	var enumErr error
-	go func() {
-		enumErr = from.EnumerateBlobs(ctx, refs, "", -1)
-	}()
 	var (
-		wg       sync.WaitGroup
 		mu       sync.Mutex
 		firstErr error
+		schemas  []pendingBlob
 	)
 	fail := func(err error) {
 		mu.Lock()
@@ -196,41 +212,88 @@ func copyBlobs(ctx context.Context, from, to *client.Client, workers int, st *Re
 		}
 		mu.Unlock()
 	}
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for sb := range refs {
-				b, err := fetchVerified(ctx, from, sb.Ref)
-				if errors.Is(err, errBadHash) {
-					mu.Lock()
-					st.BadBlobs = append(st.BadBlobs, api.BlobRef(sb.Ref.String()))
-					mu.Unlock()
-					continue
-				}
-				if err != nil {
-					fail(fmt.Errorf("kit: reading %s from the bucket: %w", sb.Ref, err))
-					continue
-				}
-				_, err = to.Upload(ctx, &client.UploadHandle{BlobRef: sb.Ref, Size: uint32(len(b)), Contents: bytes.NewReader(b)})
-				if err != nil {
-					fail(fmt.Errorf("kit: restoring %s: %w", sb.Ref, err))
-					continue
-				}
-				atomic.AddInt64(&st.Blobs, 1)
-				atomic.AddInt64(&st.Bytes, int64(len(b)))
-			}
-		}()
+	upload := func(br blob.Ref, b []byte) {
+		_, err := to.Upload(ctx, &client.UploadHandle{BlobRef: br, Size: uint32(len(b)), Contents: bytes.NewReader(b)})
+		if err != nil {
+			fail(fmt.Errorf("kit: restoring %s: %w", br, err))
+			return
+		}
+		atomic.AddInt64(&st.Blobs, 1)
+		atomic.AddInt64(&st.Bytes, int64(len(b)))
 	}
-	wg.Wait()
+
+	refs := make(chan blob.SizedRef, 256)
+	var enumErr error
+	go func() { enumErr = from.EnumerateBlobs(ctx, refs, "", -1) }()
+	parallel(workers, func() {
+		for sb := range refs {
+			b, err := fetchVerified(ctx, from, sb.Ref)
+			if errors.Is(err, errBadHash) {
+				mu.Lock()
+				st.BadBlobs = append(st.BadBlobs, api.BlobRef(sb.Ref.String()))
+				mu.Unlock()
+				continue
+			}
+			if err != nil {
+				fail(fmt.Errorf("kit: reading %s from the bucket: %w", sb.Ref, err))
+				continue
+			}
+			if looksLikeSchema(b) {
+				mu.Lock()
+				schemas = append(schemas, pendingBlob{sb.Ref, b})
+				mu.Unlock()
+				continue
+			}
+			upload(sb.Ref, b)
+		}
+	})
+	if firstErr == nil && enumErr != nil {
+		firstErr = fmt.Errorf("kit: listing the bucket's blobs: %w", enumErr)
+	}
 	if firstErr != nil {
 		return firstErr
 	}
-	if enumErr != nil {
-		return fmt.Errorf("kit: listing the bucket's blobs: %w", enumErr)
+	next := make(chan pendingBlob)
+	go func() {
+		defer close(next)
+		for _, b := range schemas {
+			select {
+			case next <- b:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	parallel(workers, func() {
+		for b := range next {
+			upload(b.ref, b.data)
+		}
+	})
+	if firstErr != nil {
+		return firstErr
 	}
 	sort.Slice(st.BadBlobs, func(i, j int) bool { return st.BadBlobs[i] < st.BadBlobs[j] })
 	return nil
+}
+
+type pendingBlob struct {
+	ref  blob.Ref
+	data []byte
+}
+
+func parallel(n int, f func()) {
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() { defer wg.Done(); f() }()
+	}
+	wg.Wait()
+}
+
+// looksLikeSchema reports whether b may be a schema blob. A false positive
+// only costs ordering.
+func looksLikeSchema(b []byte) bool {
+	return len(b) > 0 && len(b) <= schema.MaxSchemaBlobSize && b[0] == '{' && bytes.Contains(b, []byte(`"camliType"`))
 }
 
 // fetchVerified reads a blob and checks it against its ref.

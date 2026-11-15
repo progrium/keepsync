@@ -406,6 +406,12 @@ func phaseLive(t *testing.T, root string) {
 		t.Fatalf("baseline: %d files, %d permanodes", len(base.Files), len(base.Permanodes))
 	}
 	writeJSON(t, filepath.Join(root, "baseline.json"), base)
+	// The server mirrors its registry into the bucket.
+	mirror := filepath.Join(zfs.Dir(), BucketRegistryPath)
+	os.MkdirAll(filepath.Dir(mirror), 0o700)
+	if err := os.WriteFile(mirror, []byte(`{"from":"bucket"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	pass, err := Write(ctx, cfg, filepath.Join(root, FileName), st.Addr())
 	if err != nil {
@@ -438,6 +444,9 @@ func phaseDrill(t *testing.T, root string) {
 	fmt.Printf("REPORT<<%s>>REPORT\n", rep)
 	if !rep.OK() {
 		t.Fatalf("drill failed:\n%s", rep)
+	}
+	if !strings.Contains(rep.String(), "current registry in the bucket") {
+		t.Error("drill did not find the registry in the bucket")
 	}
 	if rep.Files != 4 || rep.Permanodes != 2 || rep.Blobs != len(base.Blobs) {
 		t.Errorf("restored %d files %d permanodes %d blobs; baseline %d blobs", rep.Files, rep.Permanodes, rep.Blobs, len(base.Blobs))
@@ -487,8 +496,8 @@ func phaseRecover(t *testing.T, root string) {
 	if _, err := tcnet.LoadKey(cfg.KeyPath()); err != nil {
 		t.Error(err)
 	}
-	if _, err := os.Stat(cfg.RegistryPath()); err != nil {
-		t.Error(err)
+	if b, err := os.ReadFile(cfg.RegistryPath()); err != nil || string(b) != `{"from":"bucket"}` || st.Registry != "bucket" {
+		t.Errorf("registry from %q: %s %v", st.Registry, b, err)
 	}
 	// Recovering again over it is refused.
 	if _, err := RecoverDir(ctx, k, dir, RecoverOptions{NewZeroFS: newZFS}); err == nil {

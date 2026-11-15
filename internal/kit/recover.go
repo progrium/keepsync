@@ -83,6 +83,7 @@ func Recover(ctx context.Context, k *Kit, o RecoverOptions) (*RestoreStats, erro
 		return nil, err
 	}
 	stats := e.stats
+	registry := e.registry
 	if n := len(stats.BadBlobs); n > 0 {
 		e.close(ctx)
 		return &stats, fmt.Errorf("kit: %d blobs in the bucket are damaged (first %s); nothing was installed", n, stats.BadBlobs[0])
@@ -104,9 +105,18 @@ func Recover(ctx context.Context, k *Kit, o RecoverOptions) (*RestoreStats, erro
 			return nil, err
 		}
 	}
-	if l.RegistryFile != "" && k.Has(entryRegistry) {
-		if err := k.Extract(entryRegistry, l.RegistryFile, 0o600); err != nil {
-			return nil, err
+	if l.RegistryFile != "" {
+		switch {
+		case registry != nil:
+			if err := writeNew(l.RegistryFile, registry); err != nil {
+				return nil, err
+			}
+			stats.Registry = "bucket"
+		case k.Has(entryRegistry):
+			if err := k.Extract(entryRegistry, l.RegistryFile, 0o600); err != nil {
+				return nil, err
+			}
+			stats.Registry = "kit"
 		}
 	}
 	return &stats, nil
@@ -239,6 +249,7 @@ func Drill(ctx context.Context, k *Kit, o DrillOptions) (*DrillReport, error) {
 	s.BadBlobs = append(s.BadBlobs, e.stats.BadBlobs...)
 	rep.Checks = append(rep.Checks, blobCheck(s, o.Baseline), fileCheck(s, o.Baseline))
 	rep.Checks = append(rep.Checks, indexCheck(ctx, e, s, o.Baseline, o.Samples))
+	rep.Checks = append(rep.Checks, registryCheck(k, e.registry))
 	rep.Checks = append(rep.Checks, Check{Name: "timing", OK: true, Detail: fmt.Sprintf(
 		"restore %s, %d blobs at %.1f MB/s; bucket operation counts not measured (ZeroFS does not report them)",
 		e.stats.Total.Round(time.Millisecond), e.stats.Blobs, mbps(e.stats.Bytes, e.stats.Copy))})
@@ -380,6 +391,41 @@ func indexCheck(ctx context.Context, e *restoreEnv, s *scan, base *Baseline, sam
 	}
 	c.Detail = fmt.Sprintf("%d permanodes indexed, %d of %d sample path searches found", len(s.Permanodes), found, len(tried))
 	return c
+}
+
+// registryCheck reports where recovery would get the registry from. A
+// registry only in the kit, or nowhere, is a warning: nodes approved after
+// the kit was made would have to be approved again.
+func registryCheck(k *Kit, fromBucket []byte) Check {
+	c := Check{Name: "registry", OK: true}
+	switch {
+	case fromBucket != nil:
+		c.Detail = fmt.Sprintf("current registry in the bucket (%d bytes)", len(fromBucket))
+	case k.Has(entryRegistry):
+		c.Detail = "warning: no registry in the bucket; recovery would use the kit's copy from " + k.Manifest.Created.Format("2006-01-02")
+	default:
+		c.Detail = "warning: no registry in the bucket or the kit; every node would need approving again"
+	}
+	return c
+}
+
+func writeNew(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // pick returns up to n evenly spaced elements of sorted keys.
