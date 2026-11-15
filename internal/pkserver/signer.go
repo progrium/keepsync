@@ -3,7 +3,9 @@ package pkserver
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +31,7 @@ const (
 	contentAttr    = "camliContent"
 	mtimeAttr      = "keepsyncMtime"
 	versionAttr    = "keepsyncVersion"
+	modeAttr       = "keepsyncMode"
 	goneAttr       = "keepsyncGone"
 	goneAtAttr     = "keepsyncGoneAt"
 	kindAttr       = "keepsyncKind"
@@ -57,6 +60,8 @@ type treeNode struct {
 	// dated after it, so it wins when the index folds claims by date, even
 	// if the clock is now behind (docs/design.md, Edge cases).
 	lastClaim time.Time
+	// mode is the file's permission bits, or 0 if not recorded.
+	mode os.FileMode
 }
 
 // entry is a file node's PathEntry, less its Claims.
@@ -65,6 +70,7 @@ func (n *treeNode) entry() api.PathEntry {
 		File:    api.BlobRef(n.content.String()),
 		ModTime: n.mtime,
 		Version: n.version,
+		Mode:    n.mode,
 		KeptAt:  n.keptAt,
 		Gone:    n.gone,
 		GoneAt:  n.goneAt,
@@ -98,6 +104,11 @@ func contentOps(pn blob.Ref, file blob.Ref, c api.PathClaim, cur *treeNode) []*s
 	} else if cur != nil && len(cur.version) > 0 {
 		ops = append(ops, schema.NewDelAttributeClaim(pn, versionAttr, ""))
 	}
+	if c.Mode != 0 {
+		ops = append(ops, schema.NewSetAttributeClaim(pn, modeAttr, formatMode(c.Mode)))
+	} else if cur != nil && cur.mode != 0 {
+		ops = append(ops, schema.NewDelAttributeClaim(pn, modeAttr, ""))
+	}
 	if cur != nil && cur.gone != api.GoneNone {
 		ops = append(ops,
 			schema.NewDelAttributeClaim(pn, goneAttr, ""),
@@ -108,7 +119,7 @@ func contentOps(pn blob.Ref, file blob.Ref, c api.PathClaim, cur *treeNode) []*s
 
 // setContent records in a file node the content claim just signed, at date.
 func (s *Server) setContent(n *treeNode, file blob.Ref, c api.PathClaim, claim blob.Ref, date time.Time) {
-	n.content, n.mtime, n.version = file, c.ModTime, c.Version
+	n.content, n.mtime, n.version, n.mode = file, c.ModTime, c.Version, c.Mode
 	n.contentClaim, n.keptAt, n.lastClaim = claim, date, date
 	n.gone, n.goneAt = api.GoneNone, time.Time{}
 }
@@ -274,10 +285,13 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 // The caller holds claimMu.
 func (s *Server) updateFile(ctx context.Context, n *treeNode, file blob.Ref, c api.PathClaim) (api.ClaimResult, error) {
 	if n.content == file {
-		if n.gone == api.GoneNone {
-			return api.ClaimUnchanged, nil
+		if n.gone != api.GoneNone {
+			return s.unmarkGone(ctx, n, c)
 		}
-		return s.unmarkGone(ctx, n, c)
+		if c.Mode != 0 && c.Mode != n.mode && api.Supersedes(c, n.entry()) {
+			return s.setMode(ctx, n, c)
+		}
+		return api.ClaimUnchanged, nil
 	}
 	if !api.Supersedes(c, n.entry()) {
 		return api.ClaimRejectedOlder, nil
@@ -331,6 +345,46 @@ func (s *Server) unmarkGone(ctx context.Context, n *treeNode, c api.PathClaim) (
 	}
 	s.treeMu.Unlock()
 	return api.ClaimWritten, nil
+}
+
+// setMode records a permission change with the same content (a chmod):
+// one claim sets the mode, mtime and version. The content claim, and so
+// KeptAt and History, stay as they were. The caller holds claimMu.
+func (s *Server) setMode(ctx context.Context, n *treeNode, c api.PathClaim) (api.ClaimResult, error) {
+	ops := []*schema.Builder{
+		schema.NewSetAttributeClaim(n.pn, modeAttr, formatMode(c.Mode)),
+		schema.NewSetAttributeClaim(n.pn, mtimeAttr, schema.RFC3339FromTime(c.ModTime)),
+	}
+	if len(c.Version) > 0 {
+		ops = append(ops, schema.NewSetAttributeClaim(n.pn, versionAttr, c.Version.String()))
+	}
+	multi, err := schema.NewMultiClaim(ops...)
+	if err != nil {
+		return 0, err
+	}
+	_, date, err := s.signClaim(ctx, multi.SetMultiClaimPermanode(n.pn), n.lastClaim)
+	if err != nil {
+		return 0, err
+	}
+	s.treeMu.Lock()
+	n.mode, n.mtime, n.lastClaim = c.Mode, c.ModTime, date
+	if len(c.Version) > 0 {
+		n.version = c.Version
+	}
+	s.treeMu.Unlock()
+	return api.ClaimWritten, nil
+}
+
+// formatMode and parseMode store permission bits as octal, like Perkeep's
+// own unixPermission.
+func formatMode(m os.FileMode) string { return fmt.Sprintf("0%o", m.Perm()) }
+
+func parseMode(s string) os.FileMode {
+	v, err := strconv.ParseUint(s, 8, 32)
+	if err != nil {
+		return 0
+	}
+	return os.FileMode(v).Perm()
 }
 
 // findFile returns the file node at path in root's tree, or nil. The
@@ -471,6 +525,7 @@ func (s *Server) History(ctx context.Context, permanode api.BlobRef, path string
 		if ver, err := api.ParseVersion(v.attrs[versionAttr]); err == nil {
 			e.Version = ver
 		}
+		e.Mode = parseMode(v.attrs[modeAttr])
 		e.Claims = uniqueRefs(append(chain[:len(chain):len(chain)], v.claim))
 		out = append(out, e)
 	}
@@ -672,6 +727,9 @@ func (s *Server) loadChildren(ctx context.Context, dir *treeNode, attrs map[stri
 				if ver, err := api.ParseVersion(v.v); err == nil {
 					n.version = ver
 				}
+			}
+			if m, ok := cattrs[modeAttr]; ok {
+				n.mode = parseMode(m.v)
 			}
 			if g, ok := cattrs[goneAttr]; ok {
 				n.gone, n.goneAt = api.GoneReason(g.v), g.date

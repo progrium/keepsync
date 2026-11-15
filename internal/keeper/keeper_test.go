@@ -625,3 +625,15 @@ func TestFutureMtimeIsKept(t *testing.T) {
 		t.Fatalf("not kept 49h after first seen: %+v", rep)
 	}
 }
+
+// TestKeepRecordsMode checks that the keeper claims a file with its
+// permission bits, so restore can set them.
+func TestKeepRecordsMode(t *testing.T) {
+	e := newEnv(t)
+	e.write("run.sh", "#!/bin/sh\n", 3*day)
+	os.Chmod(filepath.Join(e.dir, "run.sh"), 0o755)
+	e.pass()
+	if m := e.tree()["run.sh"].Mode; m != 0o755 {
+		t.Fatalf("kept mode %v, want 0755", m)
+	}
+}

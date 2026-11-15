@@ -188,6 +188,7 @@ type file struct {
 	abs   string
 	mtime time.Time
 	size  int64
+	mode  os.FileMode // permission bits
 }
 
 // Pass walks the folder once: keeps every file past grace (or past
@@ -278,7 +279,7 @@ func (k *Keeper) KeepNow(ctx context.Context, rels ...string) (Report, error) {
 			rep.Errors = append(rep.Errors, fmt.Errorf("keeper: %s is not a regular file", rel))
 			continue
 		}
-		k.keepOne(ctx, file{rel: rel, abs: abs, mtime: fi.ModTime(), size: fi.Size()}, tree, now, true, &rep)
+		k.keepOne(ctx, file{rel: rel, abs: abs, mtime: fi.ModTime(), size: fi.Size(), mode: fi.Mode().Perm()}, tree, now, true, &rep)
 	}
 	return rep, nil
 }
@@ -351,7 +352,7 @@ func (k *Keeper) walk() ([]file, error) {
 		if err != nil {
 			return nil
 		}
-		files = append(files, file{rel: rel, abs: abs, mtime: fi.ModTime(), size: fi.Size()})
+		files = append(files, file{rel: rel, abs: abs, mtime: fi.ModTime(), size: fi.Size(), mode: fi.Mode().Perm()})
 		return nil
 	})
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
@@ -415,6 +416,7 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 		File:      ref,
 		ModTime:   f.mtime,
 		Version:   st.Version,
+		Mode:      f.mode,
 	})
 	if err != nil {
 		rep.Errors = append(rep.Errors, fmt.Errorf("keeper: claim %s: %w", f.rel, err))

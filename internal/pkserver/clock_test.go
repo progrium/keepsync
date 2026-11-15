@@ -2,6 +2,7 @@ package pkserver
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -64,5 +65,52 @@ func TestClaimAfterClockWentBack(t *testing.T) {
 	}
 	if got["a/y"].File != y {
 		t.Errorf("a/y after reload: %+v, want %s", got["a/y"], y)
+	}
+}
+
+// TestModeKept checks that a file's permission bits are kept with it,
+// survive a reload from the index, and that a chmod alone is kept.
+func TestModeKept(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	pn, err := e.srv.NewPermanode(ctx, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 11, 2, 8, 0, 0, 0, time.UTC)
+	ref, err := e.putter.PutFile(ctx, writeFile(t, t.TempDir(), "run.sh", "#!/bin/sh\n", t0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := func(mode os.FileMode, mt time.Time) api.ClaimResult {
+		t.Helper()
+		r, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: "bin/run.sh", File: ref, ModTime: mt, Mode: mode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	reload := func() api.PathEntry {
+		e.srv.treeMu.Lock()
+		clear(e.srv.trees)
+		e.srv.treeMu.Unlock()
+		got, err := e.srv.Paths(ctx, pn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got["bin/run.sh"]
+	}
+	claim(0o644, t0)
+	if got := reload(); got.Mode != 0o644 {
+		t.Fatalf("mode after reload: %v", got.Mode)
+	}
+	if r := claim(0o755, t0.Add(time.Minute)); r != api.ClaimWritten {
+		t.Fatalf("chmod: %v", r)
+	}
+	if got := reload(); got.Mode != 0o755 || got.File != ref {
+		t.Fatalf("after chmod: %+v", got)
+	}
+	if r := claim(0o755, t0.Add(time.Minute)); r != api.ClaimUnchanged {
+		t.Fatalf("same mode again: %v", r)
 	}
 }

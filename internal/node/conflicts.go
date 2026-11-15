@@ -313,7 +313,7 @@ func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) 
 			f, err := n.fetcher()
 			if err == nil {
 				base = filepath.Join(tmp, filepath.Base(origRel))
-				_, _, err = restoreFile(ctx, f, e.File, base, true)
+				_, _, err = restoreFile(ctx, f, e.File, 0o600, base, true)
 			}
 			if err != nil {
 				return set(HookFailed, "fetch the base: "+err.Error(), stamp, true)

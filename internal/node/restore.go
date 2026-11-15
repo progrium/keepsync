@@ -133,7 +133,7 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 			res.Errors = append(res.Errors, name+": path escapes the folder")
 			continue
 		}
-		status, mt, err := restoreFile(ctx, c, e.File, dst, p.Force)
+		status, mt, err := restoreFile(ctx, c, e.File, e.Mode, dst, p.Force)
 		switch {
 		case err != nil:
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", name, err))
@@ -154,10 +154,11 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 	return res, nil
 }
 
-// restoreFile writes the kept file ref to dst with its mtime. A file
+// restoreFile writes the kept file ref to dst with its mtime and mode
+// (0644 if the mode was not recorded). A file
 // already at dst with the same size and mtime is left alone; one that
 // differs is left alone unless force.
-func restoreFile(ctx context.Context, f blob.Fetcher, ref api.BlobRef, dst string, force bool) (string, time.Time, error) {
+func restoreFile(ctx context.Context, f blob.Fetcher, ref api.BlobRef, mode os.FileMode, dst string, force bool) (string, time.Time, error) {
 	br, ok := blob.Parse(string(ref))
 	if !ok {
 		return "", time.Time{}, fmt.Errorf("bad file ref %q", ref)
@@ -190,7 +191,10 @@ func restoreFile(ctx context.Context, f blob.Fetcher, ref api.BlobRef, dst strin
 		tmp.Close()
 		return "", mt, err
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := tmp.Chmod(mode.Perm()); err != nil {
 		tmp.Close()
 		return "", mt, err
 	}

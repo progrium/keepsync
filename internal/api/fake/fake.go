@@ -193,6 +193,9 @@ func (p *Perkeep) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResu
 			now := time.Now()
 			if api.Supersedes(c, cur) {
 				cur.ModTime, cur.Version = c.ModTime, c.Version
+				if c.Mode != 0 {
+					cur.Mode = c.Mode
+				}
 			}
 			cur.Gone, cur.GoneAt = api.GoneNone, time.Time{}
 			tree[c.Path] = cur
@@ -207,7 +210,7 @@ func (p *Perkeep) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResu
 	claim := api.BlobRef(fmt.Sprintf("sha224-claim%04d", p.Claims))
 	p.blobs[claim] = false
 	now := time.Now()
-	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claims: []api.BlobRef{claim}, Version: c.Version, KeptAt: now}
+	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claims: []api.BlobRef{claim}, Version: c.Version, Mode: c.Mode, KeptAt: now}
 	p.record(c.Permanode, c.Path, tree[c.Path], now)
 	return api.ClaimWritten, nil
 }

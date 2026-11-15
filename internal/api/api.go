@@ -9,6 +9,7 @@ package api
 import (
 	"context"
 	"net"
+	"os"
 	"time"
 )
 
@@ -114,6 +115,9 @@ type PathClaim struct {
 	// version descends from (ClaimRejectedOlder). For concurrent versions,
 	// or when either side has none, it falls back to the newer-mtime rule.
 	Version Version
+	// Mode is the file's permission bits, or 0 if unknown. Restore sets
+	// them. A change of Mode alone, with the same content, is kept too.
+	Mode os.FileMode
 }
 
 // ClaimResult reports what the server did with a PathClaim.
@@ -156,6 +160,9 @@ type PathEntry struct {
 	Claims []BlobRef
 	// Version is the Syncthing version the content was kept with, if any.
 	Version Version
+	// Mode is the permission bits the file was kept with, or 0 if they
+	// were not recorded (files kept before modes were).
+	Mode os.FileMode
 	// KeptAt is when the server signed the claim that set the content.
 	KeptAt time.Time
 	// Gone says why the file left sync, if it did, and GoneAt when that
