@@ -3,6 +3,7 @@ module github.com/progrium/keepsync
 go 1.27.2
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/syncthing/syncthing v1.30.0-rc.1.0.20261020195438-d6d0181f7d46
 	github.com/tailscale/tailcat v0.7.1-0.20261105151022-e00cdde6ff78
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
@@ -20,7 +21,6 @@ require (
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Azure/go-ntlmssp v0.1.1 // indirect
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/ProtonMail/go-crypto v1.5.2 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e // indirect
