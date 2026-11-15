@@ -41,10 +41,12 @@ Syncthing config file at startup.
   `DeviceConnected` and `DeviceDisconnected`, translated to `api.SyncEvent`.
   Only files produce item events (not directories or symlinks); deletes are
   included, so consumers should stat. A path that is a conflict copy also
-  produces a `SyncConflict` event, whose `Device` is the copy's `ModifiedBy`:
-  the device whose losing version the copy holds, since that node creates
-  the copy. The short ID in the copy's name is the winner's (Syncthing names
-  it after the incoming version's `ModifiedBy`). For
+  produces a `SyncConflict` event, whose `Device` is the device named in
+  the copy's name. The vendored Syncthing names copies after the losing
+  version's `ModifiedBy` (upstream uses the winner's; see
+  `third_party/syncthing/KEEPSYNC.md`), so every node that makes a copy of
+  the same conflict, bystanders included, names the device whose change it
+  holds. The copy's own `ModifiedBy` is whichever node made it. For
   `SyncItemChanged`, `Device` is the global file's `ModifiedBy`.
   Events are hints: Syncthing drops events for slow subscribers.
 - **Scan.** `Internals.ScanFolderSubdirs`, which returns when the scan is done.

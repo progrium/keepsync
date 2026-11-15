@@ -265,3 +265,61 @@ func TestConflictBaseNone(t *testing.T) {
 		t.Fatalf("base = %q exact=%v, want none", got, exact)
 	}
 }
+
+func TestConflictDuplicateCopiesRunHookOnce(t *testing.T) {
+	tn := newTestNode(t, func(pk *fake.Perkeep) api.BlobPutter { return pk })
+	tn.sync()
+	runs := filepath.Join(t.TempDir(), "runs")
+	tn.cfg.ConflictHook = hookScript(t, `echo "$(basename "$KEEPSYNC_CONFLICT")" >> `+runs+`
+cat "$KEEPSYNC_CONFLICT" >> "$KEEPSYNC_ORIGINAL"
+rm "$KEEPSYNC_CONFLICT"
+`)
+	orig := filepath.Join(tn.dir, "a.txt")
+	os.WriteFile(orig, []byte("mine\n"), 0o644)
+	// Two nodes made the same copy in different seconds.
+	c1 := filepath.Join(tn.dir, "a.sync-conflict-20260101-120000-OTHERDV.txt")
+	c2 := filepath.Join(tn.dir, "a.sync-conflict-20260101-120001-OTHERDV.txt")
+	os.WriteFile(c1, []byte("theirs\n"), 0o644)
+	os.WriteFile(c2, []byte("theirs\n"), 0o644)
+
+	// The later name is the duplicate while both are present.
+	if ci := tn.runConflict(tn.ctx, "docs", c2, false); ci.State != HookResolved || !strings.Contains(ci.Reason, "duplicate") {
+		t.Fatalf("c2: %+v", ci)
+	}
+	if _, err := os.Stat(c2); !os.IsNotExist(err) {
+		t.Fatalf("duplicate c2 still there: %v", err)
+	}
+	if ci := tn.runConflict(tn.ctx, "docs", c1, false); ci.State != HookResolved {
+		t.Fatalf("c1: %+v", ci)
+	}
+	// A copy that arrives after the hook resolved an identical one is a
+	// duplicate too.
+	c3 := filepath.Join(tn.dir, "a.sync-conflict-20260101-120005-OTHERDV.txt")
+	os.WriteFile(c3, []byte("theirs\n"), 0o644)
+	if ci := tn.runConflict(tn.ctx, "docs", c3, false); ci.State != HookResolved || !strings.Contains(ci.Reason, "duplicate") {
+		t.Fatalf("c3: %+v", ci)
+	}
+	// A copy with other content still runs the hook.
+	c4 := filepath.Join(tn.dir, "a.sync-conflict-20260101-120009-OTHERDV.txt")
+	os.WriteFile(c4, []byte("other\n"), 0o644)
+	if ci := tn.runConflict(tn.ctx, "docs", c4, false); ci.State != HookResolved || ci.Reason != "" {
+		t.Fatalf("c4: %+v", ci)
+	}
+	if b, _ := os.ReadFile(runs); string(b) != filepath.Base(c1)+"\n"+filepath.Base(c4)+"\n" {
+		t.Fatalf("hook runs %q", b)
+	}
+	if b, _ := os.ReadFile(orig); string(b) != "mine\ntheirs\nother\n" {
+		t.Fatalf("original %q", b)
+	}
+}
+
+func TestConflictNodeFromCopyName(t *testing.T) {
+	tn := newTestNodeOpts(t, func(pk *fake.Perkeep) api.BlobPutter { return pk }, true)
+	tn.sync()
+	if got := tn.conflictNode("docs", filepath.Join(tn.dir, copyName)); got != "other" {
+		t.Fatalf("conflictNode = %q, want other (named in the copy)", got)
+	}
+	if got := tn.conflictNode("docs", filepath.Join(tn.dir, "a.sync-conflict-20260101-120000-ZZZZZZZ.txt")); got != "ZZZZZZZ" {
+		t.Fatalf("unknown device: %q", got)
+	}
+}

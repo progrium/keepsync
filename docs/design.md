@@ -263,7 +263,7 @@ BEP's TLS runs end to end, so Syncthing still checks device IDs.
 
 **Folder types.** Every node defaults to send-receive. A folder's `ReceiveOnly` list marks nodes as receive-only.
 
-**Conflicts.** Syncthing writes `.sync-conflict-<date>-<device>` copies. Conflict copies are kept in Perkeep under their own name, next to the original, and expire like any other file, so a losing version is never lost and unresolved conflicts do not pile up in sync.
+**Conflicts.** Syncthing writes `.sync-conflict-<date>-<device>` copies, where `<device>` is the short ID of the device whose losing change the copy holds (a keepsync patch; upstream names the winner). Conflict copies are kept in Perkeep under their own name, next to the original, and expire like any other file, so a losing version is never lost and unresolved conflicts do not pile up in sync.
 
 **Conflict hook.** `conflict_hook = "/path/to/script"` in node.toml applies to every folder, and a `conflict_hook` on a `[[folder]]` overrides it. The hook lets an LLM or any other tool resolve conflicts.
 
@@ -271,6 +271,7 @@ BEP's TLS runs end to end, so Syncthing still checks device IDs.
 - **When.** On each conflict event from Syncthing, and on a scan of the folder when the node starts, attaches it, or becomes its hook runner (for example by keeper failover). Each copy is debounced for 5 s, and hooks run one at a time per folder.
 - **The base**, on a kept folder, is read before the hook runs. Let W be the original's current Syncthing version. The node walks the path's kept history, newest first, and takes the first version whose content differs from both the original and the copy and that W descends from (a version kept without a Syncthing version counts as an ancestor). The base is exact if that version has a Syncthing version. With no such version, the base is the last kept version, as a guess. A version kept after the copies diverged is one of the sides, so it is never the base.
 - **Before it runs**, on a kept folder, after reading the base, the node keeps the original and the copy immediately, skipping grace, so anything the hook does is recoverable. If that fails, the hook does not run.
+- **Duplicates.** Every node that held the losing version can make a copy of it, a bystander that received both versions included, so one conflict can arrive as several identical copies, at once or one after another. The hook runs once. A copy with the same content as another copy of the same original that is still present and sorts first by name, or that the hook resolved within the last hour, is removed as a duplicate.
 - **Timeout.** `conflict_hook_timeout` (default 5m). On timeout the hook's whole process group is killed.
 
 The script runs in the folder root and its output is logged. It gets:
@@ -280,7 +281,7 @@ The script runs in the folder root and its output is logged. It gets:
 | `KEEPSYNC_FOLDER` | Folder name |
 | `KEEPSYNC_ORIGINAL` | Absolute path of the current file |
 | `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
-| `KEEPSYNC_CONFLICT_NODE` | Name of the node whose losing change the copy holds, else its short device ID. This is the copy's `ModifiedBy` in Syncthing's index. The ID in the copy's name is the winner's, so it isn't used. |
+| `KEEPSYNC_CONFLICT_NODE` | Name of the node whose losing change the copy holds, else its short device ID. It comes from the copy's name: keepsync's Syncthing names copies after the losing version's device (upstream names the winner). |
 | `KEEPSYNC_BASE` | The base in a temp file, for a three-way merge, or empty if there is none (always empty on an unkept folder). The file is deleted afterwards. |
 | `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor, else `0` (a guess, or no base). |
 

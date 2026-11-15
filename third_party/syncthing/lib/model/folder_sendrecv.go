@@ -607,7 +607,7 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
 			// Symlinks aren't checked for conflicts.
 
 			err = f.inWritableDir(func(name string) error {
-				return f.moveForConflict(name, file.ModifiedBy.String(), scanChan)
+				return f.moveForConflict(name, curFile.ModifiedBy.String(), scanChan) // keepsync: the losing version's device
 			}, curFile.Name)
 		} else {
 			err = f.deleteItemOnDisk(curFile, scanChan)
@@ -833,7 +833,7 @@ func (f *sendReceiveFolder) handleSymlinkCheckExisting(file protocol.FileInfo, s
 		// Directories and symlinks aren't checked for conflicts.
 
 		return f.inWritableDir(func(name string) error {
-			return f.moveForConflict(name, file.ModifiedBy.String(), scanChan)
+			return f.moveForConflict(name, curFile.ModifiedBy.String(), scanChan) // keepsync: the losing version's device
 		}, curFile.Name)
 	} else {
 		return f.deleteItemOnDisk(curFile, scanChan)
@@ -953,7 +953,7 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
 		// If the delete constitutes winning a conflict, we move the file to
 		// a conflict copy instead of doing the delete
 		err = f.inWritableDir(func(name string) error {
-			return f.moveForConflict(name, file.ModifiedBy.String(), scanChan)
+			return f.moveForConflict(name, cur.ModifiedBy.String(), scanChan) // keepsync: the losing version's device
 		}, cur.Name)
 
 	case f.versioner != nil && !cur.IsSymlink():
@@ -1730,7 +1730,7 @@ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCu
 			// Directories and symlinks aren't checked for conflicts.
 
 			err = f.inWritableDir(func(name string) error {
-				return f.moveForConflict(name, file.ModifiedBy.String(), scanChan)
+				return f.moveForConflict(name, curFile.ModifiedBy.String(), scanChan) // keepsync: the losing version's device
 			}, curFile.Name)
 		} else {
 			err = f.deleteItemOnDisk(curFile, scanChan)

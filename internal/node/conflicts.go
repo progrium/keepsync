@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -74,14 +75,87 @@ type conflicts struct {
 	states  map[string]*cstate     // by absolute copy path
 	timers  map[string]*time.Timer // debounce, by absolute copy path
 	folders map[string]*sync.Mutex // one hook at a time per folder
-	scanned bool
+	// resolved remembers copies the hook resolved, by absolute original
+	// path, so a late identical copy is known as a duplicate.
+	resolved map[string][]resolvedCopy
+	scanned  bool
+}
+
+type resolvedCopy struct {
+	name string
+	sum  [sha256.Size]byte
+	at   time.Time
+}
+
+// duplicateWindow is how long a resolved copy's content is remembered.
+const duplicateWindow = time.Hour
+
+func pruneResolved(rs []resolvedCopy) []resolvedCopy {
+	out := rs[:0]
+	for _, r := range rs {
+		if time.Since(r.at) < duplicateWindow {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// duplicateOf returns the name of another copy of orig with the same
+// content as the copy abs (whose SHA-256 is sum): one the hook resolved
+// recently, or one still present whose name sorts first, so every node
+// picks the same survivor. It returns "" if abs is not a duplicate.
+func (n *Node) duplicateOf(abs, orig string, sum [sha256.Size]byte) string {
+	c := n.conf()
+	c.mu.Lock()
+	rs := pruneResolved(c.resolved[orig])
+	c.resolved[orig] = rs
+	for _, r := range rs {
+		if r.sum == sum {
+			c.mu.Unlock()
+			return r.name
+		}
+	}
+	c.mu.Unlock()
+	dir, base := filepath.Split(abs)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if name >= base || !e.Type().IsRegular() || !syncer.IsConflict(name) {
+			continue
+		}
+		if o, _ := syncer.ConflictOriginal(filepath.Join(dir, name)); o != orig {
+			continue
+		}
+		if s, err := fileSum(filepath.Join(dir, name)); err == nil && s == sum {
+			return name
+		}
+	}
+	return ""
+}
+
+func fileSum(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
 }
 
 func (n *Node) conf() *conflicts {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.cf == nil {
-		n.cf = &conflicts{states: map[string]*cstate{}, timers: map[string]*time.Timer{}, folders: map[string]*sync.Mutex{}}
+		n.cf = &conflicts{states: map[string]*cstate{}, timers: map[string]*time.Timer{}, folders: map[string]*sync.Mutex{}, resolved: map[string][]resolvedCopy{}}
 	}
 	return n.cf
 }
@@ -183,32 +257,22 @@ func (n *Node) hookNode(folder string) bool {
 
 // conflictNode names the node whose change a conflict copy holds.
 func (n *Node) conflictNode(folder, copyPath string) string {
-	// The node that lost creates the copy, so the copy's ModifiedBy is
-	// the device whose change it holds. The ID in the copy's name is the
-	// winner's and is no use here.
-	var dev api.DeviceID
-	n.cfgMu.Lock()
-	f, ok := n.cfg.Folder(folder)
-	n.cfgMu.Unlock()
-	if ok && n.sy != nil {
-		if rel, err := filepath.Rel(f.Path, copyPath); err == nil {
-			dev, _ = n.sy.ModifiedBy(f.ID, filepath.ToSlash(rel))
-		}
-	}
-	if dev == "" {
+	// The copy's name carries the short ID of the device whose losing
+	// version it holds (the vendored Syncthing names it that way, on every
+	// node that makes a copy). The copy's own ModifiedBy is no use: a
+	// bystander that received both versions makes its own copy.
+	short, ok := syncer.ConflictDevice(filepath.Base(copyPath))
+	if !ok {
 		return ""
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, nd := range n.member.Nodes {
-		if nd.Device == dev && nd.Name != "" {
+		if strings.HasPrefix(string(nd.Device), short) && nd.Name != "" {
 			return nd.Name
 		}
 	}
-	if len(dev) > 7 {
-		return string(dev[:7])
-	}
-	return string(dev)
+	return short
 }
 
 func (n *Node) folderKeep(folder string) (*api.KeepPolicy, api.BlobRef) {
@@ -297,6 +361,22 @@ func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) 
 	copyRel, _ := filepath.Rel(lf.Path, abs)
 	origRel, copyRel = filepath.ToSlash(origRel), filepath.ToSlash(copyRel)
 
+	// Every node that held the losing version can make a copy of it (a
+	// bystander that got both versions does too), so one conflict can
+	// show up as several identical copies, at once or one after another.
+	// The hook runs once; the duplicates are removed.
+	sum, err := fileSum(abs)
+	if err != nil {
+		return set(HookFailed, err.Error(), stamp, true)
+	}
+	if dup := n.duplicateOf(abs, orig, sum); dup != "" {
+		if err := os.Remove(abs); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return set(HookFailed, "remove the duplicate copy: "+err.Error(), stamp, true)
+		}
+		n.logf("conflict copy %s in %s duplicates %s; removed it", copyRel, folder, dup)
+		return set(HookResolved, "duplicate of "+dup, stamp, true)
+	}
+
 	var base string
 	var exact bool
 	if keep, archive := n.folderKeep(folder); keep != nil {
@@ -339,6 +419,9 @@ func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) 
 	})
 	if res.Resolved {
 		n.logf("conflict hook resolved %s in %s", copyRel, folder)
+		c.mu.Lock()
+		c.resolved[orig] = append(pruneResolved(c.resolved[orig]), resolvedCopy{name: filepath.Base(abs), sum: sum, at: time.Now()})
+		c.mu.Unlock()
 		return set(HookResolved, "", stamp, true)
 	}
 	n.logf("conflict hook left %s in %s for a human: %s", copyRel, folder, res.Reason)

@@ -19,6 +19,14 @@ A pruned copy of [Syncthing](https://github.com/syncthing/syncthing)
    (`model.CurrentFolderFile`), which `syncer.FileState` needs to tell
    whether this node holds the global version.
 
+3. `lib/model/folder_sendrecv.go`: the four `moveForConflict` calls name
+   the conflict copy after the losing (local) version's `ModifiedBy`
+   instead of the incoming winner's. In a mesh of three or more nodes, a
+   bystander that received the losing version first also makes a copy, and
+   that copy's `ModifiedBy` is the bystander. Naming the loser in the copy
+   lets keepsync report whose change a copy holds, the same on every node.
+   Each changed line carries a `keepsync:` comment.
+
 Patched files stay under MPL-2.0.
 
 ## Updating
