@@ -49,7 +49,7 @@ type Config struct {
 const DefaultInterval = 5 * time.Minute
 
 // durableBatch caps refs per Durable request.
-const durableBatch = 500
+const durableBatch = 250 // files per Durable request (two refs each)
 
 // Keeper runs the keep loop and expiry for one folder. Every pass is
 // idempotent, so an error simply means the next pass tries again.
@@ -409,7 +409,11 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 	k.putCache[f.rel] = cached{mtime: f.mtime, size: f.size, ref: ref, result: res}
 	switch res {
 	case api.ClaimWritten, api.ClaimUnchanged:
-		tree[f.rel] = api.PathEntry{File: ref, ModTime: f.mtime}
+		// The claim ref is unknown until the next Paths fetch, which keeps
+		// a file claimed in this pass from expiring in the same pass.
+		if e, ok := tree[f.rel]; !ok || e.File != ref || !e.ModTime.Equal(f.mtime) {
+			tree[f.rel] = api.PathEntry{File: ref, ModTime: f.mtime}
+		}
 		delete(k.dirty, f.rel)
 		rep.Kept = append(rep.Kept, f.rel)
 		if forced {
@@ -426,8 +430,9 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 // If the server cannot answer, nothing is removed.
 func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.PathEntry, now time.Time, rep *Report) {
 	type cand struct {
-		f   file
-		ref api.BlobRef
+		f     file
+		ref   api.BlobRef
+		claim api.BlobRef
 	}
 	var cands []cand
 	for _, f := range files {
@@ -435,7 +440,7 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 			continue
 		}
 		e, ok := tree[f.rel]
-		if !ok || !e.ModTime.Equal(f.mtime) {
+		if !ok || !e.ModTime.Equal(f.mtime) || e.Claim == "" {
 			continue
 		}
 		ref, err := k.verifyRef(ctx, f)
@@ -447,14 +452,15 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 			// Same mtime, different content: not the kept version.
 			continue
 		}
-		cands = append(cands, cand{f, ref})
+		cands = append(cands, cand{f, ref, e.Claim})
 	}
 	for start := 0; start < len(cands); start += durableBatch {
 		end := min(start+durableBatch, len(cands))
 		batch := cands[start:end]
-		refs := make([]api.BlobRef, len(batch))
-		for i, c := range batch {
-			refs[i] = c.ref
+		// Both the content and the claim that names it must be durable.
+		refs := make([]api.BlobRef, 0, 2*len(batch))
+		for _, c := range batch {
+			refs = append(refs, c.ref, c.claim)
 		}
 		ok, err := k.cfg.Registry.Durable(ctx, refs)
 		if err == nil && len(ok) != len(refs) {
@@ -466,7 +472,7 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 			return
 		}
 		for i, c := range batch {
-			if !ok[i] {
+			if !ok[2*i] || !ok[2*i+1] {
 				continue
 			}
 			if err := k.remove(ctx, c.f); err != nil {

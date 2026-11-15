@@ -289,6 +289,51 @@ func TestExpiryNeedsCurrentVersionDurable(t *testing.T) {
 	}
 }
 
+// claimsNotDurable reports content blobs as the server does but every
+// claim blob as not yet in the bucket.
+type claimsNotDurable struct {
+	api.RegistryClient
+	claims map[api.BlobRef]bool
+}
+
+func (c *claimsNotDurable) Durable(ctx context.Context, refs []api.BlobRef) ([]bool, error) {
+	ok, err := c.RegistryClient.Durable(ctx, refs)
+	for i, r := range refs {
+		if c.claims[r] {
+			ok[i] = false
+		}
+	}
+	return ok, err
+}
+
+func TestExpiryNeedsClaimDurable(t *testing.T) {
+	e := newEnv(t)
+	cnd := &claimsNotDurable{RegistryClient: e.client, claims: map[api.BlobRef]bool{}}
+	e.k = e.newKeeper("nodekey:a", cnd)
+	e.write("a.txt", "a", 40*day)
+	e.pass()
+	ent := e.tree()["a.txt"]
+	if ent.Claim == "" {
+		t.Fatal("fake left Claim empty")
+	}
+	cnd.claims[ent.Claim] = true
+	e.pk.MarkDurable()
+	if ok, _ := cnd.Durable(e.ctx, []api.BlobRef{ent.File}); !ok[0] {
+		t.Fatal("content should be durable")
+	}
+	rep := e.pass()
+	if len(rep.Expired) != 0 || !e.exists("a.txt") {
+		t.Fatalf("expired with claim not durable: %+v", rep)
+	}
+	if st, _ := e.k.Status(e.ctx); st.Counts()[StateExpirable] != 0 {
+		t.Fatal("status reports expirable with claim not durable")
+	}
+	delete(cnd.claims, ent.Claim)
+	if rep = e.pass(); !slices.Equal(rep.Expired, []string{"a.txt"}) {
+		t.Fatalf("expired %v after claim durable", rep.Expired)
+	}
+}
+
 func TestNeverExpire(t *testing.T) {
 	e := newEnv(t)
 	p := e.policy
