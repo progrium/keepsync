@@ -163,9 +163,11 @@ The original design said mount mode needs root. The FUSE mode removed that.
 | Scope | Allows | Granted by |
 | --- | --- | --- |
 | `blobs` (default) | Upload, stat and fetch blobs, plus discovery. Not sign, enumerate, search or remove. | Every node |
-| `read` | `blobs` plus search, the web UI, `pk-get` and `pk-mount` | `keepsync server grant <name> read` |
+| `read` | `blobs` plus search, the web UI, `pk-get` and `pk-mount`, over the whole archive | `keepsync server grant <name> read` |
 
 The scope is stored on the node's registry record. No scope can sign or delete.
+
+**`read` covers every folder.** A node with `read` can search and browse the archive of every folder, including folders it is not a member of. keepsync assumes all of a server's nodes are trusted, so this is deliberate; `server grant` says so when it grants `read`. Per-folder scoping is not built. If a server is ever shared between people, the plan is Perkeep share claims on each folder's root, which let a node browse its folders' trees (but not search). Filtering search and blob access by folder was rejected: blobs are shared across folders, and checking what each node can reach is expensive.
 
 ## Keeping and expiry
 

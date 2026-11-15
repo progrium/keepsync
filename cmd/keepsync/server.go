@@ -120,6 +120,9 @@ func (e *env) serverGrant(args []string) error {
 		return err
 	}
 	fmt.Fprintf(e.stdout, "%s now has gateway scope %s\n", pos[0], pos[1])
+	if pos[1] == "read" {
+		fmt.Fprintln(e.stdout, "read covers the whole archive: every folder, including ones this node is not a member of")
+	}
 	return nil
 }
 

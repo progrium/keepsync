@@ -31,6 +31,7 @@ Server:
   server kit [--out <path>]            regenerate the recovery kit
   server baseline <out.json>           flush and snapshot, for a recovery drill
   server grant <name> <blobs|read>     set a node's Perkeep gateway scope
+                                       (read covers every folder's archive)
 
 Node:
   node init --server <tc… or name>     create this node, print its key
