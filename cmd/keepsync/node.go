@@ -186,10 +186,14 @@ func (e *env) folderRm(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := e.nodeCall(node.MethodFolderRm, node.FolderParams{Name: pos[0]}, nil); err != nil {
+	var res node.RmResult
+	if err := e.nodeCall(node.MethodFolderRm, node.FolderParams{Name: pos[0]}, &res); err != nil {
 		return err
 	}
 	fmt.Fprintf(e.stdout, "stopped syncing %s here; its files stay on disk\n", pos[0])
+	if !res.Left {
+		fmt.Fprintf(e.stdout, "warning: this node is still a member of %s on the server: %s\n", pos[0], res.Warning)
+	}
 	return nil
 }
 

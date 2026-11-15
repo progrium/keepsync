@@ -31,6 +31,12 @@ type FolderParams struct {
 	Path string `json:"path,omitempty"`
 }
 
+// RmResult is the result of MethodFolderRm.
+type RmResult struct {
+	Left    bool   `json:"left"`              // removed from the folder's members
+	Warning string `json:"warning,omitempty"` // why the registry was not updated
+}
+
 // KeepParams is the body of MethodKeep. Zero Grace and MaxDefer take the
 // defaults; zero Expire means never expire.
 type KeepParams struct {
@@ -126,6 +132,18 @@ func (n *Node) handlers() {
 		if err := ready(); err != nil {
 			return nil, err
 		}
+		if _, err := n.localFolder(p.Name); err != nil {
+			return nil, err
+		}
+		// Leave the folder in the registry so this node stops being a
+		// member (and keeper). If the server cannot be told, still stop
+		// syncing here and say so; the files stay either way.
+		var res RmResult
+		if err := n.reg.LeaveFolder(ctx, p.Name); err != nil {
+			res.Warning = err.Error()
+		} else {
+			res.Left = true
+		}
 		n.cfgMu.Lock()
 		ok := n.cfg.RemoveFolder(p.Name)
 		var err error
@@ -140,7 +158,7 @@ func (n *Node) handlers() {
 			return nil, err
 		}
 		n.reconcile(n.ctx)
-		return nil, nil
+		return res, nil
 	})
 	ctl.HandleFunc(n.ctl, MethodKeep, func(ctx context.Context, p KeepParams) (any, error) {
 		if err := ready(); err != nil {
