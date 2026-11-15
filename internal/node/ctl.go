@@ -261,7 +261,7 @@ func (n *Node) status() Status {
 	self := n.tr.Key()
 	st := Status{
 		Name: n.cfg.Name, Key: self, Addr: n.tr.Addr(), Device: n.sy.DeviceID(), Server: api.Addr(n.cfg.Server),
-		Registered: n.registered, Watching: n.watching, ServerErr: n.serverErr, ServerSeen: n.serverSeen,
+		Registered: n.registered, Watching: n.watching && n.reachable, ServerErr: n.serverErr, ServerSeen: n.serverSeen,
 		Version: n.member.Version,
 	}
 	names := map[api.NodeKey]string{}

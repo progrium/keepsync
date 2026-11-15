@@ -24,6 +24,7 @@ import (
 	"github.com/progrium/keepsync/internal/ctl"
 	"github.com/progrium/keepsync/internal/keeper"
 	"github.com/progrium/keepsync/internal/pkserver"
+	"github.com/progrium/keepsync/internal/registry"
 	"github.com/progrium/keepsync/internal/syncer"
 	"github.com/progrium/keepsync/internal/tcnet"
 )
@@ -114,7 +115,7 @@ type Node struct {
 	logf func(format string, args ...any)
 
 	tr     *tcnet.Transport
-	reg    *liveClient
+	reg    *registry.Client
 	putter *pkserver.Putter
 	sy     *syncer.Syncer
 	ctl    *ctl.Server
@@ -125,6 +126,7 @@ type Node struct {
 	haveMember bool
 	registered bool
 	watching   bool
+	reachable  bool // the last health check (or Register) succeeded
 	serverErr  string
 	serverSeen time.Time
 	connected  map[api.DeviceID]bool
@@ -175,7 +177,7 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 		return err
 	}
 	server := api.Addr(cfg.Server)
-	n.reg = newLiveClient(n.tr, server)
+	n.reg = registry.NewClient(n.tr, server)
 	if n.putter, err = pkserver.NewPutter(n.tr, server); err != nil {
 		return err
 	}
@@ -196,22 +198,21 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 	if o.Ready != nil {
 		o.Ready(n)
 	}
-	go n.probe(ctx)
+	go n.health(ctx)
 	n.watch(ctx)
 	return nil
 }
 
-// probeInterval and probeTimeout set how quickly a node notices that the
-// server is gone (see liveClient).
+// healthInterval and healthTimeout set how often `status` learns whether
+// the server answers. registry.Client reconnects its Watch on its own and
+// does not say when it is disconnected, so a cheap call is the signal.
 const (
-	probeInterval = 20 * time.Second
-	probeTimeout  = 15 * time.Second
+	healthInterval = 20 * time.Second
+	healthTimeout  = 15 * time.Second
 )
 
-// probe checks the server is still answering while the membership stream
-// is up, and resets the registry client when it is not.
-func (n *Node) probe(ctx context.Context) {
-	t := time.NewTicker(probeInterval)
+func (n *Node) health(ctx context.Context) {
+	t := time.NewTicker(healthInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -219,22 +220,22 @@ func (n *Node) probe(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		cctx, cancel := context.WithTimeout(ctx, healthTimeout)
+		_, err := n.reg.Durable(cctx, nil)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
 		n.mu.Lock()
-		watching := n.watching
+		if err != nil {
+			if n.reachable {
+				n.logf("server not answering: %v", err)
+			}
+			n.reachable, n.serverErr = false, err.Error()
+		} else {
+			n.reachable, n.serverErr, n.serverSeen = true, "", time.Now()
+		}
 		n.mu.Unlock()
-		if !watching {
-			continue
-		}
-		if err := n.reg.probe(ctx, probeTimeout); err != nil && ctx.Err() == nil {
-			n.logf("server not answering (%v); reconnecting", err)
-			n.mu.Lock()
-			n.watching, n.serverErr = false, err.Error()
-			n.mu.Unlock()
-		} else if err == nil {
-			n.mu.Lock()
-			n.serverSeen = time.Now()
-			n.mu.Unlock()
-		}
 	}
 }
 
@@ -268,7 +269,7 @@ func (n *Node) watch(ctx context.Context) {
 	fail := func(err error) {
 		n.mu.Lock()
 		n.serverErr = err.Error()
-		n.watching = false
+		n.watching, n.reachable = false, false
 		n.mu.Unlock()
 		n.logf("server: %v (retrying in %v)", err, backoff)
 		select {
@@ -284,7 +285,7 @@ func (n *Node) watch(ctx context.Context) {
 			continue
 		}
 		n.mu.Lock()
-		n.registered, n.serverErr, n.serverSeen = true, "", time.Now()
+		n.registered, n.reachable, n.serverErr, n.serverSeen = true, true, "", time.Now()
 		n.mu.Unlock()
 		n.apply(ctx, m)
 		ch, err := n.reg.Watch(ctx)
