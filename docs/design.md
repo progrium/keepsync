@@ -190,7 +190,7 @@ Durations accept Go syntax plus a `d` suffix. A policy is rejected unless grace 
 
 - The root permanode has `title` and `camliRoot` set to the folder name, so it appears under `pk-mount`'s `roots/`.
 - Every directory below the root has its own permanode. Its parent names it with `camliPath:<name> → dir permanode`.
-- Every file has its own permanode, with `camliContent → fileref` and `keepsyncMtime`. Its directory names it with `camliPath:<name> → file permanode`.
+- Every file has its own permanode, with `camliContent → fileref`, `keepsyncMtime` and `keepsyncMode` (its permission bits, in octal; a chmod with the same content sets it on its own). Its directory names it with `camliPath:<name> → file permanode`.
 
 Each change is one signed multi claim:
 
@@ -208,16 +208,17 @@ The mtime rule is checked per file permanode. A path is recoverable by name only
 
 Running two keepers is harmless, because the server deduplicates claims. max-defer is tracked in memory, so after a restart a never-settling file's cap is measured from the first version seen after the restart.
 
-**Expiry.** A pass then removes a file from sync once it is unmodified for the expire window, its current fileref and mtime are what the tree holds, and the server reports the whole recovery set durable. Before removing, the keeper re-checks the file's ref, so a same-mtime file with different content is not removed. If the server cannot answer, expiry pauses and sync folders grow past the window. That is the intended failure mode.
+**Expiry.** A pass then removes a file from sync once it is unmodified for the expire window, its current fileref and mtime are what the tree holds, and the server reports the whole recovery set durable. Before removing, the keeper hashes the file again, never trusting its put cache, so a file with the kept mtime but different content is not removed. If the server cannot answer, expiry pauses and sync folders grow past the window. That is the intended failure mode.
 
 **Excluded from keeping:** Syncthing temp files (`.syncthing.*.tmp`), `.stfolder`, `.stversions`, `.keepsync`, the ignore files themselves, anything matched by `.stignore`, and an optional `.keepignore`. The built-in matcher covers common `.stignore` syntax. Conflict copies are kept like any other file.
 
-**`keep status <folder>`** lists files as in grace (with when they will be kept), due, kept, lagging (the archive has a newer version), or expirable. It reports when durability is unknown.
+**`keep status <folder>`** lists files as in grace (with when they will be kept), due, kept, lagging (the archive has a newer version), changed (the kept version's mtime but different content, so never expired), or expirable. Like expiry, it checks the content of the files it would call expirable. It reports when durability is unknown, and lists the files the last pass failed on, with the error; the node also logs each such error once.
 
 **Restore.** `keepsync restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]` reads kept files back from the server over tailcat, including expired ones:
 
 - It reads the current tree, or the tree as of `--at`. `--at` is when the server kept a version, not a file mtime. It takes RFC 3339, `YYYY-MM-DD[ HH:MM]` in local time, or an age such as `3d` or `12h`.
 - Files go back into the folder, or into `--to`, keeping their relative paths.
+- Restored files get the kept permission bits, or 0644 for files kept before modes were recorded.
 - A local file with the kept size and mtime is left alone.
 - A local file that differs is skipped unless `--force` is given.
 - If a restored file is already past the folder's expire window, the result says so, because the next pass expires it again.
@@ -371,11 +372,11 @@ When the server is unreachable, sync keeps working, and only keeping, expiry and
 - Renaming an older file onto a path whose kept version is newer, such as swapping two files' names or copying `report-v1` over `report` with `cp -p`.
 - `touch` fixes each of these, as above.
 
-**A file with an mtime in the future.** Grace and max-defer are both measured from the mtime (max-defer from the earliest mtime seen), so neither fires until the clock passes the mtime. A file stamped years ahead, by a bad camera clock or a zip with bogus dates, is never kept and never expired, and `keep status` shows it in grace until then. A node whose clock runs ahead causes a milder version of this: once a version with a future mtime is kept, every later edit from a node with a correct clock has an older mtime and is rejected as a rollback until real time passes the kept mtime. Syncthing still syncs those edits, because it orders versions by version vector, not mtime.
+**A file with an mtime in the future (keeping fixed).** Grace and max-defer used to be measured from the mtime, so neither fired until the clock passed it, and a file stamped years ahead, by a bad camera clock or a zip with bogus dates, was never kept. Now a future mtime counts from when the keeper first saw the file, for both, so it is kept after grace like any other. It still does not expire until the clock passes its mtime plus the window. A node whose clock runs ahead causes a milder version of this: once a version with a future mtime is kept, every later edit from a node with a correct clock has an older mtime and is rejected as a rollback until real time passes the kept mtime. Syncthing still syncs those edits, because it orders versions by version vector, not mtime.
 
-**Caution: an in-place edit that keeps both size and mtime** (some tag editors have a "preserve modification time" option, and tags often fit in existing padding). Syncthing compares size and mtime, so it never sees the edit, and neither does the keeper. When the file reaches the expire window, the keeper's content re-check uses its put cache, which is keyed by mtime and size, so it matches the old ref and the file is removed. The edit is gone from sync, and it was never kept. The re-check only catches a different-content file when this keeper process has not already put that mtime and size.
+**Caution: an in-place edit that keeps both size and mtime** (some tag editors have a "preserve modification time" option, and tags often fit in existing padding). Syncthing compares size and mtime, so it never sees the edit, and neither does the keeper. Expiry used to check the content against the put cache, keyed by mtime and size, so on the node that made the edit it matched the old ref and removed the file, losing the edit. Expiry now hashes the file first (fixed), so the edited file is not removed there. But the edit still never syncs, and on any other node the old content expires as usual; that delete then reaches the editing node, where Syncthing thinks the file is unchanged and deletes it too. Touch the file after such an edit.
 
-**A same-mtime file in `keep status`.** For the "identical mtime, different content" case above, `keep status` reports the file as kept, and as expirable once it is durable and past the window, because the status check compares mtimes only. Only the expiry pass looks at the content.
+**A same-mtime file in `keep status` (fixed).** For the "identical mtime, different content" case above, `keep status` used to report the file as kept, and as expirable once it was durable and past the window, because it compared mtimes only. It now checks content the way expiry does: the put cache shows such a file as changed, and any file it would call expirable is hashed first, and is reported changed if its content differs. A changed file that is not expirable yet, and that this keeper has not put, still shows as kept, because hashing every kept file on each status would be too slow.
 
 **Coarse-mtime filesystems.** The kept mtime has nanoseconds. A keeper on a filesystem that stores coarser times (exFAT, HFS+, some network mounts) sees the synced file with a truncated mtime, so `keep status` there reports files that came from a finer filesystem as lagging, and that keeper never expires them. The other keeper still can. If the coarse keeper keeps a new file first, a finer keeper later claims it again with the finer mtime, which counts as newer, so the same content is kept twice.
 
@@ -385,7 +386,7 @@ When the server is unreachable, sync keeps working, and only keeping, expiry and
 
 **Renames, deletes and a full restore.** The tree never forgets a name, and it does not record why a file left sync. A plain `restore <folder>` therefore brings back every file ever kept: expired ones, but also files deleted on purpose, the old names of renamed files and directories (next to the new names), and conflict copies that a hook resolved, since both versions are kept before the hook runs. In a folder with expiry, the ones already past the window are expired again on the next pass. Restoring a subpath, or with `--to`, limits the damage.
 
-**Caution: what the archive does not hold.** The keeper walks regular files only. Symlinks and empty directories, which Syncthing does sync, are never kept, so a restore cannot bring them back. File permissions are not kept either: `restore` writes every file as 0644, so a restored script is no longer executable.
+**Caution: what the archive does not hold.** The keeper walks regular files only. Symlinks and empty directories, which Syncthing does sync, are never kept, so a restore cannot bring them back. Permissions used to be lost as well, with `restore` writing every file as 0644; they are now kept and restored (fixed), except for files kept before that change, which still restore as 0644 until their next edit.
 
 **Caution: `.stignore` is per node.** Syncthing never syncs `.stignore`, and each keeper reads its own. A path one keeper ignores is still kept by the other, but if both keepers ignore a path that other nodes sync, it is never kept. Keepers are chosen without looking at their ignore files. `.keepignore` is an ordinary synced file, so it is the same on every node.
 
