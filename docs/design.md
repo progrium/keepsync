@@ -216,13 +216,14 @@ Running two keepers is harmless, because the server deduplicates claims. max-def
 
 **`keep status <folder>`** lists files as in grace (with when they will be kept), due, kept, lagging (the archive has a newer version), changed (the kept version's mtime but different content, so never expired), or expirable. Like expiry, it checks the content of the files it would call expirable. It reports when durability is unknown, and lists the files the last pass failed on, with the error; the node also logs each such error once.
 
-**Restore.** `keepsync restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]` reads kept files back from the server over tailcat, including expired ones:
+**Restore.** `keepsync restore <folder> [<path>] [--at <time>] [--to <dir>] [--force] [--deleted]` reads kept files back from the server over tailcat, including expired ones:
 
 - It reads the current tree, or the tree as of `--at`. `--at` is when the server kept a version, not a file mtime. It takes RFC 3339, `YYYY-MM-DD[ HH:MM]` in local time, or an age such as `3d` or `12h`.
 - Files go back into the folder, or into `--to`, keeping their relative paths.
 - Restored files get the kept permission bits, or 0644 for files kept before modes were recorded.
 - A local file with the kept size and mtime is left alone.
 - A local file that differs is skipped unless `--force` is given.
+- A file that was deleted in sync (as of `--at`, if given) is skipped unless `--deleted` is given, and listed as "skipped (deleted in sync)" with a count. Expired files are always restored.
 - If a restored file is already past the folder's expire window, the result says so, because the next pass expires it again.
 
 ## Syncthing
@@ -247,7 +248,8 @@ BEP's TLS runs end to end, so Syncthing still checks device IDs.
 
 - **Who runs it.** On a kept folder, only `Keepers[0]`. On an unkept folder, `Members[0]`. Other nodes only report.
 - **When.** On each conflict event from Syncthing, and on a scan of the folder when the node starts, attaches it, or becomes its hook runner (for example by keeper failover). Each copy is debounced for 5 s, and hooks run one at a time per folder.
-- **Before it runs**, on a kept folder, the node reads the original's current kept version as the base. Then it keeps the original and the copy immediately, skipping grace, so anything the hook does is recoverable. If that fails, the hook does not run.
+- **The base**, on a kept folder, is read before the hook runs. Let W be the original's current Syncthing version. The node walks the path's kept history, newest first, and takes the first version whose content differs from both the original and the copy and that W descends from (a version kept without a Syncthing version counts as an ancestor). The base is exact if that version has a Syncthing version. With no such version, the base is the last kept version, as a guess. A version kept after the copies diverged is one of the sides, so it is never the base.
+- **Before it runs**, on a kept folder, after reading the base, the node keeps the original and the copy immediately, skipping grace, so anything the hook does is recoverable. If that fails, the hook does not run.
 - **Timeout.** `conflict_hook_timeout` (default 5m). On timeout the hook's whole process group is killed.
 
 The script runs in the folder root and its output is logged. It gets:
@@ -259,6 +261,7 @@ The script runs in the folder root and its output is logged. It gets:
 | `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
 | `KEEPSYNC_CONFLICT_NODE` | Name of the node whose losing change the copy holds, else its short device ID. This is the copy's `ModifiedBy` in Syncthing's index. The ID in the copy's name is the winner's, so it isn't used. |
 | `KEEPSYNC_BASE` | The base in a temp file, for a three-way merge, or empty if there is none (always empty on an unkept folder). The file is deleted afterwards. |
+| `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor, else `0` (a guess, or no base). |
 
 **Contract.** To resolve, the script writes the result to the original path, deletes the conflict copy and exits 0. Syncthing syncs that like any other edit. A non-zero exit, a timeout, or a copy still in place leaves the conflict for a human. A failed copy is not retried until its size or mtime changes.
 
@@ -331,7 +334,7 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 | `keep <folder> [--grace] [--max-defer] [--expire]` | Node | Marks a folder kept. Creates the permanode and `.keepsync`. |
 | `keep status <folder> [-v]` | Node | Files in grace, kept, lagging and expirable. |
 | `unkeep <folder>` | Node | Stops keeping a folder on every node. The archive stays. |
-| `restore <folder> [<path>] [--at] [--to] [--force]` | Node | Pulls kept files back, including expired ones, and from unkept folders. |
+| `restore <folder> [<path>] [--at] [--to] [--force] [--deleted]` | Node | Pulls kept files back, including expired ones, and from unkept folders. |
 | `conflicts` / `conflicts resolve <path>` | Node | Lists conflict copies and hook state, or runs the hook now. |
 | `gateway config [--path]` | Node | Writes a Perkeep client config for the local gateway. |
 | `recover <kit> [--drill --bucket <copy> --baseline <file>]` | Any | Rebuilds the server from the bucket, or runs the drill. |

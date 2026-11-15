@@ -48,7 +48,7 @@ Node:
   unkeep <folder>                      stop keeping a folder; the archive stays
   conflicts                            list conflict copies and hook state
   conflicts resolve <path>             run the conflict hook now, on this node
-  restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]
+  restore <folder> [<path>] [--at <time>] [--to <dir>] [--force] [--deleted]
                                        pull kept files back, including expired;
                                        --at is when the server kept them
   gateway config [--path <file>]       point Perkeep tools at this node's gateway

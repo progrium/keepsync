@@ -35,6 +35,10 @@ type RestoreParams struct {
 	// At, if set, restores the tree as the server had kept it at that
 	// time (when each version's claim was signed, not the file mtime).
 	At time.Time `json:"at,omitzero"`
+	// Deleted also restores files that were deleted in sync (as of At, if
+	// set). Without it they are listed in RestoreResult.Deleted instead.
+	// Expired files are always restored.
+	Deleted bool `json:"deleted,omitempty"`
 }
 
 // RestoreResult is the result of MethodRestore.
@@ -43,6 +47,7 @@ type RestoreResult struct {
 	Restored  []string `json:"restored"`
 	Unchanged []string `json:"unchanged,omitempty"` // already present with the kept size and mtime
 	Skipped   []string `json:"skipped,omitempty"`   // present but different (use force)
+	Deleted   []string `json:"deleted,omitempty"`   // deleted in sync, not restored (use deleted)
 	Errors    []string `json:"errors,omitempty"`
 	// Reexpire is set when files were restored into a folder whose expire
 	// window they are already past: the next keeper pass removes them
@@ -128,6 +133,10 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 	}
 	for _, name := range names {
 		e := tree[name]
+		if e.Gone == api.GoneDeleted && !p.Deleted {
+			res.Deleted = append(res.Deleted, name)
+			continue
+		}
 		dst := filepath.Join(dest, filepath.FromSlash(name))
 		if !strings.HasPrefix(dst, dest+string(filepath.Separator)) {
 			res.Errors = append(res.Errors, name+": path escapes the folder")

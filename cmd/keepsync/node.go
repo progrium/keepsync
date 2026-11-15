@@ -295,8 +295,9 @@ func (e *env) restore(args []string) error {
 	var p node.RestoreParams
 	fs.StringVar(&p.To, "to", "", "restore into this directory instead of the folder")
 	fs.BoolVar(&p.Force, "force", false, "overwrite local files that differ from the kept version")
+	fs.BoolVar(&p.Deleted, "deleted", false, "also restore files that were deleted in sync (expired files are always restored)")
 	at := fs.String("at", "", "restore the archive as the server had kept it at this time (when versions were kept, not file mtimes): RFC 3339, YYYY-MM-DD[ HH:MM] local time, or an age such as 3d or 12h")
-	pos, err := parse(fs, args, 1, 2, "<folder> [<path>] [--at <time>] [--to <dir>] [--force]")
+	pos, err := parse(fs, args, 1, 2, "<folder> [<path>] [--at <time>] [--to <dir>] [--force] [--deleted]")
 	if err != nil {
 		return err
 	}
@@ -319,6 +320,9 @@ func (e *env) restore(args []string) error {
 	for _, f := range res.Skipped {
 		fmt.Fprintf(e.stdout, "skipped   %s (differs locally; --force to overwrite)\n", f)
 	}
+	for _, f := range res.Deleted {
+		fmt.Fprintf(e.stdout, "skipped   %s (deleted in sync; --deleted to restore)\n", f)
+	}
 	for _, f := range res.Errors {
 		fmt.Fprintf(e.stdout, "error     %s\n", f)
 	}
@@ -326,8 +330,12 @@ func (e *env) restore(args []string) error {
 	if !p.At.IsZero() {
 		asOf = " (as kept at " + p.At.Format("2006-01-02 15:04:05 MST") + ")"
 	}
-	fmt.Fprintf(e.stdout, "%d restored, %d already present, %d skipped, %d errors into %s%s\n",
-		len(res.Restored), len(res.Unchanged), len(res.Skipped), len(res.Errors), res.Dir, asOf)
+	deleted := ""
+	if len(res.Deleted) > 0 {
+		deleted = fmt.Sprintf(", %d skipped (deleted in sync)", len(res.Deleted))
+	}
+	fmt.Fprintf(e.stdout, "%d restored, %d already present, %d skipped%s, %d errors into %s%s\n",
+		len(res.Restored), len(res.Unchanged), len(res.Skipped), deleted, len(res.Errors), res.Dir, asOf)
 	if res.Reexpire {
 		fmt.Fprintln(e.stdout, "note: some restored files are past the folder's expire window and will be removed from sync again on the next keeper pass; use --to to restore outside the folder")
 	}

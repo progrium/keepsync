@@ -67,3 +67,48 @@ func TestRestoreFileMode(t *testing.T) {
 		}
 	}
 }
+
+func TestRestoreSkipsDeletedUnlessAsked(t *testing.T) {
+	tn, pn := newBaseTestNode(t)
+	del := putVersion(t, tn, pn, "deleted.txt", "gone", nil)
+	exp := putVersion(t, tn, pn, "expired.txt", "old", nil)
+	putVersion(t, tn, pn, "live.txt", "here", nil)
+	time.Sleep(5 * time.Millisecond)
+	before := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	if err := tn.reg.MarkGone(tn.ctx, api.GoneClaim{Permanode: pn, Path: "deleted.txt", Reason: api.GoneDeleted, File: del}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tn.reg.MarkGone(tn.ctx, api.GoneClaim{Permanode: pn, Path: "expired.txt", Reason: api.GoneExpired, File: exp}); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := func(p RestoreParams) (RestoreResult, string) {
+		t.Helper()
+		p.Folder, p.To = "docs", t.TempDir()
+		res, err := tn.restore(tn.ctx, p)
+		if err != nil || len(res.Errors) > 0 {
+			t.Fatalf("restore %+v: %v %v", p, err, res.Errors)
+		}
+		return res, p.To
+	}
+	exists := func(dir, name string) bool { _, err := os.Stat(filepath.Join(dir, name)); return err == nil }
+
+	res, dir := restore(RestoreParams{})
+	if strings.Join(res.Restored, ",") != "expired.txt,live.txt" || strings.Join(res.Deleted, ",") != "deleted.txt" || exists(dir, "deleted.txt") {
+		t.Fatalf("default: restored %v, deleted %v", res.Restored, res.Deleted)
+	}
+	res, dir = restore(RestoreParams{Deleted: true})
+	if len(res.Restored) != 3 || len(res.Deleted) != 0 || !exists(dir, "deleted.txt") {
+		t.Fatalf("--deleted: restored %v, deleted %v", res.Restored, res.Deleted)
+	}
+	// As of before the delete was recorded, the file was still in sync.
+	res, dir = restore(RestoreParams{At: before})
+	if len(res.Restored) != 3 || len(res.Deleted) != 0 || !exists(dir, "deleted.txt") {
+		t.Fatalf("--at before the delete: restored %v, deleted %v", res.Restored, res.Deleted)
+	}
+	res, _ = restore(RestoreParams{At: time.Now()})
+	if strings.Join(res.Deleted, ",") != "deleted.txt" {
+		t.Fatalf("--at now: restored %v, deleted %v", res.Restored, res.Deleted)
+	}
+}
