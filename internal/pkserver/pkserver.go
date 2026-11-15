@@ -146,18 +146,20 @@ func HighLevelConfig(dir, replicaDir, keyID, authSpec string) map[string]any {
 // Server is an embedded perkeepd plus the keepsync signer and durability
 // watermark. It implements api.Signer and api.Durability.
 type Server struct {
-	cfg      Config
-	logf     func(string, ...any)
-	signer   *schema.Signer
-	pubKey   string
-	pubRef   blob.Ref
-	roots    roots // handler prefixes, for node scopes
-	ln       *pipeListener
-	hs       *http.Server
-	shutdown interface{ Close() error }
-	owner    *http.Client   // owner access to any handler
-	bs       *client.Client // the primary blob storage, with owner access
-	replica  *client.Client // the diskpacked replica on ZeroFS
+	cfg        Config
+	logf       func(string, ...any)
+	signer     *schema.Signer
+	pubKey     string
+	pubRef     blob.Ref
+	roots      roots // handler prefixes, for node scopes
+	ln         *pipeListener
+	hs         *http.Server
+	shutdown   interface{ Close() error }
+	owner      *http.Client   // owner access to any handler
+	bs         *client.Client // the primary blob storage, with owner access
+	replica    *client.Client // the blob store on ZeroFS
+	layout     string         // LayoutDiskpacked or LayoutFiles
+	unregister func()         // drops the registered 9P VFS, if any
 
 	claimMu   sync.Mutex       // serializes signing, so the mtime rule holds
 	lastClaim time.Time        // date of the last claim signed; guarded by claimMu
@@ -211,8 +213,17 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	// that somehow arrive without one: give those a password nobody has.
 	pw := make([]byte, 16)
 	rand.Read(pw)
-	pkconf, err := loadConfig(cfg.Mode, cfg.Dir, cfg.ZeroFS.Dir(), id.KeyID, "userpass:keepsync:"+hex.EncodeToString(pw))
+	access := accessOf(cfg.ZeroFS, cfg.ZeroFS.Dir())
+	if s.layout, err = detectLayout(access); err != nil {
+		return nil, err
+	}
+	var vfsKey string
+	if access.vfs != nil {
+		vfsKey, s.unregister = registerVFS(access.vfs)
+	}
+	pkconf, err := loadConfig(cfg.Mode, cfg.Dir, access, s.layout, vfsKey, id.KeyID, "userpass:keepsync:"+hex.EncodeToString(pw))
 	if err != nil {
+		s.Close()
 		return nil, err
 	}
 	mux := http.NewServeMux()
@@ -241,7 +252,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 	if s.cacheMode() {
-		// The primary storage is the diskpacked store on ZeroFS.
+		// The primary storage is the blob store on ZeroFS.
 		s.replica = s.bs
 	} else {
 		s.replica, err = s.newClient("/sto-" + replicaName + "/")
@@ -279,15 +290,22 @@ func CheckMode(mode string) error {
 
 // loadConfig builds the perkeepd config for mode. Store mode is
 // HighLevelConfig as is. Cache mode starts from the same config's low-level
-// form and makes the diskpacked store on ZeroFS the primary blob storage
-// (/bs/), dropping the local blob storage and the replication to ZeroFS.
+// form and makes the blob store on ZeroFS the primary blob storage (/bs/),
+// dropping the local blob storage and the replication to ZeroFS.
 // Everything else that genconfig puts in the local blob dir (the index
 // sync queue, the thumbnail cache and its metadata, the importer cache)
-// stays local, so the mount sees only blob writes and diskpacked's own
-// index.
-func loadConfig(mode, dir, replicaDir, keyID, authSpec string) (*serverinit.Config, error) {
+// stays local, so ZeroFS sees only blob writes and the blob store's own
+// files. In LayoutFiles the store on ZeroFS is swapped for a files store,
+// through the mount or over 9P (vfsKey).
+func loadConfig(mode, dir string, a zeroFSAccess, layout, vfsKey, keyID, authSpec string) (*serverinit.Config, error) {
 	if err := CheckMode(mode); err != nil {
 		return nil, err
+	}
+	replicaDir := a.dir
+	if replicaDir == "" {
+		// Over 9P there is no directory; the handler is replaced below
+		// before anything opens it.
+		replicaDir = filepath.Join(dir, "zerofs-9p")
 	}
 	raw, err := json.Marshal(HighLevelConfig(dir, replicaDir, keyID, authSpec))
 	if err != nil {
@@ -297,7 +315,7 @@ func loadConfig(mode, dir, replicaDir, keyID, authSpec string) (*serverinit.Conf
 	if err != nil {
 		return nil, fmt.Errorf("pkserver: perkeepd config: %w", err)
 	}
-	if mode != ModeCache {
+	if mode != ModeCache && layout == LayoutDiskpacked {
 		return conf, nil
 	}
 	low := conf.LowLevelJSONConfig()
@@ -306,13 +324,18 @@ func loadConfig(mode, dir, replicaDir, keyID, authSpec string) (*serverinit.Conf
 		return nil, errors.New("pkserver: perkeepd config has no prefixes")
 	}
 	sto := "/sto-" + replicaName + "/"
-	replica, ok := prefixes[sto]
+	replica, ok := prefixes[sto].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("pkserver: perkeepd config has no %s", sto)
 	}
-	prefixes["/bs/"] = replica
-	for _, p := range []string{sto, "/sync-to-" + replicaName + "/", "/bs-loose/", "/bs-packed/"} {
-		delete(prefixes, p)
+	if layout != LayoutDiskpacked {
+		replica["handler"], replica["handlerArgs"] = replicaHandler(a, layout, vfsKey)
+	}
+	if mode == ModeCache {
+		prefixes["/bs/"] = replica
+		for _, p := range []string{sto, "/sync-to-" + replicaName + "/", "/bs-loose/", "/bs-packed/"} {
+			delete(prefixes, p)
+		}
 	}
 	delete(low, "_knownkeys")
 	raw, err = json.Marshal(low)
@@ -321,7 +344,7 @@ func loadConfig(mode, dir, replicaDir, keyID, authSpec string) (*serverinit.Conf
 	}
 	conf, err = serverinit.Load(raw)
 	if err != nil {
-		return nil, fmt.Errorf("pkserver: perkeepd cache-mode config: %w", err)
+		return nil, fmt.Errorf("pkserver: perkeepd %s-mode config: %w", mode, err)
 	}
 	return conf, nil
 }
@@ -389,6 +412,9 @@ func (s *Server) Close() error {
 	}
 	if s.shutdown != nil {
 		errs = append(errs, s.shutdown.Close())
+	}
+	if s.unregister != nil {
+		s.unregister()
 	}
 	return errors.Join(errs...)
 }
