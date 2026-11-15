@@ -179,7 +179,7 @@ func (n *NineP) Lstat(name string) (fs.FileInfo, error) {
 	if err != nil {
 		return nil, n.pathErr("stat", name, err)
 	}
-	defer f.Close()
+	defer clunkAsync(f)
 	return n.stat(f, name)
 }
 
@@ -236,24 +236,44 @@ type readFile struct {
 	f    p9.File
 	name string
 	size int64 // at open, for Seek from the end
-	off  int64
+	off  int64 // of the next byte Read returns
+
+	// buf holds file bytes from bufOff, read ahead in large 9P reads:
+	// callers such as io.ReadAll read in small pieces, and each 9P read
+	// is a round trip.
+	buf    []byte
+	bufOff int64
 }
+
+// readAhead is the most a Read asks zerofs for at once.
+const readAhead = ninePMsize - 4096
 
 func (r *readFile) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	m, err := r.f.ReadAt(p, r.off)
+	if r.off < r.bufOff || r.off >= r.bufOff+int64(len(r.buf)) {
+		want := int64(readAhead)
+		if rest := r.size - r.off; rest > 0 && rest < want {
+			want = rest // files.Storage reads blobs whole: one round trip
+		}
+		if int64(len(p)) > want {
+			want = int64(len(p))
+		}
+		if int64(cap(r.buf)) < want {
+			r.buf = make([]byte, want)
+		}
+		m, err := r.f.ReadAt(r.buf[:want], r.off)
+		r.buf, r.bufOff = r.buf[:m], r.off
+		if m == 0 {
+			if err == nil || err == io.EOF {
+				return 0, io.EOF
+			}
+			return 0, r.n.pathErr("read", r.name, err)
+		}
+	}
+	m := copy(p, r.buf[r.off-r.bufOff:])
 	r.off += int64(m)
-	if err == io.EOF {
-		return m, io.EOF
-	}
-	if err != nil {
-		return m, r.n.pathErr("read", r.name, err)
-	}
-	if m == 0 {
-		return 0, io.EOF
-	}
 	return m, nil
 }
 
@@ -274,7 +294,17 @@ func (r *readFile) Seek(offset int64, whence int) (int64, error) {
 	return offset, nil
 }
 
-func (r *readFile) Close() error { return r.n.pathErr("close", r.name, r.f.Close()) }
+// Close releases the fid without waiting: nothing was written through it,
+// so the reply carries nothing a caller needs.
+func (r *readFile) Close() error {
+	clunkAsync(r.f)
+	return nil
+}
+
+// clunkAsync releases a read-only fid in the background, taking its round
+// trip off the caller's path. The fid returns to the pool only once zerofs
+// has answered, so it is never reused early.
+func clunkAsync(f p9.File) { go f.Close() }
 
 // MkdirAll makes the directory name and any missing parents.
 func (n *NineP) MkdirAll(name string, perm fs.FileMode) error {
