@@ -184,7 +184,20 @@ func (p *Perkeep) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResu
 	}
 	if cur, ok := tree[c.Path]; ok {
 		if cur.File == c.File {
-			return api.ClaimUnchanged, nil
+			if cur.Gone == api.GoneNone {
+				return api.ClaimUnchanged, nil
+			}
+			// Back in sync with the same content: clear the mark, and
+			// take the newer version if this claim supersedes.
+			p.Claims++
+			now := time.Now()
+			if api.Supersedes(c, cur) {
+				cur.ModTime, cur.Version = c.ModTime, c.Version
+			}
+			cur.Gone, cur.GoneAt = api.GoneNone, time.Time{}
+			tree[c.Path] = cur
+			p.record(c.Permanode, c.Path, cur, now)
+			return api.ClaimWritten, nil
 		}
 		if !api.Supersedes(c, cur) {
 			return api.ClaimRejectedOlder, nil
