@@ -86,7 +86,7 @@ The server runs perkeepd with local blob storage and a `diskpacked` replica on Z
 
 **ZeroFS encryption password.** `server init` generates it (32 random bytes) and stores it in the server's config with owner-only permissions and in the recovery kit. Nobody types it. To adopt an existing bucket, such as the current proof of concept, `server init --zerofs-password-file <path>` imports the existing one instead.
 
-**Signing.** Nodes upload file blobs, which are content-addressed and unsigned. They then ask the server over the registry API to set `camliPath:<name> → fileref`, and the server signs the claim. The server writes nothing if the value is already set, and accepts a new ref for a name only if its mtime is newer than the current one, so a lagging node cannot roll a file back.
+**Signing.** Nodes upload file blobs, which are content-addressed and unsigned. They then ask the server over the registry API to keep a fileref at a path in a kept folder, and the server signs the claims (see "Kept tree layout"). The server writes nothing if the path already holds that ref, and accepts a new ref for a path only if its mtime is newer than the current one, so a lagging node cannot roll a file back.
 
 **Durability watermark.** After each ZeroFS flush, the server records which blobs are now in the bucket. Nodes ask "are these refs durable?" before expiring anything. This is the blob verification tooling, built early because expiry depends on it.
 
@@ -106,11 +106,24 @@ The config is rejected unless grace < max-defer < expire.
 
 **Mapping.** `keepsync keep <folder>` asks the server to create the permanode and writes its ref into a `.keepsync` file inside the folder. Syncthing carries that file to every node, so all nodes agree on the permanode.
 
+**Kept tree layout.** The tree uses Perkeep's own conventions, so the web UI, search and `pk-mount` show kept folders as ordinary directories:
+
+- The folder's root permanode has `title` and `camliRoot` set to the folder name, so it appears under `pk-mount`'s `roots/`.
+- Every directory below the root has its own permanode. Its parent names it with `camliPath:<name> → dir permanode`.
+- Every file has its own permanode, with `camliContent → fileref` and `keepsyncMtime`. Its directory names it with `camliPath:<name> → file permanode`.
+
+Each change is one signed multi claim:
+
+- A changed file gets one claim on its permanode, setting `camliContent` and `keepsyncMtime` together. Nothing above it changes.
+- A new file gets a new permanode, and one claim sets its content and mtime and names it in its directory. A missing directory gets a permanode too, named in the same claim.
+
+The server keeps the mtime rule per file permanode. A path is recoverable by name only when the fileref, the file's permanode and every claim and permanode from the root down to it are durable. The registry returns that set with each path entry, and expiry checks all of it. `PathsAt`, `restore --at` and `pk-mount`'s `at/` all fold the same claims as of a time.
+
 **The keeper loop**, every interval:
 
 1. Walk the folder, skipping excluded files.
 2. For each file past grace (or past max-defer), `pk-put` it. The stat cache makes unchanged files free, and blobs the server already has are not re-uploaded.
-3. Ask the server to set `camliPath:<name>` to the fileref.
+3. Ask the server to keep the fileref at the file's path.
 4. A missing file is never translated into a delete.
 
 **Two keepers per folder.** The server assigns two keeper nodes per folder when available, for redundancy, and reassigns if one goes away. Running both is harmless, because the server deduplicates claims.
@@ -119,7 +132,7 @@ The config is rejected unless grace < max-defer < expire.
 
 **Excluded from keeping:** Syncthing temp files (`.syncthing.*.tmp`), `.stfolder`, `.stversions`, anything matched by `.stignore`, and an optional `.keepignore`. Conflict copies *are* kept (see Conflicts).
 
-**Deleting from keep** means a claim: `del-attribute` on `camliPath:<name>`, or a `delete` claim on a permanode. Both are reversible and history stays. Perkeep has no garbage collector, so physical deletion is `keepsync purge`, a rare manual admin step.
+**Deleting from keep** means a claim: `del-attribute` on `camliPath:<name>` in the parent directory's permanode, or a `delete` claim on a permanode. Both are reversible and history stays. Perkeep has no garbage collector, so physical deletion is `keepsync purge`, a rare manual admin step.
 
 ## Syncthing, conflicts and the conflict hook
 
