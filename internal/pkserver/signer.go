@@ -43,6 +43,10 @@ type treeNode struct {
 	mtime    time.Time
 	// contentClaim is the claim that set content and mtime.
 	contentClaim blob.Ref
+	// lastClaim is the date of the newest claim on pn. A new claim on pn is
+	// dated after it, so it wins when the index folds claims by date, even
+	// if the clock is now behind (docs/design.md, Edge cases).
+	lastClaim time.Time
 }
 
 func newDirNode(pn, nameClaim blob.Ref) *treeNode {
@@ -67,11 +71,14 @@ func (s *Server) NewPermanode(ctx context.Context, title string) (api.BlobRef, e
 		return "", err
 	}
 	multi.SetMultiClaimPermanode(pn)
-	if _, err := s.signAndUpload(ctx, multi); err != nil {
+	_, date, err := s.signClaim(ctx, multi, time.Time{})
+	if err != nil {
 		return "", err
 	}
+	root := newDirNode(pn, blob.Ref{})
+	root.lastClaim = date
 	s.treeMu.Lock()
-	s.trees[api.BlobRef(pn.String())] = newDirNode(pn, blob.Ref{})
+	s.trees[api.BlobRef(pn.String())] = root
 	s.treeMu.Unlock()
 	return api.BlobRef(pn.String()), nil
 }
@@ -153,12 +160,12 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 			if err != nil {
 				return 0, err
 			}
-			claim, err := s.signAndUpload(ctx, multi.SetMultiClaimPermanode(cur.pn))
+			claim, date, err := s.signClaim(ctx, multi.SetMultiClaimPermanode(cur.pn), cur.lastClaim)
 			if err != nil {
 				return 0, err
 			}
 			s.treeMu.Lock()
-			cur.content, cur.mtime, cur.contentClaim = file, c.ModTime, claim
+			cur.content, cur.mtime, cur.contentClaim, cur.lastClaim = file, c.ModTime, claim, date
 			s.treeMu.Unlock()
 			return api.ClaimWritten, nil
 		}
@@ -198,13 +205,15 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 	if err != nil {
 		return 0, err
 	}
-	claim, err := s.signAndUpload(ctx, multi)
+	// The claim changes dir's attributes; the other permanodes are new.
+	claim, date, err := s.signClaim(ctx, multi, dir.lastClaim)
 	if err != nil {
 		return 0, err
 	}
 	s.treeMu.Lock()
+	dir.lastClaim = date
 	for _, m := range news {
-		m.node.nameClaim = claim
+		m.node.nameClaim, m.node.lastClaim = claim, date
 		if m.node.isFile {
 			m.node.contentClaim = claim
 		}
@@ -299,16 +308,23 @@ type attrVal struct {
 
 // attrsOf folds the server's claims on pn, read from the index, into its
 // current attributes, counting only the claims signed at or before at, or
-// all of them if at is zero. It reports false if pn has no claims at all.
-func (s *Server) attrsOf(ctx context.Context, pn blob.Ref, at time.Time) (map[string]attrVal, bool, error) {
+// all of them if at is zero. It also returns the date of the server's newest
+// claim on pn, whatever at is, and reports false if pn has no claims at all.
+func (s *Server) attrsOf(ctx context.Context, pn blob.Ref, at time.Time) (map[string]attrVal, time.Time, bool, error) {
 	res, err := s.bs.GetClaims(ctx, &search.ClaimsRequest{Permanode: pn})
 	if err != nil {
-		return nil, false, fmt.Errorf("pkserver: claims of %s: %w", pn, err)
+		return nil, time.Time{}, false, fmt.Errorf("pkserver: claims of %s: %w", pn, err)
 	}
 	claims := res.Claims
 	sort.SliceStable(claims, func(i, j int) bool {
 		return time.Time(claims[i].Date).Before(time.Time(claims[j].Date))
 	})
+	var latest time.Time
+	for _, c := range claims {
+		if c.Signer == s.pubRef && time.Time(c.Date).After(latest) {
+			latest = time.Time(c.Date)
+		}
+	}
 	attrs := map[string]attrVal{}
 	for _, c := range claims {
 		if c.Signer != s.pubRef {
@@ -326,7 +342,7 @@ func (s *Server) attrsOf(ctx context.Context, pn blob.Ref, at time.Time) (map[st
 			}
 		}
 	}
-	return attrs, len(claims) > 0, nil
+	return attrs, latest, len(claims) > 0, nil
 }
 
 // loadTree walks a kept tree from its root permanode, as of at (or now, if
@@ -336,7 +352,7 @@ func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Ti
 	if !ok {
 		return nil, fmt.Errorf("pkserver: bad permanode %q", permanode)
 	}
-	attrs, ok, err := s.attrsOf(ctx, pn, at)
+	attrs, latest, ok, err := s.attrsOf(ctx, pn, at)
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +364,7 @@ func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Ti
 		return nil, fmt.Errorf("pkserver: unknown permanode %s: not a kept folder's root", permanode)
 	}
 	root := newDirNode(pn, blob.Ref{})
+	root.lastClaim = latest
 	visited := map[blob.Ref]bool{pn: true}
 	if err := s.loadChildren(ctx, root, attrs, at, visited); err != nil {
 		return nil, err
@@ -366,11 +383,12 @@ func (s *Server) loadChildren(ctx context.Context, dir *treeNode, attrs map[stri
 			continue // not a permanode, or a cycle
 		}
 		visited[cpn] = true
-		cattrs, _, err := s.attrsOf(ctx, cpn, at)
+		cattrs, latest, _, err := s.attrsOf(ctx, cpn, at)
 		if err != nil {
 			return err
 		}
 		n := newDirNode(cpn, v.claim)
+		n.lastClaim = latest
 		if content, ok := cattrs[contentAttr]; ok {
 			ref, ok := blob.Parse(content.v)
 			if !ok {
@@ -391,23 +409,44 @@ func (s *Server) loadChildren(ctx context.Context, dir *treeNode, attrs map[stri
 	return nil
 }
 
-// signAndUpload signs bb with the server's identity and stores it. Claim
-// dates strictly increase, so that a later claim on an attribute always
-// wins even within one clock tick. The caller holds claimMu.
+// signAndUpload signs bb with the server's identity and stores it. The
+// caller holds claimMu.
 func (s *Server) signAndUpload(ctx context.Context, bb *schema.Builder) (blob.Ref, error) {
-	now := time.Now().UTC()
-	if !now.After(s.lastClaim) {
-		now = s.lastClaim.Add(time.Microsecond)
+	ref, _, err := s.signClaim(ctx, bb, time.Time{})
+	return ref, err
+}
+
+// signClaim is signAndUpload, returning the date it signed at. Dates
+// strictly increase within a run, so a later claim on an attribute always
+// wins even within one clock tick, and are after notBefore, the newest
+// claim already on the permanodes bb changes, so a clock that went back
+// across a restart cannot date a claim before the one it replaces. The
+// caller holds claimMu.
+func (s *Server) signClaim(ctx context.Context, bb *schema.Builder, notBefore time.Time) (blob.Ref, time.Time, error) {
+	now := s.clock().UTC()
+	for _, after := range []time.Time{s.lastClaim, notBefore} {
+		if !now.After(after) {
+			now = after.Add(time.Microsecond)
+		}
 	}
 	s.lastClaim = now
 	s.signed++
 	signed, err := bb.SignAt(ctx, s.signer, now)
 	if err != nil {
-		return blob.Ref{}, fmt.Errorf("pkserver: signing: %w", err)
+		return blob.Ref{}, time.Time{}, fmt.Errorf("pkserver: signing: %w", err)
 	}
 	pr, err := s.bs.Upload(ctx, client.NewUploadHandleFromString(signed))
 	if err != nil {
-		return blob.Ref{}, fmt.Errorf("pkserver: storing claim: %w", err)
+		return blob.Ref{}, time.Time{}, fmt.Errorf("pkserver: storing claim: %w", err)
 	}
-	return pr.BlobRef, nil
+	return pr.BlobRef, now, nil
+}
+
+// clock is the time claims are dated with: time.Now, or Server.now in
+// tests.
+func (s *Server) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }

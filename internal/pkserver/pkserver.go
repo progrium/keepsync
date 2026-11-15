@@ -144,9 +144,10 @@ type Server struct {
 	bs       *client.Client // the primary blob storage, with owner access
 	replica  *client.Client // the diskpacked replica on ZeroFS
 
-	claimMu   sync.Mutex // serializes signing, so the mtime rule holds
-	lastClaim time.Time  // date of the last claim signed; guarded by claimMu
-	signed    int        // blobs signed, for tests; guarded by claimMu
+	claimMu   sync.Mutex       // serializes signing, so the mtime rule holds
+	lastClaim time.Time        // date of the last claim signed; guarded by claimMu
+	signed    int              // blobs signed, for tests; guarded by claimMu
+	now       func() time.Time // dates claims; nil means time.Now (tests set it)
 
 	treeMu sync.Mutex
 	trees  map[api.BlobRef]*treeNode // cached kept trees, by root permanode
