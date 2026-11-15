@@ -9,9 +9,7 @@
 //
 // ZeroFS is mounted with FUSE ("zerofs mount"), so /dev/fuse must be
 // usable. The whole run takes about five minutes, two of them waiting
-// out registry.DefaultKeeperTimeout for keeper reassignment. Known,
-// unfixed bugs are logged rather than failed unless
-// KEEPSYNC_E2E_KNOWN_BUGS=1 (see knownBug).
+// out registry.DefaultKeeperTimeout for keeper reassignment.
 //
 //	KEEPSYNC_ZEROFS_BIN=/opt/e2ebin/zerofs KEEPSYNC_MINIO_BIN=/opt/e2ebin/minio \
 //	  go test ./test/e2e -v -timeout 30m
@@ -47,20 +45,6 @@ import (
 	"github.com/progrium/keepsync/internal/server"
 	"github.com/progrium/keepsync/internal/zerofs"
 )
-
-// knownBugEnv turns known bugs from log lines into failures.
-const knownBugEnv = "KEEPSYNC_E2E_KNOWN_BUGS"
-
-// knownBug reports a bug that is known and not fixed yet: a failure with
-// KEEPSYNC_E2E_KNOWN_BUGS=1, else a log line, so the suite stays green.
-func knownBug(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv(knownBugEnv) != "" {
-		t.Errorf("known bug: "+format, args...)
-		return
-	}
-	t.Logf("KNOWN BUG (set %s=1 to fail on it): "+format, append([]any{knownBugEnv}, args...)...)
-}
 
 // binary finds a required external binary, or skips the test.
 func binary(t *testing.T, env, name string) string {

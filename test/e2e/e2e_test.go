@@ -380,7 +380,7 @@ func TestCluster(t *testing.T) {
 			t.Errorf("hook run %q: want node %s (Keepers[0]) and a base", runs[0], hookN.name)
 		}
 		if f[3] != loser.name {
-			knownBug(t, "KEEPSYNC_CONFLICT_NODE is %q, want %q: Syncthing names the copy after the incoming (winning) change's device, not the device whose change the copy holds", f[3], loser.name)
+			t.Errorf("KEEPSYNC_CONFLICT_NODE is %q, want %q, whose change the copy holds", f[3], loser.name)
 		}
 		if b, err := os.ReadFile(filepath.Join(c.root, "hookbase-"+hookN.name+"-f.txt")); err != nil || string(b) != "base\n" {
 			t.Errorf("KEEPSYNC_BASE held %q (%v), want the last kept version", b, err)
