@@ -1,9 +1,11 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"perkeep.org/pkg/blob"
 
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/hook"
@@ -294,30 +298,21 @@ func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) 
 	origRel, copyRel = filepath.ToSlash(origRel), filepath.ToSlash(copyRel)
 
 	var base string
+	var exact bool
 	if keep, archive := n.folderKeep(folder); keep != nil {
-		// The base is the original as last kept, read before KeepNow
-		// replaces it with the local version.
+		// The base is read before KeepNow replaces the kept original with
+		// the local version.
 		if archive == "" {
 			archive = keep.Permanode
 		}
-		tree, err := n.reg.Paths(ctx, archive)
+		tmp, err := os.MkdirTemp("", "keepsync-base-")
 		if err != nil {
-			return set(HookFailed, "read the kept tree: "+err.Error(), stamp, true)
+			return set(HookFailed, err.Error(), stamp, true)
 		}
-		if e, ok := tree[origRel]; ok {
-			tmp, err := os.MkdirTemp("", "keepsync-base-")
-			if err != nil {
-				return set(HookFailed, err.Error(), stamp, true)
-			}
-			defer os.RemoveAll(tmp)
-			f, err := n.fetcher()
-			if err == nil {
-				base = filepath.Join(tmp, filepath.Base(origRel))
-				_, _, err = restoreFile(ctx, f, e.File, 0o600, base, true)
-			}
-			if err != nil {
-				return set(HookFailed, "fetch the base: "+err.Error(), stamp, true)
-			}
+		defer os.RemoveAll(tmp)
+		base, exact, err = n.conflictBase(ctx, lf.ID, archive, origRel, orig, abs, tmp)
+		if err != nil {
+			return set(HookFailed, err.Error(), stamp, true)
 		}
 		// Keep both versions first, so whatever the hook does can be undone.
 		n.mu.Lock()
@@ -339,7 +334,7 @@ func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) 
 	n.logf("conflict hook for %s in %s", copyRel, folder)
 	res := hook.Run(ctx, hook.Job{
 		Script: script, Folder: folder, Dir: lf.Path,
-		Original: orig, Conflict: abs, ConflictNode: info.Node, Base: base,
+		Original: orig, Conflict: abs, ConflictNode: info.Node, Base: base, BaseExact: exact,
 		Timeout: timeout, Logf: n.logf,
 	})
 	if res.Resolved {
@@ -404,4 +399,130 @@ func (n *Node) resolveConflict(ctx context.Context, path string) (ConflictInfo, 
 		return ConflictInfo{}, fmt.Errorf("no conflict hook is configured for %s (conflict_hook in node.toml)", folder)
 	}
 	return n.runConflict(ctx, folder, abs, true), nil
+}
+
+// conflictBase writes the hook's base for the original at origRel (orig on
+// disk) and its conflict copy into dir, and reports whether it is exact.
+//
+// The base is the newest kept version whose content differs from both
+// sides and that the original's current Syncthing version W descends from
+// (an entry kept without a version counts as an ancestor). It is exact if
+// that entry has a version. Failing that, it is the last kept version, as
+// a guess; with nothing kept at the path there is no base.
+func (n *Node) conflictBase(ctx context.Context, folderID string, archive api.BlobRef, origRel, orig, copyAbs, dir string) (string, bool, error) {
+	hist, err := n.reg.History(ctx, archive, origRel)
+	if err != nil {
+		return "", false, fmt.Errorf("read the kept history: %w", err)
+	}
+	var w api.Version
+	if st, err := n.sy.FileState(folderID, origRel); err == nil && st.Known {
+		w = st.Version
+	}
+	var f blob.Fetcher
+	fetch := func(ref api.BlobRef, dst string) error {
+		if f == nil {
+			var err error
+			if f, err = n.fetcher(); err != nil {
+				return err
+			}
+		}
+		_, _, err := restoreFile(ctx, f, ref, 0o600, dst, true)
+		if err != nil {
+			return fmt.Errorf("fetch the base: %w", err)
+		}
+		return nil
+	}
+	dst := filepath.Join(dir, filepath.Base(origRel))
+	cand := filepath.Join(dir, ".candidate")
+	differs := map[api.BlobRef]bool{} // content differs from both sides
+	for i := len(hist) - 1; i >= 0; i-- {
+		e := hist[i]
+		if len(e.Version) > 0 && !w.DescendsFrom(e.Version) {
+			continue
+		}
+		d, seen := differs[e.File]
+		if !seen {
+			if err := fetch(e.File, cand); err != nil {
+				return "", false, err
+			}
+			same, err := sameContent(cand, orig)
+			if err == nil && !same {
+				same, err = sameContent(cand, copyAbs)
+			}
+			if err != nil {
+				return "", false, fmt.Errorf("compare the base: %w", err)
+			}
+			d = !same
+			differs[e.File] = d
+		}
+		if !d {
+			continue
+		}
+		// Only the first fetch of a ref can get here, so cand holds it.
+		if err := os.Rename(cand, dst); err != nil {
+			return "", false, err
+		}
+		return dst, len(e.Version) > 0, nil
+	}
+	os.Remove(cand)
+
+	// No exact ancestor: fall back to the last kept version.
+	tree, err := n.reg.Paths(ctx, archive)
+	if err != nil {
+		return "", false, fmt.Errorf("read the kept tree: %w", err)
+	}
+	e, ok := tree[origRel]
+	if !ok {
+		return "", false, nil
+	}
+	if err := fetch(e.File, dst); err != nil {
+		return "", false, err
+	}
+	return dst, false, nil
+}
+
+// sameContent reports whether files a and b hold the same bytes. A
+// missing b counts as different.
+func sameContent(a, b string) (bool, error) {
+	fa, err := os.Open(a)
+	if err != nil {
+		return false, err
+	}
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer fb.Close()
+	sa, err := fa.Stat()
+	if err != nil {
+		return false, err
+	}
+	sb, err := fb.Stat()
+	if err != nil {
+		return false, err
+	}
+	if sa.Size() != sb.Size() {
+		return false, nil
+	}
+	ba, bb := make([]byte, 64<<10), make([]byte, 64<<10)
+	for {
+		na, ea := io.ReadFull(fa, ba)
+		nb, eb := io.ReadFull(fb, bb)
+		if na != nb || !bytes.Equal(ba[:na], bb[:nb]) {
+			return false, nil
+		}
+		if ea == io.EOF || ea == io.ErrUnexpectedEOF {
+			return eb == io.EOF || eb == io.ErrUnexpectedEOF, nil
+		}
+		if ea != nil {
+			return false, ea
+		}
+		if eb != nil {
+			return false, eb
+		}
+	}
 }

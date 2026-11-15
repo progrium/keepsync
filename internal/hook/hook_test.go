@@ -94,3 +94,25 @@ func TestTimeoutKillsGroup(t *testing.T) {
 }
 
 func sprintf(f string, a ...any) string { return fmt.Sprintf(f, a...) }
+
+func TestBaseExact(t *testing.T) {
+	s := script(t, `echo "exact=$KEEPSYNC_BASE_EXACT"; exit 1`)
+	for _, tc := range []struct {
+		exact, noBase bool
+		want          string
+	}{
+		{true, false, "exact=1"},
+		{false, false, "exact=0"},
+		{true, true, "exact=0"}, // no base is never exact
+	} {
+		j, l := job(t, s)
+		j.BaseExact = tc.exact
+		if tc.noBase {
+			j.Base = ""
+		}
+		Run(context.Background(), j)
+		if got := strings.Join(l.lines, "|"); !strings.Contains(got, tc.want) {
+			t.Fatalf("%+v: output %q", tc, got)
+		}
+	}
+}

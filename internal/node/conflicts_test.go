@@ -56,6 +56,7 @@ func TestConflictHookKeepsBothAndGetsBase(t *testing.T) {
 	tn.fetcher = func() (blob.Fetcher, error) { return sto, nil }
 	baseOut := filepath.Join(t.TempDir(), "base.out")
 	tn.cfg.ConflictHook = hookScript(t, `cp "$KEEPSYNC_BASE" `+baseOut+`
+echo "$KEEPSYNC_BASE_EXACT" > `+baseOut+`.exact
 echo "hook node=$KEEPSYNC_CONFLICT_NODE" >> `+ol.path+`
 cat "$KEEPSYNC_CONFLICT" > "$KEEPSYNC_ORIGINAL"
 rm "$KEEPSYNC_CONFLICT"
@@ -76,6 +77,9 @@ rm "$KEEPSYNC_CONFLICT"
 	}
 	if b, _ := os.ReadFile(baseOut); string(b) != "v1" {
 		t.Fatalf("base = %q, want the last kept version v1", b)
+	}
+	if b, _ := os.ReadFile(baseOut + ".exact"); string(b) != "0\n" {
+		t.Fatalf("KEEPSYNC_BASE_EXACT = %q, want 0 for a base kept without a version", b)
 	}
 	if b, _ := os.ReadFile(orig); string(b) != "theirs" {
 		t.Fatalf("original = %q", b)
@@ -132,5 +136,132 @@ func TestConflictHookFailureNotRerun(t *testing.T) {
 	tn.runConflict(tn.ctx, "docs", cp, false)
 	if b, _ := os.ReadFile(count); strings.Count(string(b), "x") != 2 {
 		t.Fatal("hook did not rerun after the copy changed")
+	}
+}
+
+// putVersion keeps body at path in pn with Syncthing version v, through
+// the putter (so the fetcher can read it back), and returns the file ref.
+func putVersion(t *testing.T, tn *testNode, pn api.BlobRef, path, body string, v api.Version) api.BlobRef {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), filepath.Base(path))
+	os.WriteFile(src, []byte(body), 0o644)
+	mt := time.Now()
+	os.Chtimes(src, mt, mt)
+	ref, err := tn.putter.PutFile(tn.ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := tn.reg.ClaimPath(tn.ctx, api.PathClaim{Permanode: pn, Path: path, File: ref, ModTime: mt, Version: v})
+	if err != nil || res != api.ClaimWritten {
+		t.Fatalf("claim %s %q: %v %v", path, body, res, err)
+	}
+	return ref
+}
+
+func newBaseTestNode(t *testing.T) (*testNode, api.BlobRef) {
+	t.Helper()
+	sto := new(memory.Storage)
+	tn := newTestNode(t, func(*fake.Perkeep) api.BlobPutter { return memPutter{sto} })
+	tn.fetcher = func() (blob.Fetcher, error) { return sto, nil }
+	pn := tn.keep(t)
+	tn.stopKeepers()
+	return tn, pn
+}
+
+func vv(pairs ...any) api.Version {
+	var v api.Version
+	for i := 0; i < len(pairs); i += 2 {
+		v = append(v, api.VersionCounter{ID: pairs[i].(string), Value: uint64(pairs[i+1].(int))})
+	}
+	return v
+}
+
+func (tn *testNode) folderID(t *testing.T) string {
+	t.Helper()
+	lf, err := tn.localFolder("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lf.ID
+}
+
+func (tn *testNode) base(t *testing.T, mine, theirs string) (string, bool) {
+	t.Helper()
+	orig := filepath.Join(tn.dir, "a.txt")
+	cp := filepath.Join(tn.dir, copyName)
+	os.WriteFile(orig, []byte(mine), 0o644)
+	os.WriteFile(cp, []byte(theirs), 0o644)
+	_, archive := tn.folderKeep("docs")
+	if archive == "" {
+		k, _ := tn.folderKeep("docs")
+		archive = k.Permanode
+	}
+	dir := t.TempDir()
+	path, exact, err := tn.conflictBase(tn.ctx, tn.folderID(t), archive, "a.txt", orig, cp, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path == "" {
+		return "", exact
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), exact
+}
+
+func TestConflictBaseSkipsVersionEqualToOneSide(t *testing.T) {
+	tn, pn := newBaseTestNode(t)
+	putVersion(t, tn, pn, "a.txt", "v1", vv("AAAAAAA", 1))
+	// Mine was kept after the copies diverged: the last kept version is
+	// one side, not the base.
+	putVersion(t, tn, pn, "a.txt", "mine", vv("AAAAAAA", 2))
+	tn.sy.(*fake.Syncer).SetFileState(tn.folderID(t), "a.txt", api.FileState{Known: true, Current: true, Version: vv("AAAAAAA", 2)})
+	got, exact := tn.base(t, "mine", "theirs")
+	if got != "v1" || !exact {
+		t.Fatalf("base = %q exact=%v, want v1 exact", got, exact)
+	}
+}
+
+func TestConflictBaseSkipsEqualToCopy(t *testing.T) {
+	tn, pn := newBaseTestNode(t)
+	putVersion(t, tn, pn, "a.txt", "v1", vv("AAAAAAA", 1))
+	putVersion(t, tn, pn, "a.txt", "theirs", vv("AAAAAAA", 1, "BBBBBBB", 1))
+	// W descends from both kept versions; the newer one is the copy.
+	tn.sy.(*fake.Syncer).SetFileState(tn.folderID(t), "a.txt", api.FileState{Known: true, Current: true, Version: vv("AAAAAAA", 2, "BBBBBBB", 1)})
+	got, exact := tn.base(t, "mine", "theirs")
+	if got != "v1" || !exact {
+		t.Fatalf("base = %q exact=%v, want v1 exact", got, exact)
+	}
+}
+
+func TestConflictBaseNotAncestorFallsBack(t *testing.T) {
+	tn, pn := newBaseTestNode(t)
+	// The only kept version is concurrent with the original's version, so
+	// it is not a known ancestor: fall back to it as a guess.
+	putVersion(t, tn, pn, "a.txt", "v1", vv("BBBBBBB", 5))
+	tn.sy.(*fake.Syncer).SetFileState(tn.folderID(t), "a.txt", api.FileState{Known: true, Current: true, Version: vv("AAAAAAA", 1)})
+	got, exact := tn.base(t, "mine", "theirs")
+	if got != "v1" || exact {
+		t.Fatalf("base = %q exact=%v, want v1 not exact", got, exact)
+	}
+}
+
+func TestConflictBaseUnversionedNotExact(t *testing.T) {
+	tn, pn := newBaseTestNode(t)
+	putVersion(t, tn, pn, "a.txt", "v1", nil)
+	tn.sy.(*fake.Syncer).SetFileState(tn.folderID(t), "a.txt", api.FileState{Known: true, Current: true, Version: vv("AAAAAAA", 3)})
+	got, exact := tn.base(t, "mine", "theirs")
+	if got != "v1" || exact {
+		t.Fatalf("base = %q exact=%v, want v1 not exact", got, exact)
+	}
+}
+
+func TestConflictBaseNone(t *testing.T) {
+	tn, _ := newBaseTestNode(t)
+	got, exact := tn.base(t, "mine", "theirs")
+	if got != "" || exact {
+		t.Fatalf("base = %q exact=%v, want none", got, exact)
 	}
 }

@@ -29,6 +29,7 @@ const (
 	EnvConflict     = "KEEPSYNC_CONFLICT"
 	EnvConflictNode = "KEEPSYNC_CONFLICT_NODE"
 	EnvBase         = "KEEPSYNC_BASE"
+	EnvBaseExact    = "KEEPSYNC_BASE_EXACT"
 )
 
 // Job is one hook run.
@@ -43,10 +44,14 @@ type Job struct {
 	Conflict string
 	// ConflictNode names the node whose change the copy holds.
 	ConflictNode string
-	// Base is a file holding the last kept version of the original, or
+	// Base is a file holding the version both sides diverged from, or
 	// "" if there is none.
-	Base    string
-	Timeout time.Duration
+	Base string
+	// BaseExact says the base is known to be the common ancestor: its
+	// Syncthing version is one the original descends from. Otherwise it
+	// is a best guess.
+	BaseExact bool
+	Timeout   time.Duration
 	// Logf receives the script's output, one line per call.
 	Logf func(format string, args ...any)
 }
@@ -73,6 +78,10 @@ func Run(ctx context.Context, j Job) Result {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	exact := "0"
+	if j.BaseExact && j.Base != "" {
+		exact = "1"
+	}
 	cmd := exec.Command(j.Script)
 	cmd.Dir = j.Dir
 	cmd.Env = append(os.Environ(),
@@ -81,6 +90,7 @@ func Run(ctx context.Context, j Job) Result {
 		EnvConflict+"="+j.Conflict,
 		EnvConflictNode+"="+j.ConflictNode,
 		EnvBase+"="+j.Base,
+		EnvBaseExact+"="+exact,
 	)
 	out := &lineWriter{logf: logf, prefix: "hook: "}
 	cmd.Stdout, cmd.Stderr = out, out
