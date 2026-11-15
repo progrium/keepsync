@@ -15,18 +15,42 @@ import (
 	"github.com/progrium/keepsync/internal/api"
 )
 
-// Attributes on a kept folder's permanode. camliPath:<path> is Perkeep's
-// own; mtimeAttrPrefix+<path> holds the mtime the path's current file was
-// claimed with, set in the same multi claim, so the newer-mtime rule needs
-// only the index and survives a reindex from the bucket.
+// The kept tree uses Perkeep's own conventions (docs/design.md, "Kept tree
+// layout"): the root permanode has title and camliRoot; each directory is
+// a permanode named by camliPath:<name> in its parent; each file is a
+// permanode with camliContent and keepsyncMtime, named by camliPath:<name>
+// in its directory. keepsyncMtime is the mtime the current content was
+// kept with, set in the same claim as camliContent, so the newer-mtime
+// rule needs only the index and comes back with a reindex.
 const (
-	pathAttrPrefix  = "camliPath:"
-	mtimeAttrPrefix = "keepsyncMtime:"
-	kindAttr        = "keepsyncKind"
-	kindFolder      = "folder"
+	pathAttrPrefix = "camliPath:"
+	contentAttr    = "camliContent"
+	mtimeAttr      = "keepsyncMtime"
+	kindAttr       = "keepsyncKind"
+	kindFolder     = "folder"
+	kindDir        = "dir"
 )
 
-// NewPermanode creates a permanode for a kept folder, titled title.
+// treeNode is one permanode of a kept tree.
+type treeNode struct {
+	pn        blob.Ref
+	nameClaim blob.Ref // the claim naming it in its parent; zero for the root
+
+	// A directory (or the root) has children; a file has content.
+	children map[string]*treeNode
+	isFile   bool
+	content  blob.Ref
+	mtime    time.Time
+	// contentClaim is the claim that set content and mtime.
+	contentClaim blob.Ref
+}
+
+func newDirNode(pn, nameClaim blob.Ref) *treeNode {
+	return &treeNode{pn: pn, nameClaim: nameClaim, children: map[string]*treeNode{}}
+}
+
+// NewPermanode creates the root permanode of a kept folder, with title and
+// camliRoot set to title.
 func (s *Server) NewPermanode(ctx context.Context, title string) (api.BlobRef, error) {
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
@@ -36,6 +60,7 @@ func (s *Server) NewPermanode(ctx context.Context, title string) (api.BlobRef, e
 	}
 	multi, err := schema.NewMultiClaim(
 		schema.NewSetAttributeClaim(pn, "title", title),
+		schema.NewSetAttributeClaim(pn, "camliRoot", title),
 		schema.NewSetAttributeClaim(pn, kindAttr, kindFolder),
 	)
 	if err != nil {
@@ -45,74 +70,160 @@ func (s *Server) NewPermanode(ctx context.Context, title string) (api.BlobRef, e
 	if _, err := s.signAndUpload(ctx, multi); err != nil {
 		return "", err
 	}
+	s.treeMu.Lock()
+	s.trees[api.BlobRef(pn.String())] = newDirNode(pn, blob.Ref{})
+	s.treeMu.Unlock()
 	return api.BlobRef(pn.String()), nil
 }
 
-// ClaimPath sets camliPath:<c.Path> on c.Permanode to c.File. It writes
-// nothing if the path already points at c.File, and rejects a claim whose
-// ModTime is not newer than the current entry's.
+// splitPath splits a slash path into its components, refusing empty, "."
+// and ".." components and absolute paths.
+func splitPath(p string) ([]string, error) {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return nil, fmt.Errorf("pkserver: bad path %q", p)
+	}
+	parts := strings.Split(p, "/")
+	for _, c := range parts {
+		if c == "" || c == "." || c == ".." {
+			return nil, fmt.Errorf("pkserver: bad path %q", p)
+		}
+	}
+	return parts, nil
+}
+
+// ClaimPath keeps c.File at c.Path under the root permanode c.Permanode.
+// It writes nothing if the file there already has c.File as content, and
+// rejects a claim whose ModTime is not newer than the file's
+// keepsyncMtime. Each write is one signed multi claim: on the file's
+// permanode for a changed file; or, for a new file, setting its content
+// and naming it and any missing directories, whose permanodes it creates.
 func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResult, error) {
-	pn, ok := blob.Parse(string(c.Permanode))
-	if !ok {
+	if _, ok := blob.Parse(string(c.Permanode)); !ok {
 		return 0, fmt.Errorf("pkserver: bad permanode %q", c.Permanode)
 	}
 	file, ok := blob.Parse(string(c.File))
 	if !ok {
 		return 0, fmt.Errorf("pkserver: bad file ref %q", c.File)
 	}
-	if c.Path == "" {
-		return 0, fmt.Errorf("pkserver: empty path")
+	parts, err := splitPath(c.Path)
+	if err != nil {
+		return 0, err
 	}
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
 	s.treeMu.Lock()
-	tree, err := s.treeLocked(ctx, c.Permanode)
+	root, err := s.treeLocked(ctx, c.Permanode)
 	s.treeMu.Unlock()
 	if err != nil {
 		return 0, err
 	}
-	s.treeMu.Lock()
-	cur, ok := tree[c.Path]
-	s.treeMu.Unlock()
-	if ok {
-		if cur.File == c.File {
-			return api.ClaimUnchanged, nil
+
+	// Find the deepest existing directory on the path. Only ClaimPath,
+	// under claimMu, changes the tree, so it can be read without treeMu.
+	dir := root
+	i := 0
+	for ; i < len(parts)-1; i++ {
+		next, ok := dir.children[parts[i]]
+		if !ok {
+			break
 		}
-		if !c.ModTime.After(cur.ModTime) {
-			return api.ClaimRejectedOlder, nil
+		if next.isFile {
+			return 0, fmt.Errorf("pkserver: %s: %s is a file", c.Path, strings.Join(parts[:i+1], "/"))
+		}
+		dir = next
+	}
+	base := parts[len(parts)-1]
+	mtime := schema.RFC3339FromTime(c.ModTime)
+
+	if i == len(parts)-1 {
+		if cur, ok := dir.children[base]; ok {
+			if !cur.isFile {
+				return 0, fmt.Errorf("pkserver: %s is a directory", c.Path)
+			}
+			if cur.content == file {
+				return api.ClaimUnchanged, nil
+			}
+			if !c.ModTime.After(cur.mtime) {
+				return api.ClaimRejectedOlder, nil
+			}
+			multi, err := schema.NewMultiClaim(
+				schema.NewSetAttributeClaim(cur.pn, contentAttr, file.String()),
+				schema.NewSetAttributeClaim(cur.pn, mtimeAttr, mtime),
+			)
+			if err != nil {
+				return 0, err
+			}
+			claim, err := s.signAndUpload(ctx, multi.SetMultiClaimPermanode(cur.pn))
+			if err != nil {
+				return 0, err
+			}
+			s.treeMu.Lock()
+			cur.content, cur.mtime, cur.contentClaim = file, c.ModTime, claim
+			s.treeMu.Unlock()
+			return api.ClaimWritten, nil
 		}
 	}
-	multi, err := schema.NewMultiClaim(
-		schema.NewSetAttributeClaim(pn, pathAttrPrefix+c.Path, file.String()),
-		schema.NewSetAttributeClaim(pn, mtimeAttrPrefix+c.Path, schema.RFC3339FromTime(c.ModTime)),
-	)
+
+	// A new file, and the directories from parts[i] down to it.
+	var ops []*schema.Builder
+	type made struct {
+		parent *treeNode
+		name   string
+		node   *treeNode
+	}
+	var news []made
+	parent := dir
+	for ; i < len(parts); i++ {
+		pn, err := s.signAndUpload(ctx, schema.NewUnsignedPermanode())
+		if err != nil {
+			return 0, err
+		}
+		n := newDirNode(pn, blob.Ref{})
+		if i == len(parts)-1 {
+			n.children = nil
+			n.isFile, n.content, n.mtime = true, file, c.ModTime
+			ops = append(ops,
+				schema.NewSetAttributeClaim(pn, contentAttr, file.String()),
+				schema.NewSetAttributeClaim(pn, mtimeAttr, mtime))
+		} else {
+			ops = append(ops,
+				schema.NewSetAttributeClaim(pn, "title", parts[i]),
+				schema.NewSetAttributeClaim(pn, kindAttr, kindDir))
+		}
+		ops = append(ops, schema.NewSetAttributeClaim(parent.pn, pathAttrPrefix+parts[i], pn.String()))
+		news = append(news, made{parent, parts[i], n})
+		parent = n
+	}
+	multi, err := schema.NewMultiClaim(ops...)
 	if err != nil {
 		return 0, err
 	}
-	multi.SetMultiClaimPermanode(pn)
 	claim, err := s.signAndUpload(ctx, multi)
 	if err != nil {
 		return 0, err
 	}
 	s.treeMu.Lock()
-	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claims: []api.BlobRef{api.BlobRef(claim.String())}}
+	for _, m := range news {
+		m.node.nameClaim = claim
+		if m.node.isFile {
+			m.node.contentClaim = claim
+		}
+		m.parent.children[m.name] = m.node
+	}
 	s.treeMu.Unlock()
 	return api.ClaimWritten, nil
 }
 
-// Paths returns the current entries of a kept folder's tree.
+// Paths returns the current entries of a kept folder's tree, by slash
+// path.
 func (s *Server) Paths(ctx context.Context, permanode api.BlobRef) (map[string]api.PathEntry, error) {
 	s.treeMu.Lock()
 	defer s.treeMu.Unlock()
-	t, err := s.treeLocked(ctx, permanode)
+	root, err := s.treeLocked(ctx, permanode)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]api.PathEntry, len(t))
-	for k, v := range t {
-		out[k] = v
-	}
-	return out, nil
+	return flatten(root), nil
 }
 
 // PathsAt returns the entries of a kept folder's tree as it was at time
@@ -123,13 +234,52 @@ func (s *Server) PathsAt(ctx context.Context, permanode api.BlobRef, at time.Tim
 	if at.IsZero() {
 		return nil, fmt.Errorf("pkserver: PathsAt needs a time")
 	}
-	return s.loadTree(ctx, permanode, at)
+	root, err := s.loadTree(ctx, permanode, at)
+	if err != nil {
+		return nil, err
+	}
+	return flatten(root), nil
+}
+
+// flatten returns the files under root by slash path. Each entry's Claims
+// hold every blob besides the file that recovering it by name needs: the
+// file's permanode and the claims setting its content and naming it, and
+// the permanode of each directory above it, up to and including the root,
+// with the claims naming them.
+func flatten(root *treeNode) map[string]api.PathEntry {
+	out := map[string]api.PathEntry{}
+	var walk func(n *treeNode, prefix string, chain []blob.Ref)
+	walk = func(n *treeNode, prefix string, chain []blob.Ref) {
+		for name, c := range n.children {
+			p := prefix + name
+			if !c.isFile {
+				walk(c, p+"/", append(chain[:len(chain):len(chain)], c.pn, c.nameClaim))
+				continue
+			}
+			refs := append(chain[:len(chain):len(chain)], c.pn, c.nameClaim, c.contentClaim)
+			out[p] = api.PathEntry{File: api.BlobRef(c.content.String()), ModTime: c.mtime, Claims: uniqueRefs(refs)}
+		}
+	}
+	walk(root, "", []blob.Ref{root.pn})
+	return out
+}
+
+func uniqueRefs(refs []blob.Ref) []api.BlobRef {
+	seen := map[blob.Ref]bool{}
+	var out []api.BlobRef
+	for _, r := range refs {
+		if r.Valid() && !seen[r] {
+			seen[r] = true
+			out = append(out, api.BlobRef(r.String()))
+		}
+	}
+	return out
 }
 
 // treeLocked returns the cached tree of permanode, loading it from the
 // index on first use. This server is the only signer, so after loading,
 // ClaimPath keeps the cache current. The caller holds treeMu.
-func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (map[string]api.PathEntry, error) {
+func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (*treeNode, error) {
 	if t, ok := s.trees[permanode]; ok {
 		return t, nil
 	}
@@ -141,30 +291,25 @@ func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (map[str
 	return t, nil
 }
 
-// loadTree folds the server's claims on permanode, read from the index,
-// into its tree, counting only the claims signed at or before at, or all
-// of them if at is zero.
-func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Time) (map[string]api.PathEntry, error) {
-	pn, ok := blob.Parse(string(permanode))
-	if !ok {
-		return nil, fmt.Errorf("pkserver: bad permanode %q", permanode)
-	}
+// attrVal is an attribute's current value and the claim that set it.
+type attrVal struct {
+	v     string
+	claim blob.Ref
+}
+
+// attrsOf folds the server's claims on pn, read from the index, into its
+// current attributes, counting only the claims signed at or before at, or
+// all of them if at is zero. It reports false if pn has no claims at all.
+func (s *Server) attrsOf(ctx context.Context, pn blob.Ref, at time.Time) (map[string]attrVal, bool, error) {
 	res, err := s.bs.GetClaims(ctx, &search.ClaimsRequest{Permanode: pn})
 	if err != nil {
-		return nil, fmt.Errorf("pkserver: claims of %s: %w", permanode, err)
-	}
-	if len(res.Claims) == 0 {
-		return nil, fmt.Errorf("pkserver: unknown permanode %s", permanode)
+		return nil, false, fmt.Errorf("pkserver: claims of %s: %w", pn, err)
 	}
 	claims := res.Claims
 	sort.SliceStable(claims, func(i, j int) bool {
 		return time.Time(claims[i].Date).Before(time.Time(claims[j].Date))
 	})
-	type val struct {
-		v     string
-		claim blob.Ref
-	}
-	attrs := map[string]*val{}
+	attrs := map[string]attrVal{}
 	for _, c := range claims {
 		if c.Signer != s.pubRef {
 			continue // only the server's own claims count
@@ -174,28 +319,76 @@ func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Ti
 		}
 		switch c.Type {
 		case "set-attribute", "add-attribute":
-			attrs[c.Attr] = &val{c.Value, c.BlobRef}
+			attrs[c.Attr] = attrVal{c.Value, c.BlobRef}
 		case "del-attribute":
-			if c.Value == "" || (attrs[c.Attr] != nil && attrs[c.Attr].v == c.Value) {
+			if cur, ok := attrs[c.Attr]; c.Value == "" || (ok && cur.v == c.Value) {
 				delete(attrs, c.Attr)
 			}
 		}
 	}
-	t := map[string]api.PathEntry{}
+	return attrs, len(claims) > 0, nil
+}
+
+// loadTree walks a kept tree from its root permanode, as of at (or now, if
+// at is zero).
+func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Time) (*treeNode, error) {
+	pn, ok := blob.Parse(string(permanode))
+	if !ok {
+		return nil, fmt.Errorf("pkserver: bad permanode %q", permanode)
+	}
+	attrs, ok, err := s.attrsOf(ctx, pn, at)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("pkserver: unknown permanode %s", permanode)
+	}
+	if attrs[kindAttr].v != kindFolder {
+		// A directory's or file's permanode, or someone else's.
+		return nil, fmt.Errorf("pkserver: unknown permanode %s: not a kept folder's root", permanode)
+	}
+	root := newDirNode(pn, blob.Ref{})
+	visited := map[blob.Ref]bool{pn: true}
+	if err := s.loadChildren(ctx, root, attrs, at, visited); err != nil {
+		return nil, err
+	}
+	return root, nil
+}
+
+func (s *Server) loadChildren(ctx context.Context, dir *treeNode, attrs map[string]attrVal, at time.Time, visited map[blob.Ref]bool) error {
 	for k, v := range attrs {
-		p, ok := strings.CutPrefix(k, pathAttrPrefix)
+		name, ok := strings.CutPrefix(k, pathAttrPrefix)
 		if !ok {
 			continue
 		}
-		e := api.PathEntry{File: api.BlobRef(v.v), Claims: []api.BlobRef{api.BlobRef(v.claim.String())}}
-		if mt := attrs[mtimeAttrPrefix+p]; mt != nil {
-			if tm, err := time.Parse(time.RFC3339Nano, mt.v); err == nil {
-				e.ModTime = tm
-			}
+		cpn, ok := blob.Parse(v.v)
+		if !ok || visited[cpn] {
+			continue // not a permanode, or a cycle
 		}
-		t[p] = e
+		visited[cpn] = true
+		cattrs, _, err := s.attrsOf(ctx, cpn, at)
+		if err != nil {
+			return err
+		}
+		n := newDirNode(cpn, v.claim)
+		if content, ok := cattrs[contentAttr]; ok {
+			ref, ok := blob.Parse(content.v)
+			if !ok {
+				continue
+			}
+			n.children = nil
+			n.isFile, n.content, n.contentClaim = true, ref, content.claim
+			if mt, ok := cattrs[mtimeAttr]; ok {
+				if tm, err := time.Parse(time.RFC3339Nano, mt.v); err == nil {
+					n.mtime = tm
+				}
+			}
+		} else if err := s.loadChildren(ctx, n, cattrs, at, visited); err != nil {
+			return err
+		}
+		dir.children[name] = n
 	}
-	return t, nil
+	return nil
 }
 
 // signAndUpload signs bb with the server's identity and stores it. Claim
@@ -207,6 +400,7 @@ func (s *Server) signAndUpload(ctx context.Context, bb *schema.Builder) (blob.Re
 		now = s.lastClaim.Add(time.Microsecond)
 	}
 	s.lastClaim = now
+	s.signed++
 	signed, err := bb.SignAt(ctx, s.signer, now)
 	if err != nil {
 		return blob.Ref{}, fmt.Errorf("pkserver: signing: %w", err)

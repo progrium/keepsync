@@ -146,9 +146,10 @@ type Server struct {
 
 	claimMu   sync.Mutex // serializes signing, so the mtime rule holds
 	lastClaim time.Time  // date of the last claim signed; guarded by claimMu
+	signed    int        // blobs signed, for tests; guarded by claimMu
 
 	treeMu sync.Mutex
-	trees  map[api.BlobRef]map[string]api.PathEntry // cached kept trees
+	trees  map[api.BlobRef]*treeNode // cached kept trees, by root permanode
 
 	flushMu sync.Mutex // serializes Flush
 	wm      watermark
@@ -165,7 +166,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.ZeroFS == nil {
 		return nil, errors.New("pkserver: Config.ZeroFS is required")
 	}
-	s := &Server{cfg: cfg, logf: cfg.Logf, trees: map[api.BlobRef]map[string]api.PathEntry{}}
+	s := &Server{cfg: cfg, logf: cfg.Logf, trees: map[api.BlobRef]*treeNode{}}
 	if s.logf == nil {
 		s.logf = log.Printf
 	}

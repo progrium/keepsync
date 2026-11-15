@@ -16,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/search"
+
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/api/fake"
 )
@@ -481,5 +484,161 @@ func TestPathsAt(t *testing.T) {
 	}
 	if _, err := e.srv.PathsAt(ctx, "sha224-00000000000000000000000000000000000000000000000000000000", afterAll); err == nil {
 		t.Error("PathsAt of an unknown permanode succeeded")
+	}
+}
+
+func (s *Server) signedCount() int {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	return s.signed
+}
+
+// describeAttrs returns pn's attributes as perkeepd's search index has them.
+func describeAttrs(t *testing.T, s *Server, pn api.BlobRef) map[string][]string {
+	t.Helper()
+	br, _ := blob.Parse(string(pn))
+	res, err := s.bs.Describe(context.Background(), &search.DescribeRequest{BlobRef: br})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := res.Meta[string(pn)]
+	if m == nil || m.Permanode == nil {
+		t.Fatalf("%s: not described as a permanode", pn)
+	}
+	return m.Permanode.Attr
+}
+
+func TestKeptTreeLayout(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	files := t.TempDir()
+	t0 := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	root, err := e.srv.NewPermanode(ctx, "photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(name, body string) api.BlobRef {
+		t.Helper()
+		ref, err := e.putter.PutFile(ctx, writeFile(t, files, name, body, t0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ref
+	}
+	claim := func(path string, ref api.BlobRef, mt time.Time) api.ClaimResult {
+		t.Helper()
+		r, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: root, Path: path, File: ref, ModTime: mt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	// A new file in two new directories: three permanodes and one claim.
+	v1 := put("v1", "one")
+	n := e.srv.signedCount()
+	if r := claim("2026/trip/a.jpg", v1, t0); r != api.ClaimWritten {
+		t.Fatalf("new nested file: %v", r)
+	}
+	if got := e.srv.signedCount() - n; got != 4 {
+		t.Errorf("new file in new dirs signed %d blobs, want 3 permanodes and 1 claim", got)
+	}
+
+	// A sibling in an existing directory: one permanode and one claim.
+	n = e.srv.signedCount()
+	claim("2026/trip/b.jpg", put("b", "bee"), t0)
+	if got := e.srv.signedCount() - n; got != 2 {
+		t.Errorf("new file in an existing dir signed %d blobs, want 2", got)
+	}
+
+	// A change writes exactly one claim; the same file writes nothing; an
+	// older or equal mtime is rejected.
+	v2 := put("v2", "two")
+	n = e.srv.signedCount()
+	if r := claim("2026/trip/a.jpg", v2, t0.Add(time.Hour)); r != api.ClaimWritten {
+		t.Fatalf("change: %v", r)
+	}
+	if got := e.srv.signedCount() - n; got != 1 {
+		t.Errorf("change signed %d blobs, want 1", got)
+	}
+	n = e.srv.signedCount()
+	if r := claim("2026/trip/a.jpg", v2, t0.Add(2*time.Hour)); r != api.ClaimUnchanged {
+		t.Errorf("same file: %v, want unchanged", r)
+	}
+	if r := claim("2026/trip/a.jpg", v1, t0.Add(time.Hour)); r != api.ClaimRejectedOlder {
+		t.Errorf("same mtime: %v, want rejected", r)
+	}
+	if got := e.srv.signedCount() - n; got != 0 {
+		t.Errorf("unchanged and rejected claims signed %d blobs", got)
+	}
+	if _, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: root, Path: "2026/trip", File: v1, ModTime: t0}); err == nil {
+		t.Error("claiming a directory's path as a file succeeded")
+	}
+	if _, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: root, Path: "2026/../x", File: v1, ModTime: t0}); err == nil {
+		t.Error("a path with .. was accepted")
+	}
+
+	// The cached tree matches a walk of the index.
+	paths, err := e.srv.Paths(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walked, err := e.srv.loadTree(ctx, root, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromIndex := flatten(walked)
+	if len(paths) != 2 || len(fromIndex) != 2 {
+		t.Fatalf("paths %v, from index %v", paths, fromIndex)
+	}
+	for k, p := range paths {
+		w := fromIndex[k]
+		if p.File != w.File || !p.ModTime.Equal(w.ModTime) || fmt.Sprint(p.Claims) != fmt.Sprint(w.Claims) {
+			t.Errorf("%s: cached %+v, index %+v", k, p, w)
+		}
+	}
+	a := paths["2026/trip/a.jpg"]
+	if a.File != v2 || !a.ModTime.Equal(t0.Add(time.Hour)) {
+		t.Errorf("a.jpg: %+v", a)
+	}
+	// root, 2026 and its naming claim, trip and its naming claim, a.jpg's
+	// permanode, its naming claim (the claim that made the dirs) and the
+	// change: the dirs' naming claims are one claim, so 6 distinct.
+	if len(a.Claims) != 6 {
+		t.Errorf("a.jpg claims: %d %v, want 6", len(a.Claims), a.Claims)
+	}
+
+	// The index shows the tree the Perkeep way.
+	rootAttrs := describeAttrs(t, e.srv, root)
+	if fmt.Sprint(rootAttrs["camliRoot"]) != "[photos]" || len(rootAttrs["camliPath:2026"]) != 1 {
+		t.Errorf("root attrs: %v", rootAttrs)
+	}
+	trip := describeAttrs(t, e.srv, api.BlobRef(describeAttrs(t, e.srv, api.BlobRef(rootAttrs["camliPath:2026"][0]))["camliPath:trip"][0]))
+	filePN := api.BlobRef(trip["camliPath:a.jpg"][0])
+	fileAttrs := describeAttrs(t, e.srv, filePN)
+	if fmt.Sprint(fileAttrs["camliContent"]) != "["+string(v2)+"]" || len(fileAttrs["keepsyncMtime"]) != 1 {
+		t.Errorf("file attrs: %v", fileAttrs)
+	}
+
+	// Nothing on the path is durable until it has been flushed.
+	refs := append([]api.BlobRef{a.File}, a.Claims...)
+	d, err := e.srv.Durable(ctx, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, ok := range d {
+		if ok {
+			t.Errorf("%s durable before a flush", refs[i])
+		}
+	}
+	waitDurable(t, e, refs)
+
+	// PathsAt walks the same tree as of a time.
+	old, err := e.srv.PathsAt(ctx, root, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(old) != 2 || old["2026/trip/a.jpg"].File != v2 {
+		t.Errorf("PathsAt now: %v", old)
 	}
 }
