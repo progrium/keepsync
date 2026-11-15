@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/progrium/keepsync/internal/api"
+	"perkeep.org/pkg/blobserver/files"
 )
 
 // Config configures a Supervisor.
@@ -157,8 +158,60 @@ func New(cfg Config) (*Supervisor, error) {
 	return s, nil
 }
 
-// Dir is the mount point the diskpacked replica writes to.
-func (s *Supervisor) Dir() string { return s.cfg.MountDir }
+// Dir is the mount point, or "" in MountNineP mode, where nothing is
+// mounted (use FS).
+func (s *Supervisor) Dir() string {
+	if s.cfg.Mount == MountNineP {
+		return ""
+	}
+	return s.cfg.MountDir
+}
+
+// FS is the 9P client in MountNineP mode, while running; otherwise nil.
+func (s *Supervisor) FS() *NineP {
+	if m, ok := s.mount.(*ninePMount); ok {
+		return m.client()
+	}
+	return nil
+}
+
+// VFS is FS as a Perkeep files.VFS, or nil (not a nil *NineP) when FS is.
+func (s *Supervisor) VFS() files.VFS {
+	if fs := s.FS(); fs != nil {
+		return fs
+	}
+	return nil
+}
+
+// ReadFile reads name, a slash-separated path relative to the root of the
+// ZeroFS filesystem, through the mount or the 9P client.
+func (s *Supervisor) ReadFile(name string) ([]byte, error) {
+	if s.cfg.Mount == MountNineP {
+		fs := s.FS()
+		if fs == nil {
+			return nil, errors.New("zerofs: not running")
+		}
+		return fs.ReadFile(name)
+	}
+	return os.ReadFile(filepath.Join(s.cfg.MountDir, filepath.FromSlash(name)))
+}
+
+// WriteFile replaces name (as in ReadFile) with data atomically. Like any
+// write, it is durable in the bucket after the next Flush.
+func (s *Supervisor) WriteFile(name string, data []byte) error {
+	if s.cfg.Mount == MountNineP {
+		fs := s.FS()
+		if fs == nil {
+			return errors.New("zerofs: not running")
+		}
+		return fs.WriteFile(name, data)
+	}
+	p := filepath.Join(s.cfg.MountDir, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(p, data, 0o600)
+}
 
 // ConfigPath is the generated zerofs.toml.
 func (s *Supervisor) ConfigPath() string { return s.configPath }
@@ -258,7 +311,11 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 		return fmt.Errorf("zerofs: mount %s: %w", s.cfg.MountDir, err)
 	}
 	s.running.Store(true)
-	s.log.Info("zerofs mounted", "dir", s.cfg.MountDir, "mode", s.cfg.Mount)
+	if s.cfg.Mount == MountNineP {
+		s.log.Info("zerofs connected over 9p", "socket", s.ninePSocket)
+	} else {
+		s.log.Info("zerofs mounted", "dir", s.cfg.MountDir, "mode", s.cfg.Mount)
+	}
 	return nil
 }
 
@@ -277,8 +334,12 @@ func (s *Supervisor) flushLocked(ctx context.Context) error {
 	if err := s.exited(); err != nil {
 		return err
 	}
-	if err := syncDir(s.cfg.MountDir); err != nil {
-		return fmt.Errorf("zerofs: sync %s: %w", s.cfg.MountDir, err)
+	// Over a mount, writes may sit in the kernel until synced. A NineP
+	// write is already in zerofs when it returns.
+	if s.cfg.Mount != MountNineP {
+		if err := syncDir(s.cfg.MountDir); err != nil {
+			return fmt.Errorf("zerofs: sync %s: %w", s.cfg.MountDir, err)
+		}
 	}
 	if err := s.mount.Err(); err != nil {
 		return fmt.Errorf("zerofs: mount: %w", err)
@@ -355,6 +416,9 @@ func (s *Supervisor) prepareDirs() error {
 	}
 	if len(s.ninePSocket) > maxSocketPath {
 		return fmt.Errorf("zerofs: socket path %s is longer than %d bytes; use a shorter DataDir", s.ninePSocket, maxSocketPath)
+	}
+	if s.cfg.Mount == MountNineP {
+		return nil
 	}
 	return os.MkdirAll(s.cfg.MountDir, 0o700)
 }

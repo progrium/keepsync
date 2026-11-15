@@ -14,6 +14,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/hugelgupf/p9/fsimpl/localfs"
+	"github.com/hugelgupf/p9/p9"
 )
 
 // The test binary doubles as a stand-in zerofs: with KEEPSYNC_FAKE_ZEROFS set
@@ -91,15 +94,20 @@ func fakeMain(events string, args []string) int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		go func() {
-			for {
-				c, err := l9.Accept()
-				if err != nil {
-					return
+		if root := os.Getenv("FAKE_NINEP_ROOT"); root != "" {
+			// Serve root over 9P, for MountNineP tests.
+			go p9.NewServer(localfs.Attacher(root)).Serve(l9)
+		} else {
+			go func() {
+				for {
+					c, err := l9.Accept()
+					if err != nil {
+						return
+					}
+					c.Close()
 				}
-				c.Close()
-			}
-		}()
+			}()
+		}
 		lr, err := net.Listen("unix", rpc)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)

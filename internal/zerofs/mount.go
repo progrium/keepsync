@@ -15,7 +15,8 @@ import (
 	"time"
 )
 
-// MountMode chooses how the ZeroFS filesystem is mounted at Dir. Every mode
+// MountMode chooses how keepsync reaches the ZeroFS filesystem: through a
+// mount at Dir, or (MountNineP) as a 9P client with no mount. Every mode
 // speaks 9P to ZeroFS, never NFS: ZeroFS reports NFS writes as stable while
 // they are still buffered.
 type MountMode string
@@ -32,7 +33,14 @@ const (
 	// 9P export at MountDir by other means. Start checks that MountDir is a
 	// mount point, so data is never written to a plain local directory.
 	MountExternal MountMode = "external"
+	// MountNineP mounts nothing: keepsync is itself the 9P client (see
+	// NineP and Supervisor.FS), so it needs no FUSE, root or kernel
+	// module, and nothing else on the machine sees the filesystem.
+	MountNineP MountMode = "9p"
 )
+
+// MountModes lists the valid mount modes, the default first.
+var MountModes = []MountMode{MountFUSE, MountNineP, MountKernel, MountExternal}
 
 type mountSpec struct {
 	binary string
@@ -58,6 +66,8 @@ func newMounter(mode MountMode) (mounter, error) {
 		return &kernelMount{}, nil
 	case MountExternal:
 		return &externalMount{}, nil
+	case MountNineP:
+		return &ninePMount{}, nil
 	}
 	return nil, fmt.Errorf("zerofs: unknown mount mode %q", mode)
 }
@@ -272,4 +282,45 @@ func runQuiet(ctx context.Context, name string, args ...string) error {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(buf.String()))
 	}
 	return nil
+}
+
+// ninePMount connects a NineP client instead of mounting.
+type ninePMount struct {
+	mu sync.Mutex
+	fs *NineP
+}
+
+func (n *ninePMount) Mount(ctx context.Context, m mountSpec) error {
+	fs, err := DialNineP(ctx, m.socket)
+	if err != nil {
+		return err
+	}
+	n.mu.Lock()
+	n.fs = fs
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *ninePMount) Unmount(context.Context) error {
+	n.mu.Lock()
+	fs := n.fs
+	n.fs = nil
+	n.mu.Unlock()
+	if fs == nil {
+		return nil
+	}
+	return fs.Close()
+}
+
+func (n *ninePMount) Err() error {
+	if fs := n.client(); fs != nil {
+		return fs.Err()
+	}
+	return nil
+}
+
+func (n *ninePMount) client() *NineP {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.fs
 }
