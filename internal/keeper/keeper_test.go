@@ -60,7 +60,7 @@ func (e *env) newKeeper(self api.NodeKey, reg api.RegistryClient) *Keeper {
 	e.t.Helper()
 	k, err := New(Config{
 		Folder: "docs", FolderID: "fake-docs", Dir: e.dir, Self: self, Policy: e.policy,
-		Registry: reg, Putter: e.pk, Clock: e.clock, Scanner: e.scans,
+		Registry: reg, Putter: e.pk, Clock: e.clock, Syncer: e.scans,
 	})
 	if err != nil {
 		e.t.Fatal(err)

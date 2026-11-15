@@ -15,7 +15,8 @@ import (
 )
 
 // Scanner is the part of api.Syncer the keeper uses to tell Syncthing about
-// an expired file right away instead of waiting for its watcher.
+// an expired file right away instead of waiting for its watcher. Superseded
+// by Config.Syncer; kept so callers that only scan still work.
 type Scanner interface {
 	Scan(ctx context.Context, folderID, subpath string) error
 }
@@ -23,7 +24,7 @@ type Scanner interface {
 // Config sets up a Keeper for one kept folder on this node.
 type Config struct {
 	Folder   string // registry folder name
-	FolderID string // Syncthing folder ID, for Scanner
+	FolderID string // Syncthing folder ID, for Syncer
 	Dir      string // local path of the synced folder
 	Self     api.NodeKey
 	Policy   api.KeepPolicy
@@ -31,7 +32,13 @@ type Config struct {
 	Registry api.RegistryClient
 	Putter   api.BlobPutter
 	Clock    api.Clock // defaults to api.SystemClock
-	Scanner  Scanner   // optional
+	Scanner  Scanner   // optional; Syncer takes its place when set
+
+	// Syncer is the node's Syncthing. With it the keeper claims only the
+	// version Syncthing calls current, sends its version vector with each
+	// claim, and records files deleted in sync as gone. Without it the
+	// keeper falls back to mtimes and never marks deletes.
+	Syncer api.Syncer
 
 	// Exclude, if set, replaces the .stignore/.keepignore matcher. The
 	// built-in exclusions (Syncthing temp and state files, .keepsync and the
@@ -91,6 +98,9 @@ func New(cfg Config) (*Keeper, error) {
 	if cfg.Interval <= 0 {
 		cfg.Interval = DefaultInterval
 	}
+	if cfg.Syncer != nil {
+		cfg.Scanner = cfg.Syncer
+	}
 	return &Keeper{
 		cfg:      cfg,
 		policy:   cfg.Policy,
@@ -145,8 +155,10 @@ type Report struct {
 	Kept    []string // paths claimed this pass (written or already set)
 	Forced  []string // the subset of Kept kept by max-defer rather than grace
 	InGrace []string // paths with an unkept version still inside grace
-	Lagging []string // local copy older than the archive; left for Syncthing
+	Lagging []string // not the current version (per Syncthing or the archive); left for Syncthing
 	Expired []string // paths removed from sync this pass
+	// Gone holds the paths marked gone in the kept tree this pass, with why.
+	Gone map[string]api.GoneReason
 	// ExpiryPaused is set when expiry could not run (server unreachable).
 	ExpiryPaused bool
 	// Errors holds per-file failures; the pass carried on past them.
@@ -224,6 +236,7 @@ func (k *Keeper) Pass(ctx context.Context) (Report, error) {
 	if k.policy.Expire > 0 {
 		k.expire(ctx, files, tree, now, &rep)
 	}
+	k.markDeleted(ctx, tree, seen, now, &rep)
 	return rep, nil
 }
 
@@ -345,20 +358,18 @@ func (k *Keeper) walk() ([]file, error) {
 	return files, err
 }
 
-// keptVersion reports whether the archive already holds this exact version
-// of f. Matching mtimes are taken as the same version; expiry verifies the
-// ref before deleting anything.
-func keptVersion(f file, tree map[string]api.PathEntry) bool {
-	e, ok := tree[f.rel]
-	return ok && e.ModTime.Equal(f.mtime)
-}
-
 func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEntry, now time.Time, force bool, rep *Report) {
-	if keptVersion(f, tree) {
+	st := k.fileState(f.rel)
+	if st.notCurrent() {
+		// A node that is behind must not claim its stale copy.
+		rep.Lagging = append(rep.Lagging, f.rel)
+		return
+	}
+	if keptVersion(f, st, tree) {
 		delete(k.dirty, f.rel)
 		return
 	}
-	if e, ok := tree[f.rel]; ok && e.ModTime.After(f.mtime) && !force {
+	if laggingVersion(f, st, tree) && !force {
 		rep.Lagging = append(rep.Lagging, f.rel)
 		return
 	}
@@ -401,6 +412,7 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 		Path:      f.rel,
 		File:      ref,
 		ModTime:   f.mtime,
+		Version:   st.Version,
 	})
 	if err != nil {
 		rep.Errors = append(rep.Errors, fmt.Errorf("keeper: claim %s: %w", f.rel, err))
@@ -412,7 +424,7 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 		// The claim ref is unknown until the next Paths fetch, which keeps
 		// a file claimed in this pass from expiring in the same pass.
 		if e, ok := tree[f.rel]; !ok || e.File != ref || !e.ModTime.Equal(f.mtime) {
-			tree[f.rel] = api.PathEntry{File: ref, ModTime: f.mtime}
+			tree[f.rel] = api.PathEntry{File: ref, ModTime: f.mtime, Version: st.Version}
 		}
 		delete(k.dirty, f.rel)
 		rep.Kept = append(rep.Kept, f.rel)
@@ -431,6 +443,7 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.PathEntry, now time.Time, rep *Report) {
 	type cand struct {
 		f    file
+		file api.BlobRef
 		refs []api.BlobRef
 	}
 	var cands []cand
@@ -439,7 +452,11 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 			continue
 		}
 		e, ok := tree[f.rel]
-		if !ok || !e.ModTime.Equal(f.mtime) || len(e.Claims) == 0 {
+		if !ok || len(e.Claims) == 0 {
+			continue
+		}
+		st := k.fileState(f.rel)
+		if st.notCurrent() || !keptVersion(f, st, tree) {
 			continue
 		}
 		ref, err := k.verifyRef(ctx, f)
@@ -451,7 +468,7 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 			// Same mtime, different content: not the kept version.
 			continue
 		}
-		cands = append(cands, cand{f, recoverRefs(e)})
+		cands = append(cands, cand{f, e.File, recoverRefs(e)})
 	}
 	for start := 0; start < len(cands); start += durableBatch {
 		end := min(start+durableBatch, len(cands))
@@ -476,7 +493,62 @@ func (k *Keeper) expire(ctx context.Context, files []file, tree map[string]api.P
 				continue
 			}
 			rep.Expired = append(rep.Expired, c.f.rel)
+			k.markGone(ctx, c.f.rel, c.file, api.GoneExpired, rep)
 		}
+	}
+}
+
+// markGone records in the kept tree why path left sync.
+func (k *Keeper) markGone(ctx context.Context, rel string, ref api.BlobRef, why api.GoneReason, rep *Report) {
+	err := k.cfg.Registry.MarkGone(ctx, api.GoneClaim{
+		Permanode: k.policy.Permanode,
+		Path:      rel,
+		Reason:    why,
+		File:      ref,
+	})
+	if err != nil {
+		rep.Errors = append(rep.Errors, fmt.Errorf("keeper: mark %s %s: %w", rel, why, err))
+		return
+	}
+	if rep.Gone == nil {
+		rep.Gone = map[string]api.GoneReason{}
+	}
+	rep.Gone[rel] = why
+}
+
+// markDeleted marks kept paths that have left sync. A path counts only when
+// it is missing on disk and Syncthing's current version is a delete, so a
+// node that is behind, or has no Syncer, marks nothing. A path whose kept
+// version is past the expire window was expired by another keeper.
+func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry, seen map[string]bool, now time.Time, rep *Report) {
+	if k.cfg.Syncer == nil {
+		return
+	}
+	rels := make([]string, 0)
+	for rel, e := range tree {
+		if !seen[rel] && e.Gone == api.GoneNone && e.File != "" {
+			rels = append(rels, rel)
+		}
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
+		if ctx.Err() != nil {
+			return
+		}
+		// Not walked can also mean excluded; only a missing file is gone.
+		if _, err := os.Lstat(filepath.Join(k.cfg.Dir, filepath.FromSlash(rel))); !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		st := k.fileState(rel)
+		if !st.ok || !st.Known || !st.Current || !st.Deleted {
+			continue
+		}
+		e := tree[rel]
+		why := api.GoneDeleted
+		if k.policy.Expire > 0 && now.Sub(e.ModTime) >= k.policy.Expire {
+			why = api.GoneExpired
+		}
+		k.markGone(ctx, rel, e.File, why, rep)
 	}
 }
 

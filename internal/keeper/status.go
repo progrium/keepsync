@@ -86,9 +86,12 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 	var expRefs [][]api.BlobRef
 	for _, f := range files {
 		fs := FileStatus{Path: f.rel, ModTime: f.mtime, Size: f.size}
-		e, inTree := tree[f.rel]
+		e := tree[f.rel]
+		fst := k.fileState(f.rel)
 		switch {
-		case keptVersion(f, tree):
+		case fst.notCurrent():
+			fs.State = StateLagging
+		case keptVersion(f, fst, tree):
 			fs.State = StateKept
 			if k.policy.Expire > 0 {
 				fs.ExpireAt = f.mtime.Add(k.policy.Expire)
@@ -97,7 +100,7 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 					expRefs = append(expRefs, recoverRefs(e))
 				}
 			}
-		case inTree && e.ModTime.After(f.mtime):
+		case laggingVersion(f, fst, tree):
 			fs.State = StateLagging
 		case k.cachedRejected(f):
 			fs.State = StateLagging
