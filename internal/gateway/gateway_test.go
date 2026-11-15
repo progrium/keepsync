@@ -30,8 +30,11 @@ type env struct {
 	node    *fake.Transport
 	pn      api.BlobRef // the kept permanode
 	file    api.BlobRef // the file schema of a.txt
-	content string
-	search  string // the search handler's root, from discovery
+	content string      // a.txt now
+	old     string      // a.txt as of before
+	before  time.Time   // between the two versions of a.txt
+	nested  string      // sub/dir/b.txt
+	search  string      // the search handler's root, from discovery
 
 	mu     sync.Mutex
 	scopes map[api.NodeKey]string
@@ -57,7 +60,8 @@ func newEnv(t *testing.T) *env {
 	}
 	nw := fake.NewNetwork()
 	server := nw.Transport("server")
-	e := &env{node: nw.Transport("node"), scopes: map[api.NodeKey]string{}, content: "hello from the archive\n"}
+	e := &env{node: nw.Transport("node"), scopes: map[api.NodeKey]string{}, content: "hello from the archive\n",
+		old: "first version\n", nested: "deep inside\n"}
 	server.Allow(e.node.Key())
 	e.grant(pkserver.ScopeBlobs)
 	srv, err := pkserver.Start(ctx, pkserver.Config{
@@ -79,19 +83,36 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := filepath.Join(root, "a.txt")
-	if err := os.WriteFile(p, []byte(e.content), 0o644); err != nil {
-		t.Fatal(err)
+	put := func(name, body string) api.BlobRef {
+		t.Helper()
+		p := filepath.Join(root, "files", name)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ref, err := putter.PutFile(ctx, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ref
 	}
-	if e.file, err = putter.PutFile(ctx, p); err != nil {
-		t.Fatal(err)
+	claim := func(path string, file api.BlobRef, mtime time.Time) {
+		t.Helper()
+		if r, err := srv.ClaimPath(ctx, api.PathClaim{Permanode: e.pn, Path: path, File: file, ModTime: mtime}); err != nil || r != api.ClaimWritten {
+			t.Fatalf("claim %s: %v %v", path, r, err)
+		}
 	}
 	if e.pn, err = srv.NewPermanode(ctx, "docs"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.ClaimPath(ctx, api.PathClaim{Permanode: e.pn, Path: "a.txt", File: e.file, ModTime: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
+	t0 := time.Now().Add(-time.Hour)
+	claim("a.txt", put("v1/a.txt", e.old), t0)
+	time.Sleep(20 * time.Millisecond)
+	e.before = time.Now()
+	time.Sleep(20 * time.Millisecond)
+	e.file = put("v2/a.txt", e.content)
+	claim("a.txt", e.file, t0.Add(time.Minute))
+	claim("sub/dir/b.txt", put("b.txt", e.nested), t0)
 
 	if e.token, err = LoadToken(filepath.Join(root, "node", "gateway-token")); err != nil {
 		t.Fatal(err)
@@ -403,24 +424,35 @@ func TestStockTools(t *testing.T) {
 			cmd.Process.Kill()
 			cmd.Wait()
 		}()
-		// pk-mount's permanode directories want camliPath to point at
-		// child permanodes, while keepsync points it at file schemas,
-		// so files are read by their blobref.
-		want := filepath.Join(mnt, string(e.file))
-		var got []byte
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			got, err = os.ReadFile(want)
-			if err == nil || time.Now().After(deadline) {
-				break
+		// The kept folder, as pk-mount's roots/ and at/ show it.
+		files := map[string]string{
+			filepath.Join("roots", "docs", "a.txt"):                                       e.content,
+			filepath.Join("roots", "docs", "sub", "dir", "b.txt"):                         e.nested,
+			filepath.Join("at", e.before.UTC().Format(time.RFC3339Nano), "docs", "a.txt"): e.old,
+			string(e.file): e.content, // and any file by blobref
+		}
+		for rel, content := range files {
+			want := filepath.Join(mnt, rel)
+			var got []byte
+			var err error
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				got, err = os.ReadFile(want)
+				if err == nil || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
 			}
-			time.Sleep(200 * time.Millisecond)
+			if err != nil {
+				t.Fatalf("reading %s through pk-mount: %v\n%s", rel, err, log.String())
+			}
+			if string(got) != content {
+				t.Errorf("pk-mount %s: %q, want %q", rel, got, content)
+			}
 		}
-		if err != nil {
-			t.Fatalf("reading %s through pk-mount: %v\n%s", want, err, log.String())
-		}
-		if string(got) != e.content {
-			t.Fatalf("pk-mount a.txt: %q", got)
+		// at/ shows nothing kept after then.
+		if _, err := os.Stat(filepath.Join(mnt, "at", e.before.UTC().Format(time.RFC3339Nano), "docs", "sub")); err == nil {
+			t.Error("at/ before sub/ was kept shows sub/")
 		}
 	})
 
@@ -442,4 +474,77 @@ func stderr(err error) string {
 		return string(ee.Stderr)
 	}
 	return fmt.Sprint(err)
+}
+
+// walk reads the kept tree under permanode pn through the gateway, as
+// pk-mount and the web UI do: describe each permanode, follow camliPath
+// to child permanodes, and download each file's camliContent. at, if not
+// zero, reads the tree as of then. It returns path → contents.
+func (e *env) walk(t *testing.T, pn string, at time.Time) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	var visit func(pn, prefix string)
+	visit = func(pn, prefix string) {
+		req := map[string]any{"blobref": pn, "depth": 3}
+		if !at.IsZero() {
+			req["at"] = at.UTC().Format(time.RFC3339Nano)
+		}
+		body, _ := json.Marshal(req)
+		code, res := e.do(t, "POST", e.search+"camli/search/describe", "application/json", string(body))
+		if code != 200 {
+			t.Fatalf("describe %s: %d %.300s", pn, code, res)
+		}
+		var d struct {
+			Meta map[string]struct {
+				Permanode *struct{ Attr map[string][]string }
+			}
+		}
+		if err := json.Unmarshal([]byte(res), &d); err != nil {
+			t.Fatal(err)
+		}
+		self := d.Meta[pn]
+		if self.Permanode == nil {
+			t.Fatalf("%s (%q) is not described as a permanode", pn, prefix)
+		}
+		for k, v := range self.Permanode.Attr {
+			name, ok := strings.CutPrefix(k, "camliPath:")
+			if !ok || len(v) == 0 {
+				continue
+			}
+			child := d.Meta[v[0]]
+			if child.Permanode == nil {
+				t.Errorf("%s%s: camliPath names %s, which is not a permanode", prefix, name, v[0])
+				continue
+			}
+			if c := child.Permanode.Attr["camliContent"]; len(c) > 0 {
+				code, body := e.do(t, "GET", "/ui/download/"+c[0]+"/"+name, "", "")
+				if code != 200 {
+					t.Fatalf("download %s%s: %d", prefix, name, code)
+				}
+				out[prefix+name] = body
+				continue
+			}
+			visit(v[0], prefix+name+"/")
+		}
+	}
+	visit(pn, "")
+	return out
+}
+
+func TestKeptTreeThroughGateway(t *testing.T) {
+	e := newEnv(t)
+	e.grant(pkserver.ScopeRead)
+	want := map[string]string{"a.txt": e.content, "sub/dir/b.txt": e.nested}
+	if got := e.walk(t, string(e.pn), time.Time{}); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("tree now: %q, want %q", got, want)
+	}
+	old := map[string]string{"a.txt": e.old}
+	if got := e.walk(t, string(e.pn), e.before); fmt.Sprint(got) != fmt.Sprint(old) {
+		t.Fatalf("tree as of before: %q, want %q", got, old)
+	}
+	// The root is a camliRoot, which pk-mount's roots/ lists.
+	code, body := e.do(t, "GET", e.search+"camli/search/permanodeattr?attr=camliRoot&value=docs", "", "")
+	if code != 200 || !strings.Contains(body, string(e.pn)) {
+		t.Fatalf("camliRoot search: %d %.300s", code, body)
+	}
 }
