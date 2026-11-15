@@ -19,13 +19,18 @@ import (
 // layout"): the root permanode has title and camliRoot; each directory is
 // a permanode named by camliPath:<name> in its parent; each file is a
 // permanode with camliContent and keepsyncMtime, named by camliPath:<name>
-// in its directory. keepsyncMtime is the mtime the current content was
-// kept with, set in the same claim as camliContent, so the newer-mtime
-// rule needs only the index and comes back with a reindex.
+// in its directory. keepsyncMtime and keepsyncVersion are the mtime and
+// Syncthing version the current content was kept with, set in the same
+// claim as camliContent, so api.Supersedes needs only the index and comes
+// back with a reindex. keepsyncGone and keepsyncGoneAt record why and when
+// the file left sync; the next content claim deletes them.
 const (
 	pathAttrPrefix = "camliPath:"
 	contentAttr    = "camliContent"
 	mtimeAttr      = "keepsyncMtime"
+	versionAttr    = "keepsyncVersion"
+	goneAttr       = "keepsyncGone"
+	goneAtAttr     = "keepsyncGoneAt"
 	kindAttr       = "keepsyncKind"
 	kindFolder     = "folder"
 	kindDir        = "dir"
@@ -41,12 +46,71 @@ type treeNode struct {
 	isFile   bool
 	content  blob.Ref
 	mtime    time.Time
-	// contentClaim is the claim that set content and mtime.
+	version  api.Version
+	// contentClaim is the claim that set content, mtime and version, and
+	// keptAt its date.
 	contentClaim blob.Ref
+	keptAt       time.Time
+	gone         api.GoneReason
+	goneAt       time.Time
 	// lastClaim is the date of the newest claim on pn. A new claim on pn is
 	// dated after it, so it wins when the index folds claims by date, even
 	// if the clock is now behind (docs/design.md, Edge cases).
 	lastClaim time.Time
+}
+
+// entry is a file node's PathEntry, less its Claims.
+func (n *treeNode) entry() api.PathEntry {
+	return api.PathEntry{
+		File:    api.BlobRef(n.content.String()),
+		ModTime: n.mtime,
+		Version: n.version,
+		KeptAt:  n.keptAt,
+		Gone:    n.gone,
+		GoneAt:  n.goneAt,
+	}
+}
+
+// newestMtime is the newest mtime of the files under a directory node.
+func newestMtime(n *treeNode) time.Time {
+	if n.isFile {
+		return n.mtime
+	}
+	var t time.Time
+	for _, c := range n.children {
+		if m := newestMtime(c); m.After(t) {
+			t = m
+		}
+	}
+	return t
+}
+
+// contentOps are the attribute operations that set a file permanode's
+// content to c's, clearing a version or gone mark that cur (the node's
+// current state, or nil for a new permanode) has and c doesn't replace.
+func contentOps(pn blob.Ref, file blob.Ref, c api.PathClaim, cur *treeNode) []*schema.Builder {
+	ops := []*schema.Builder{
+		schema.NewSetAttributeClaim(pn, contentAttr, file.String()),
+		schema.NewSetAttributeClaim(pn, mtimeAttr, schema.RFC3339FromTime(c.ModTime)),
+	}
+	if len(c.Version) > 0 {
+		ops = append(ops, schema.NewSetAttributeClaim(pn, versionAttr, c.Version.String()))
+	} else if cur != nil && len(cur.version) > 0 {
+		ops = append(ops, schema.NewDelAttributeClaim(pn, versionAttr, ""))
+	}
+	if cur != nil && cur.gone != api.GoneNone {
+		ops = append(ops,
+			schema.NewDelAttributeClaim(pn, goneAttr, ""),
+			schema.NewDelAttributeClaim(pn, goneAtAttr, ""))
+	}
+	return ops
+}
+
+// setContent records in a file node the content claim just signed, at date.
+func (s *Server) setContent(n *treeNode, file blob.Ref, c api.PathClaim, claim blob.Ref, date time.Time) {
+	n.content, n.mtime, n.version = file, c.ModTime, c.Version
+	n.contentClaim, n.keptAt, n.lastClaim = claim, date, date
+	n.gone, n.goneAt = api.GoneNone, time.Time{}
 }
 
 func newDirNode(pn, nameClaim blob.Ref) *treeNode {
@@ -100,10 +164,16 @@ func splitPath(p string) ([]string, error) {
 
 // ClaimPath keeps c.File at c.Path under the root permanode c.Permanode.
 // It writes nothing if the file there already has c.File as content, and
-// rejects a claim whose ModTime is not newer than the file's
-// keepsyncMtime. Each write is one signed multi claim: on the file's
+// rejects a claim that api.Supersedes says is not newer than the file's
+// current content. Each write is one signed multi claim: on the file's
 // permanode for a changed file; or, for a new file, setting its content
 // and naming it and any missing directories, whose permanodes it creates.
+//
+// A path whose existing entry is the other type is retargeted: the name
+// gets a new permanode of the right type, and the old one stays in
+// history. A file becomes a directory whenever a path goes through it. A
+// directory becomes a file only for a claim with a Version, or with a
+// ModTime newer than the newest file under the directory.
 func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResult, error) {
 	if _, ok := blob.Parse(string(c.Permanode)); !ok {
 		return 0, fmt.Errorf("pkserver: bad permanode %q", c.Permanode)
@@ -125,53 +195,31 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 		return 0, err
 	}
 
-	// Find the deepest existing directory on the path. Only ClaimPath,
+	// Follow the existing directories down the path. Only signing code,
 	// under claimMu, changes the tree, so it can be read without treeMu.
 	dir := root
 	i := 0
-	for ; i < len(parts)-1; i++ {
-		next, ok := dir.children[parts[i]]
+	for ; i < len(parts); i++ {
+		child, ok := dir.children[parts[i]]
 		if !ok {
 			break
 		}
-		if next.isFile {
-			return 0, fmt.Errorf("pkserver: %s: %s is a file", c.Path, strings.Join(parts[:i+1], "/"))
+		last := i == len(parts)-1
+		if !last && !child.isFile {
+			dir = child
+			continue
 		}
-		dir = next
-	}
-	base := parts[len(parts)-1]
-	mtime := schema.RFC3339FromTime(c.ModTime)
-
-	if i == len(parts)-1 {
-		if cur, ok := dir.children[base]; ok {
-			if !cur.isFile {
-				return 0, fmt.Errorf("pkserver: %s is a directory", c.Path)
-			}
-			if cur.content == file {
-				return api.ClaimUnchanged, nil
-			}
-			if !c.ModTime.After(cur.mtime) {
-				return api.ClaimRejectedOlder, nil
-			}
-			multi, err := schema.NewMultiClaim(
-				schema.NewSetAttributeClaim(cur.pn, contentAttr, file.String()),
-				schema.NewSetAttributeClaim(cur.pn, mtimeAttr, mtime),
-			)
-			if err != nil {
-				return 0, err
-			}
-			claim, date, err := s.signClaim(ctx, multi.SetMultiClaimPermanode(cur.pn), cur.lastClaim)
-			if err != nil {
-				return 0, err
-			}
-			s.treeMu.Lock()
-			cur.content, cur.mtime, cur.contentClaim, cur.lastClaim = file, c.ModTime, claim, date
-			s.treeMu.Unlock()
-			return api.ClaimWritten, nil
+		if last && child.isFile {
+			return s.updateFile(ctx, child, file, c)
 		}
+		if last && len(c.Version) == 0 && !c.ModTime.After(newestMtime(child)) {
+			return api.ClaimRejectedOlder, nil // directory→file, not newer
+		}
+		break // retarget: file→directory, or directory→file
 	}
 
-	// A new file, and the directories from parts[i] down to it.
+	// A new file, and the directories from parts[i] down to it, each
+	// named in its parent (which renames a retargeted entry).
 	var ops []*schema.Builder
 	type made struct {
 		parent *treeNode
@@ -188,10 +236,8 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 		n := newDirNode(pn, blob.Ref{})
 		if i == len(parts)-1 {
 			n.children = nil
-			n.isFile, n.content, n.mtime = true, file, c.ModTime
-			ops = append(ops,
-				schema.NewSetAttributeClaim(pn, contentAttr, file.String()),
-				schema.NewSetAttributeClaim(pn, mtimeAttr, mtime))
+			n.isFile = true
+			ops = append(ops, contentOps(pn, file, c, nil)...)
 		} else {
 			ops = append(ops,
 				schema.NewSetAttributeClaim(pn, "title", parts[i]),
@@ -215,12 +261,179 @@ func (s *Server) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResul
 	for _, m := range news {
 		m.node.nameClaim, m.node.lastClaim = claim, date
 		if m.node.isFile {
-			m.node.contentClaim = claim
+			s.setContent(m.node, file, c, claim, date)
 		}
 		m.parent.children[m.name] = m.node
 	}
 	s.treeMu.Unlock()
 	return api.ClaimWritten, nil
+}
+
+// updateFile keeps new content on an existing file permanode, in one claim.
+// The caller holds claimMu.
+func (s *Server) updateFile(ctx context.Context, n *treeNode, file blob.Ref, c api.PathClaim) (api.ClaimResult, error) {
+	if n.content == file {
+		return api.ClaimUnchanged, nil
+	}
+	if !api.Supersedes(c, n.entry()) {
+		return api.ClaimRejectedOlder, nil
+	}
+	multi, err := schema.NewMultiClaim(contentOps(n.pn, file, c, n)...)
+	if err != nil {
+		return 0, err
+	}
+	claim, date, err := s.signClaim(ctx, multi.SetMultiClaimPermanode(n.pn), n.lastClaim)
+	if err != nil {
+		return 0, err
+	}
+	s.treeMu.Lock()
+	s.setContent(n, file, c, claim, date)
+	s.treeMu.Unlock()
+	return api.ClaimWritten, nil
+}
+
+// findFile returns the file node at path in root's tree, or nil. The
+// caller holds claimMu or treeMu.
+func findFile(root *treeNode, parts []string) *treeNode {
+	n := root
+	for _, p := range parts {
+		if n.isFile {
+			return nil
+		}
+		c, ok := n.children[p]
+		if !ok {
+			return nil
+		}
+		n = c
+	}
+	if !n.isFile {
+		return nil
+	}
+	return n
+}
+
+// MarkGone records why a kept file left sync, setting keepsyncGone and
+// keepsyncGoneAt on its permanode in one claim. It writes nothing if the
+// path holds no file, holds other content than g.File, or already has the
+// mark.
+func (s *Server) MarkGone(ctx context.Context, g api.GoneClaim) error {
+	if g.Reason == api.GoneNone {
+		return fmt.Errorf("pkserver: gone mark without a reason")
+	}
+	file, ok := blob.Parse(string(g.File))
+	if !ok {
+		return fmt.Errorf("pkserver: bad file ref %q", g.File)
+	}
+	parts, err := splitPath(g.Path)
+	if err != nil {
+		return err
+	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	s.treeMu.Lock()
+	root, err := s.treeLocked(ctx, g.Permanode)
+	s.treeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	n := findFile(root, parts)
+	if n == nil || n.content != file || n.gone == g.Reason {
+		return nil
+	}
+	multi, err := schema.NewMultiClaim(
+		schema.NewSetAttributeClaim(n.pn, goneAttr, string(g.Reason)),
+		schema.NewSetAttributeClaim(n.pn, goneAtAttr, schema.RFC3339FromTime(time.Now().UTC())),
+	)
+	if err != nil {
+		return err
+	}
+	_, date, err := s.signClaim(ctx, multi.SetMultiClaimPermanode(n.pn), n.lastClaim)
+	if err != nil {
+		return err
+	}
+	s.treeMu.Lock()
+	n.gone, n.goneAt, n.lastClaim = g.Reason, date, date
+	s.treeMu.Unlock()
+	return nil
+}
+
+// History returns every content value the file permanode now at path has
+// had, oldest first, folded from its claims. Each entry's Claims are those
+// recovering that version by name needs: the current chain of directories
+// and naming claims, and that version's content claim. Gone marks are not
+// part of history.
+func (s *Server) History(ctx context.Context, permanode api.BlobRef, path string) ([]api.PathEntry, error) {
+	parts, err := splitPath(path)
+	if err != nil {
+		return nil, err
+	}
+	s.treeMu.Lock()
+	root, err := s.treeLocked(ctx, permanode)
+	var chain []blob.Ref
+	var n *treeNode
+	if err == nil {
+		chain = []blob.Ref{root.pn}
+		n = root
+		for _, p := range parts {
+			c, ok := n.children[p]
+			if !ok || n.isFile {
+				n = nil
+				break
+			}
+			n = c
+			chain = append(chain, n.pn, n.nameClaim)
+		}
+	}
+	s.treeMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if n == nil || !n.isFile {
+		return nil, fmt.Errorf("pkserver: %s: no kept file at %s", permanode, path)
+	}
+
+	claims, err := s.claimsOf(ctx, n.pn)
+	if err != nil {
+		return nil, err
+	}
+	// Group the attribute operations by claim; a content claim sets
+	// camliContent, and its keepsyncMtime and keepsyncVersion are in the
+	// same claim.
+	type version struct {
+		claim blob.Ref
+		date  time.Time
+		attrs map[string]string
+	}
+	var order []*version
+	byClaim := map[blob.Ref]*version{}
+	for _, c := range claims {
+		v := byClaim[c.BlobRef]
+		if v == nil {
+			v = &version{claim: c.BlobRef, date: time.Time(c.Date), attrs: map[string]string{}}
+			byClaim[c.BlobRef] = v
+			order = append(order, v)
+		}
+		if c.Type == "set-attribute" || c.Type == "add-attribute" {
+			v.attrs[c.Attr] = c.Value
+		}
+	}
+	var out []api.PathEntry
+	for _, v := range order {
+		content, ok := v.attrs[contentAttr]
+		if !ok {
+			continue
+		}
+		e := api.PathEntry{File: api.BlobRef(content), KeptAt: v.date}
+		if tm, err := time.Parse(time.RFC3339Nano, v.attrs[mtimeAttr]); err == nil {
+			e.ModTime = tm
+		}
+		if ver, err := api.ParseVersion(v.attrs[versionAttr]); err == nil {
+			e.Version = ver
+		}
+		e.Claims = uniqueRefs(append(chain[:len(chain):len(chain)], v.claim))
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // Paths returns the current entries of a kept folder's tree, by slash
@@ -266,7 +479,9 @@ func flatten(root *treeNode) map[string]api.PathEntry {
 				continue
 			}
 			refs := append(chain[:len(chain):len(chain)], c.pn, c.nameClaim, c.contentClaim)
-			out[p] = api.PathEntry{File: api.BlobRef(c.content.String()), ModTime: c.mtime, Claims: uniqueRefs(refs)}
+			e := c.entry()
+			e.Claims = uniqueRefs(refs)
+			out[p] = e
 		}
 	}
 	walk(root, "", []blob.Ref{root.pn})
@@ -304,6 +519,7 @@ func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (*treeNo
 type attrVal struct {
 	v     string
 	claim blob.Ref
+	date  time.Time
 }
 
 // attrsOf folds the server's claims on pn, read from the index, into its
@@ -311,31 +527,22 @@ type attrVal struct {
 // all of them if at is zero. It also returns the date of the server's newest
 // claim on pn, whatever at is, and reports false if pn has no claims at all.
 func (s *Server) attrsOf(ctx context.Context, pn blob.Ref, at time.Time) (map[string]attrVal, time.Time, bool, error) {
-	res, err := s.bs.GetClaims(ctx, &search.ClaimsRequest{Permanode: pn})
+	claims, err := s.claimsOf(ctx, pn)
 	if err != nil {
-		return nil, time.Time{}, false, fmt.Errorf("pkserver: claims of %s: %w", pn, err)
+		return nil, time.Time{}, false, err
 	}
-	claims := res.Claims
-	sort.SliceStable(claims, func(i, j int) bool {
-		return time.Time(claims[i].Date).Before(time.Time(claims[j].Date))
-	})
 	var latest time.Time
-	for _, c := range claims {
-		if c.Signer == s.pubRef && time.Time(c.Date).After(latest) {
-			latest = time.Time(c.Date)
-		}
+	if len(claims) > 0 {
+		latest = time.Time(claims[len(claims)-1].Date) // oldest first
 	}
 	attrs := map[string]attrVal{}
 	for _, c := range claims {
-		if c.Signer != s.pubRef {
-			continue // only the server's own claims count
-		}
 		if !at.IsZero() && time.Time(c.Date).After(at) {
 			break // sorted by date, so every later claim is after at too
 		}
 		switch c.Type {
 		case "set-attribute", "add-attribute":
-			attrs[c.Attr] = attrVal{c.Value, c.BlobRef}
+			attrs[c.Attr] = attrVal{c.Value, c.BlobRef, time.Time(c.Date)}
 		case "del-attribute":
 			if cur, ok := attrs[c.Attr]; c.Value == "" || (ok && cur.v == c.Value) {
 				delete(attrs, c.Attr)
@@ -343,6 +550,25 @@ func (s *Server) attrsOf(ctx context.Context, pn blob.Ref, at time.Time) (map[st
 		}
 	}
 	return attrs, latest, len(claims) > 0, nil
+}
+
+// claimsOf returns the server's own claims on pn, from the index, oldest
+// first.
+func (s *Server) claimsOf(ctx context.Context, pn blob.Ref) ([]*search.ClaimsItem, error) {
+	res, err := s.bs.GetClaims(ctx, &search.ClaimsRequest{Permanode: pn})
+	if err != nil {
+		return nil, fmt.Errorf("pkserver: claims of %s: %w", pn, err)
+	}
+	var claims []*search.ClaimsItem
+	for _, c := range res.Claims {
+		if c.Signer == s.pubRef { // only the server's own claims count
+			claims = append(claims, c)
+		}
+	}
+	sort.SliceStable(claims, func(i, j int) bool {
+		return time.Time(claims[i].Date).Before(time.Time(claims[j].Date))
+	})
+	return claims, nil
 }
 
 // loadTree walks a kept tree from its root permanode, as of at (or now, if
@@ -395,11 +621,19 @@ func (s *Server) loadChildren(ctx context.Context, dir *treeNode, attrs map[stri
 				continue
 			}
 			n.children = nil
-			n.isFile, n.content, n.contentClaim = true, ref, content.claim
+			n.isFile, n.content, n.contentClaim, n.keptAt = true, ref, content.claim, content.date
 			if mt, ok := cattrs[mtimeAttr]; ok {
 				if tm, err := time.Parse(time.RFC3339Nano, mt.v); err == nil {
 					n.mtime = tm
 				}
+			}
+			if v, ok := cattrs[versionAttr]; ok {
+				if ver, err := api.ParseVersion(v.v); err == nil {
+					n.version = ver
+				}
+			}
+			if g, ok := cattrs[goneAttr]; ok {
+				n.gone, n.goneAt = api.GoneReason(g.v), g.date
 			}
 		} else if err := s.loadChildren(ctx, n, cattrs, at, visited); err != nil {
 			return err

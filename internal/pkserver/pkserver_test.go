@@ -571,8 +571,8 @@ func TestKeptTreeLayout(t *testing.T) {
 	if got := e.srv.signedCount() - n; got != 0 {
 		t.Errorf("unchanged and rejected claims signed %d blobs", got)
 	}
-	if _, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: root, Path: "2026/trip", File: v1, ModTime: t0}); err == nil {
-		t.Error("claiming a directory's path as a file succeeded")
+	if r, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: root, Path: "2026/trip", File: v1, ModTime: t0}); err != nil || r != api.ClaimRejectedOlder {
+		t.Errorf("a directory's path as a file, not newer than its files: %v %v, want rejected", r, err)
 	}
 	if _, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: root, Path: "2026/../x", File: v1, ModTime: t0}); err == nil {
 		t.Error("a path with .. was accepted")
@@ -640,5 +640,285 @@ func TestKeptTreeLayout(t *testing.T) {
 	}
 	if len(old) != 2 || old["2026/trip/a.jpg"].File != v2 {
 		t.Errorf("PathsAt now: %v", old)
+	}
+}
+
+// keptEnv is a server with one kept folder, and helpers to claim paths.
+type keptEnv struct {
+	*env
+	t     *testing.T
+	root  api.BlobRef
+	files string
+	n     int
+}
+
+func newKeptEnv(t *testing.T) *keptEnv {
+	e := newEnv(t)
+	root, err := e.srv.NewPermanode(context.Background(), "folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &keptEnv{env: e, t: t, root: root, files: t.TempDir()}
+}
+
+// put uploads a new file with unique content.
+func (k *keptEnv) put() api.BlobRef {
+	k.t.Helper()
+	k.n++
+	ref, err := k.putter.PutFile(context.Background(), writeFile(k.t, k.files, fmt.Sprint(k.n), fmt.Sprint("content ", k.n), time.Now()))
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	return ref
+}
+
+func (k *keptEnv) claim(path string, file api.BlobRef, mt time.Time, v api.Version) api.ClaimResult {
+	k.t.Helper()
+	r, err := k.srv.ClaimPath(context.Background(), api.PathClaim{Permanode: k.root, Path: path, File: file, ModTime: mt, Version: v})
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	return r
+}
+
+func (k *keptEnv) paths() map[string]api.PathEntry {
+	k.t.Helper()
+	p, err := k.srv.Paths(context.Background(), k.root)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	return p
+}
+
+func (k *keptEnv) pathsAt(at time.Time) map[string]api.PathEntry {
+	k.t.Helper()
+	p, err := k.srv.PathsAt(context.Background(), k.root, at)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	return p
+}
+
+// tick returns a time strictly between the claims before and after it.
+func tick() time.Time {
+	time.Sleep(2 * time.Millisecond)
+	t := time.Now()
+	time.Sleep(2 * time.Millisecond)
+	return t
+}
+
+// checkCache checks that the cached tree matches a fresh walk of the index.
+func (k *keptEnv) checkCache() {
+	k.t.Helper()
+	walked, err := k.srv.loadTree(context.Background(), k.root, time.Time{})
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	want, got := flatten(walked), k.paths()
+	if len(want) != len(got) {
+		k.t.Fatalf("cache %v, index %v", got, want)
+	}
+	for p, w := range want {
+		g := got[p]
+		if g.File != w.File || !g.ModTime.Equal(w.ModTime) || g.Version.String() != w.Version.String() ||
+			!g.KeptAt.Equal(w.KeptAt) || g.Gone != w.Gone || !g.GoneAt.Equal(w.GoneAt) ||
+			fmt.Sprint(g.Claims) != fmt.Sprint(w.Claims) {
+			k.t.Errorf("%s: cache %+v, index %+v", p, g, w)
+		}
+	}
+}
+
+func ver(counters ...any) api.Version {
+	var v api.Version
+	for i := 0; i < len(counters); i += 2 {
+		v = append(v, api.VersionCounter{ID: counters[i].(string), Value: uint64(counters[i+1].(int))})
+	}
+	return v
+}
+
+func TestVersionsDecide(t *testing.T) {
+	k := newKeptEnv(t)
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	if r := k.claim("f", k.put(), t0, ver("A", 1)); r != api.ClaimWritten {
+		t.Fatalf("first: %v", r)
+	}
+	// A newer version with an older mtime is written.
+	newer := k.put()
+	if r := k.claim("f", newer, t0.Add(-time.Hour), ver("A", 2)); r != api.ClaimWritten {
+		t.Fatalf("newer version, older mtime: %v", r)
+	}
+	// An older version with a newer mtime is rejected.
+	if r := k.claim("f", k.put(), t0.Add(5*time.Hour), ver("A", 1)); r != api.ClaimRejectedOlder {
+		t.Fatalf("older version, newer mtime: %v", r)
+	}
+	// Concurrent versions fall back to mtime.
+	if r := k.claim("f", k.put(), t0.Add(-2*time.Hour), ver("B", 1)); r != api.ClaimRejectedOlder {
+		t.Fatalf("concurrent, older mtime: %v", r)
+	}
+	conc := k.put()
+	if r := k.claim("f", conc, t0, ver("B", 1)); r != api.ClaimWritten {
+		t.Fatalf("concurrent, newer mtime: %v", r)
+	}
+	e := k.paths()["f"]
+	if e.File != conc || e.Version.String() != "B:1" || e.KeptAt.IsZero() {
+		t.Fatalf("after concurrent: %+v", e)
+	}
+	// Missing versions behave as before: mtime decides, and the stale
+	// version is dropped.
+	if r := k.claim("f", k.put(), t0, nil); r != api.ClaimRejectedOlder {
+		t.Fatalf("no version, same mtime: %v", r)
+	}
+	plain := k.put()
+	if r := k.claim("f", plain, t0.Add(time.Minute), nil); r != api.ClaimWritten {
+		t.Fatalf("no version, newer mtime: %v", r)
+	}
+	if e := k.paths()["f"]; e.File != plain || len(e.Version) != 0 {
+		t.Fatalf("after unversioned: %+v", e)
+	}
+	if r := k.claim("f", plain, t0, ver("Z", 9)); r != api.ClaimUnchanged {
+		t.Fatalf("same file: %v", r)
+	}
+	k.checkCache()
+}
+
+func TestFileDirectoryRetarget(t *testing.T) {
+	k := newKeptEnv(t)
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+
+	// file→directory is always accepted.
+	x := k.put()
+	k.claim("x", x, t0, nil)
+	beforeDir := tick()
+	xy := k.put()
+	if r := k.claim("x/y", xy, t0.Add(-time.Hour), nil); r != api.ClaimWritten {
+		t.Fatalf("file→directory: %v", r)
+	}
+	p := k.paths()
+	if _, ok := p["x"]; ok || p["x/y"].File != xy {
+		t.Fatalf("after file→directory: %v", p)
+	}
+	if old := k.pathsAt(beforeDir); old["x"].File != x || len(old) != 1 {
+		t.Fatalf("before file→directory, PathsAt: %v", old)
+	}
+
+	// directory→file needs a newer mtime than the directory's newest
+	// file, or a version.
+	k.claim("d/e", k.put(), t0, nil)
+	k.claim("d/f/g", k.put(), t0.Add(time.Hour), nil)
+	if r := k.claim("d", k.put(), t0.Add(time.Hour), nil); r != api.ClaimRejectedOlder {
+		t.Fatalf("directory→file, not newer: %v", r)
+	}
+	beforeFile := tick()
+	d := k.put()
+	if r := k.claim("d", d, t0.Add(2*time.Hour), nil); r != api.ClaimWritten {
+		t.Fatalf("directory→file, newer: %v", r)
+	}
+	p = k.paths()
+	if p["d"].File != d || len(p) != 2 {
+		t.Fatalf("after directory→file: %v", p)
+	}
+	if old := k.pathsAt(beforeFile); old["d/e"].File == "" || old["d/f/g"].File == "" {
+		t.Fatalf("before directory→file, PathsAt: %v", old)
+	}
+	k.claim("v/w", k.put(), t0.Add(time.Hour), nil)
+	if r := k.claim("v", k.put(), t0, ver("A", 1)); r != api.ClaimWritten {
+		t.Fatalf("directory→file with a version: %v", r)
+	}
+	k.checkCache()
+}
+
+func TestGoneMarks(t *testing.T) {
+	ctx := context.Background()
+	k := newKeptEnv(t)
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	f := k.put()
+	k.claim("a/f", f, t0, nil)
+	mark := func(path string, file api.BlobRef) int {
+		t.Helper()
+		n := k.srv.signedCount()
+		if err := k.srv.MarkGone(ctx, api.GoneClaim{Permanode: k.root, Path: path, Reason: api.GoneExpired, File: file}); err != nil {
+			t.Fatal(err)
+		}
+		return k.srv.signedCount() - n
+	}
+	if n := mark("a/missing", f); n != 0 {
+		t.Errorf("mark on a missing path signed %d", n)
+	}
+	if n := mark("a/f", k.put()); n != 0 {
+		t.Errorf("mark for other content signed %d", n)
+	}
+	beforeMark := tick()
+	if n := mark("a/f", f); n != 1 {
+		t.Errorf("mark signed %d, want 1", n)
+	}
+	if n := mark("a/f", f); n != 0 {
+		t.Errorf("repeat mark signed %d", n)
+	}
+	e := k.paths()["a/f"]
+	if e.Gone != api.GoneExpired || e.GoneAt.IsZero() {
+		t.Fatalf("after mark: %+v", e)
+	}
+	k.checkCache()
+	afterMark := tick()
+
+	// A new version clears the mark, in its one content claim.
+	n := k.srv.signedCount()
+	f2 := k.put()
+	if r := k.claim("a/f", f2, t0.Add(time.Hour), nil); r != api.ClaimWritten {
+		t.Fatal(r)
+	}
+	if got := k.srv.signedCount() - n; got != 1 {
+		t.Errorf("new version signed %d, want 1", got)
+	}
+	if e := k.paths()["a/f"]; e.Gone != api.GoneNone || !e.GoneAt.IsZero() || e.File != f2 {
+		t.Fatalf("after new version: %+v", e)
+	}
+	k.checkCache()
+	if e := k.pathsAt(beforeMark)["a/f"]; e.Gone != api.GoneNone {
+		t.Errorf("PathsAt before the mark: %+v", e)
+	}
+	if e := k.pathsAt(afterMark)["a/f"]; e.Gone != api.GoneExpired || e.File != f {
+		t.Errorf("PathsAt after the mark: %+v", e)
+	}
+}
+
+func TestHistory(t *testing.T) {
+	ctx := context.Background()
+	k := newKeptEnv(t)
+	t0 := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	var files []api.BlobRef
+	for i := range 3 {
+		f := k.put()
+		files = append(files, f)
+		if r := k.claim("h/f", f, t0.Add(time.Duration(i)*time.Hour), ver("A", i+1)); r != api.ClaimWritten {
+			t.Fatal(r)
+		}
+	}
+	k.srv.MarkGone(ctx, api.GoneClaim{Permanode: k.root, Path: "h/f", Reason: api.GoneDeleted, File: files[2]})
+	h, err := k.srv.History(ctx, k.root, "h/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h) != 3 {
+		t.Fatalf("history: %d entries, want 3: %v", len(h), h)
+	}
+	cur := k.paths()["h/f"]
+	for i, e := range h {
+		if e.File != files[i] || !e.ModTime.Equal(t0.Add(time.Duration(i)*time.Hour)) || e.Version.String() != fmt.Sprintf("A:%d", i+1) {
+			t.Errorf("history[%d]: %+v", i, e)
+		}
+		if i > 0 && !e.KeptAt.After(h[i-1].KeptAt) {
+			t.Errorf("history[%d] kept at %v, not after %v", i, e.KeptAt, h[i-1].KeptAt)
+		}
+		// The first version's content claim is also its naming claim.
+		if i > 0 && len(e.Claims) != len(cur.Claims) {
+			t.Errorf("history[%d] claims %v, current %v", i, e.Claims, cur.Claims)
+		}
+	}
+	if !h[2].KeptAt.Equal(cur.KeptAt) || fmt.Sprint(h[2].Claims) != fmt.Sprint(cur.Claims) {
+		t.Errorf("last history entry %+v, current %+v", h[2], cur)
+	}
+	if _, err := k.srv.History(ctx, k.root, "h"); err == nil {
+		t.Error("History of a directory succeeded")
 	}
 }
