@@ -3,6 +3,7 @@ module github.com/progrium/keepsync
 go 1.27.2
 
 require (
+	filippo.io/age v1.2.1
 	github.com/BurntSushi/toml v1.6.0
 	github.com/syncthing/syncthing v1.30.0-rc.1.0.20261020195438-d6d0181f7d46
 	github.com/tailscale/tailcat v0.7.1-0.20261105151022-e00cdde6ff78
