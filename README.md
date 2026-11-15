@@ -20,7 +20,6 @@ Nodes sync directly with each other, so sync keeps working while the server is d
 - **tailcat.** Nothing to install. keepsync embeds tailcat as a library, and `go.mod` pins a version from tailcat's `main` branch, which `go build` fetches. By default traffic is relayed through tailcat's public DERP relays when a direct connection can't be made. Those are rate-limited, so for real sync volumes run your own `derper` and pass `--derp-map` and `--derp-region` to `server init` and `node init`.
 - **An S3-compatible bucket** for the archive, such as Cloudflare R2, AWS S3 or MinIO, with an access key that can read and write it.
 - **ZeroFS v2.3.7** on the server. You don't need to install it: `server init` downloads the pinned release and checks its SHA-256 if it isn't on your `PATH`. Builds exist for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and freebsd/amd64.
-- **FUSE on the server** for the default mount mode: Linux with `/dev/fuse` and `fusermount3`. No root is needed. On macOS or FreeBSD, mount ZeroFS's 9P export yourself and use `--mount external` (see [Mount modes](#mount-modes)).
 
 ### Build
 
@@ -67,7 +66,7 @@ Then start the server and leave it running (under systemd, launchd or similar):
 keepsync server run
 ```
 
-It mounts ZeroFS, starts Perkeep and the registry, and flushes to the bucket every minute. Stopping it with Ctrl-C or SIGTERM drains and flushes everything to the bucket first.
+It starts ZeroFS, starts Perkeep and the registry, and flushes to the bucket every minute. Stopping it with Ctrl-C or SIGTERM drains and flushes everything to the bucket first.
 
 Check on it with:
 
@@ -287,7 +286,7 @@ keepsync recover keepsync-recovery.zip.age
 keepsync server run
 ```
 
-`recover` mounts ZeroFS on the bucket and rebuilds the Perkeep index from it, then installs the key, config and registry. A store-mode server also gets every archived blob copied back to local disk; a cache-mode one reads them from the bucket as needed. `--mode store|cache` recovers into a different mode from the one the kit was made with. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. Nodes reconnect on their own, because the address is the same.
+`recover` starts ZeroFS on the bucket and rebuilds the Perkeep index from it, then installs the key, config and registry. A store-mode server also gets every archived blob copied back to local disk; a cache-mode one reads them from the bucket as needed. `--mode store|cache` recovers into a different mode from the one the kit was made with. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. Nodes reconnect on their own, because the address is the same.
 
 ZeroFS allows only one writer, so **never recover while the old server could still be running against the bucket.**
 
@@ -310,13 +309,16 @@ The drill restores the copy without taking over the server's identity, then chec
 
 ### Mount modes
 
-The server always talks to ZeroFS over 9P. Pick how it mounts with `server init --mount`:
+The server always talks to ZeroFS over 9P. By default it is the 9P client itself and mounts nothing, so it needs no FUSE or root. Pick another way with `server init --mount`:
 
 | Mode | How | Needs |
 | --- | --- | --- |
-| `fuse` (default) | ZeroFS's own 9P client through FUSE, as your user | Linux, `/dev/fuse`, `fusermount3` |
+| `9p` (default) | keepsync talks 9P to ZeroFS directly; no mount | Nothing extra |
+| `fuse` | ZeroFS's own 9P client through FUSE, as your user | Linux, `/dev/fuse`, `fusermount3` |
 | `v9fs` | The Linux kernel's 9P client | Linux, root, the `9p` and `9pnet_fd` modules |
 | `external` | Nothing. You mount the 9P export at `--mount-dir` yourself | Any platform |
+
+With `9p`, blobs are stored one file per blob, which writes far faster than the `diskpacked` packs the mount modes use for a new bucket (see [Testing](docs/design.md#testing)). A bucket keeps the layout it was created with, and one written as `diskpacked` needs a mount mode. Servers set up before `9p` keep `fuse`.
 
 ### Command reference
 
