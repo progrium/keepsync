@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -22,6 +23,10 @@ type Client struct {
 
 	// RetryMin and RetryMax bound Watch's reconnect backoff.
 	RetryMin, RetryMax time.Duration
+	// IdleTimeout is how long a connection may go without hearing from
+	// the server (which pings every PingInterval) before the client drops
+	// it. Default DefaultIdleTimeout. Set it before the first call.
+	IdleTimeout time.Duration
 
 	mu      sync.Mutex
 	conn    *rpcConn
@@ -35,11 +40,12 @@ var _ api.RegistryClient = (*Client)(nil)
 // NewClient returns a client for the registry at server.
 func NewClient(t api.Transport, server api.Addr) *Client {
 	return &Client{
-		t:        t,
-		server:   server,
-		RetryMin: 100 * time.Millisecond,
-		RetryMax: 30 * time.Second,
-		closing:  make(chan struct{}),
+		t:           t,
+		server:      server,
+		RetryMin:    100 * time.Millisecond,
+		RetryMax:    30 * time.Second,
+		IdleTimeout: DefaultIdleTimeout,
+		closing:     make(chan struct{}),
 	}
 }
 
@@ -66,6 +72,8 @@ type rpcConn struct {
 	mu      sync.Mutex
 	pending map[uint64]chan response
 	err     error
+	last    atomic.Int64 // unix nanos of the last message received
+	done    chan struct{}
 }
 
 func (r *rpcConn) close(err error) {
@@ -76,6 +84,11 @@ func (r *rpcConn) close(err error) {
 	for id, ch := range r.pending {
 		close(ch)
 		delete(r.pending, id)
+	}
+	select {
+	case <-r.done:
+	default:
+		close(r.done)
 	}
 	r.mu.Unlock()
 	r.conn.Close()
@@ -88,6 +101,17 @@ func (r *rpcConn) readLoop() {
 		if err := dec.Decode(&res); err != nil {
 			r.close(fmt.Errorf("registry: connection lost: %w", err))
 			return
+		}
+		r.last.Store(time.Now().UnixNano())
+		if res.Ping {
+			r.wmu.Lock()
+			err := r.enc.Encode(request{Method: mPong})
+			r.wmu.Unlock()
+			if err != nil {
+				r.close(fmt.Errorf("registry: connection lost: %w", err))
+				return
+			}
+			continue
 		}
 		r.mu.Lock()
 		ch := r.pending[res.ID]
@@ -120,8 +144,10 @@ func (c *Client) getConn(ctx context.Context) (rc *rpcConn, reused bool, err err
 	if err != nil {
 		return nil, false, fmt.Errorf("registry: dial %s: %w", c.server, err)
 	}
-	rc = &rpcConn{conn: nc, enc: json.NewEncoder(nc), pending: map[uint64]chan response{}}
+	rc = &rpcConn{conn: nc, enc: json.NewEncoder(nc), pending: map[uint64]chan response{}, done: make(chan struct{})}
+	rc.last.Store(time.Now().UnixNano())
 	go rc.readLoop()
+	go watchdog(nc, c.IdleTimeout, &rc.last, rc.done)
 	c.conn = rc
 	return rc, false, nil
 }
@@ -241,6 +267,12 @@ func (c *Client) JoinFolder(ctx context.Context, name string) (api.Folder, error
 	return f, err
 }
 
+// LeaveFolder stops this node being a member of a folder. Its keeper slot,
+// if it had one, goes to another connected member. Files are untouched.
+func (c *Client) LeaveFolder(ctx context.Context, name string) error {
+	return c.call(ctx, mLeave, folderParams{Name: name}, nil)
+}
+
 func (c *Client) Keep(ctx context.Context, folder string, p api.KeepPolicy) (api.BlobRef, error) {
 	var ref api.BlobRef
 	err := c.call(ctx, mKeep, keepParams{Folder: folder, Policy: p}, &ref)
@@ -324,7 +356,7 @@ func (c *Client) watchLoop(ctx context.Context, conn net.Conn, out chan<- api.Me
 			if conn != nil {
 				cur := conn
 				stop := context.AfterFunc(ctx, func() { cur.Close() })
-				err := readWatch(cur, latest)
+				err := readWatch(cur, latest, c.IdleTimeout)
 				stop()
 				cur.Close()
 				if err == nil {
@@ -372,8 +404,14 @@ func (c *Client) watchLoop(ctx context.Context, conn net.Conn, out chan<- api.Me
 
 // readWatch forwards memberships from conn into latest, replacing any
 // unread one. It returns nil if at least one membership arrived.
-func readWatch(conn net.Conn, latest chan api.Membership) error {
+func readWatch(conn net.Conn, latest chan api.Membership, idle time.Duration) error {
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	done := make(chan struct{})
+	defer close(done)
+	go watchdog(conn, idle, &last, done)
 	dec := json.NewDecoder(conn)
+	enc := json.NewEncoder(conn)
 	var got bool
 	for {
 		var res response
@@ -382,6 +420,13 @@ func readWatch(conn net.Conn, latest chan api.Membership) error {
 				return nil
 			}
 			return err
+		}
+		last.Store(time.Now().UnixNano())
+		if res.Ping {
+			if err := enc.Encode(request{Method: mPong}); err != nil {
+				return err
+			}
+			continue
 		}
 		if res.Error != nil {
 			return res.Error.err()
@@ -397,10 +442,4 @@ func readWatch(conn net.Conn, latest chan api.Membership) error {
 		}
 		latest <- m
 	}
-}
-
-// LeaveFolder is a placeholder until the registry implements leave
-// (workstream B).
-func (c *Client) LeaveFolder(ctx context.Context, name string) error {
-	return errors.New("registry: LeaveFolder not implemented yet")
 }

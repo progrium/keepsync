@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -18,6 +20,14 @@ import (
 // membership and then one more response with the same ID per change, until
 // either side closes the connection.
 //
+// Heartbeat: the server sends {"id":0,"ping":true} on every connection
+// every PingInterval, and the client answers each with a "pong" request
+// (ID 0, no response). Each side closes a connection on which it has
+// received nothing for its idle timeout, because a tailcat connection to a
+// peer that vanished is never reset: reads just block. A node therefore
+// stops counting as online within IdleTimeout of going silent, and a client
+// stops waiting on a dead server within its own IdleTimeout.
+//
 // The caller's identity is the authenticated tailcat key of the connection,
 // never a field in a request.
 
@@ -30,6 +40,8 @@ const (
 	mClaimPath  = "claimPath"
 	mPaths      = "paths"
 	mDurable    = "durable"
+	mLeave      = "leaveFolder"
+	mPong       = "pong"
 )
 
 type request struct {
@@ -42,6 +54,7 @@ type response struct {
 	ID     uint64          `json:"id"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *wireError      `json:"error,omitempty"`
+	Ping   bool            `json:"ping,omitempty"`
 }
 
 type wireError struct {
@@ -133,4 +146,24 @@ func ValidatePolicy(p api.KeepPolicy) error {
 // Default timings for the server.
 const (
 	DefaultKeeperTimeout = 2 * time.Minute
+	DefaultPingInterval  = 10 * time.Second
+	DefaultIdleTimeout   = 30 * time.Second
 )
+
+// watchdog closes conn once nothing has been received on it (as recorded in
+// last, unix nanoseconds) for idle. It returns when done is closed.
+func watchdog(conn net.Conn, idle time.Duration, last *atomic.Int64, done <-chan struct{}) {
+	tick := time.NewTicker(idle / 4)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-tick.C:
+			if time.Since(time.Unix(0, last.Load())) > idle {
+				conn.Close()
+				return
+			}
+		}
+	}
+}

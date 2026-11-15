@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -29,6 +30,12 @@ type Config struct {
 	// server hands its folders to another connected member. Default
 	// DefaultKeeperTimeout.
 	KeeperTimeout time.Duration
+	// PingInterval is how often the server pings each connection.
+	// Default DefaultPingInterval.
+	PingInterval time.Duration
+	// IdleTimeout is how long a connection may stay silent (no request
+	// and no pong) before the server drops it. Default DefaultIdleTimeout.
+	IdleTimeout time.Duration
 }
 
 // Server is the registry: the membership list, folders, keep policies and
@@ -62,6 +69,12 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	if cfg.KeeperTimeout <= 0 {
 		cfg.KeeperTimeout = DefaultKeeperTimeout
+	}
+	if cfg.PingInterval <= 0 {
+		cfg.PingInterval = DefaultPingInterval
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
 	}
 	st, err := cfg.Store.Load(ctx)
 	if err != nil {
@@ -374,12 +387,27 @@ func (s *Server) HandleConn(conn net.Conn, peer api.NodeKey) {
 		wg.Wait()
 	}()
 
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	done := make(chan struct{})
+	defer close(done)
+	go watchdog(conn, s.cfg.IdleTimeout, &last, done)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.pinger(ctx, conn, send)
+	}()
+
 	dec := json.NewDecoder(conn)
 	for {
 		var req request
 		if err := dec.Decode(&req); err != nil {
 			conn.Close()
 			return
+		}
+		last.Store(time.Now().UnixNano())
+		if req.Method == mPong {
+			continue
 		}
 		if req.Method == mWatch {
 			wg.Add(1)
@@ -404,6 +432,24 @@ func (s *Server) HandleConn(conn net.Conn, peer api.NodeKey) {
 				conn.Close()
 			}
 		}()
+	}
+}
+
+// pinger sends a ping every PingInterval. A ping stuck on a dead peer
+// blocks only until the watchdog closes the connection.
+func (s *Server) pinger(ctx context.Context, conn net.Conn, send func(response) error) {
+	tick := time.NewTicker(s.cfg.PingInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if send(response{Ping: true}) != nil {
+				conn.Close()
+				return
+			}
+		}
 	}
 }
 
@@ -482,6 +528,12 @@ func (s *Server) call(ctx context.Context, peer api.NodeKey, req request) (any, 
 			return nil, err
 		}
 		return s.joinFolder(ctx, peer, p.Name)
+	case mLeave:
+		var p folderParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return nil, s.leaveFolder(ctx, peer, p.Name)
 	case mKeep:
 		var p keepParams
 		if err := decode(&p); err != nil {
@@ -578,6 +630,29 @@ func (s *Server) joinFolder(ctx context.Context, peer api.NodeKey, name string) 
 		return nil
 	})
 	return out, err
+}
+
+// leaveFolder removes peer from a folder's members, receive-only list and
+// keepers, and refills the keepers from the remaining connected members.
+// Leaving a folder the node is not in is a no-op. The folder itself, and
+// its kept archive, stay even if its last member leaves.
+func (s *Server) leaveFolder(ctx context.Context, peer api.NodeKey, name string) error {
+	return s.mutate(ctx, func(st *State) error {
+		f := st.folder(name)
+		if f == nil {
+			return fmt.Errorf("%w: folder %q", ErrNotFound, name)
+		}
+		if !contains(f.Members, peer) {
+			return errNoChange
+		}
+		f.Members = without(f.Members, peer)
+		f.ReceiveOnly = without(f.ReceiveOnly, peer)
+		if f.Keep != nil {
+			f.Keep.Keepers = without(f.Keep.Keepers, peer)
+		}
+		s.assignKeepersLocked(st)
+		return nil
+	})
 }
 
 // keep marks a folder kept. The first call creates the folder's permanode

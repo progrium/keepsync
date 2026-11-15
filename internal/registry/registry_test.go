@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -10,7 +11,11 @@ import (
 	"github.com/progrium/keepsync/internal/api/fake"
 )
 
-const keeperTimeout = 50 * time.Millisecond
+const (
+	keeperTimeout = 50 * time.Millisecond
+	pingInterval  = 10 * time.Millisecond
+	idleTimeout   = 100 * time.Millisecond
+)
 
 type env struct {
 	t     *testing.T
@@ -34,6 +39,7 @@ func (e *env) start() {
 	srv, err := NewServer(context.Background(), Config{
 		Store: e.store, Signer: e.pk, Durability: e.pk,
 		Transport: e.srvT, KeeperTimeout: keeperTimeout,
+		PingInterval: pingInterval, IdleTimeout: idleTimeout,
 	})
 	if err != nil {
 		e.t.Fatal(err)
@@ -59,6 +65,7 @@ func (e *env) node(name string) *node {
 	}
 	n := &node{t: tr, c: NewClient(tr, e.srvT.Addr())}
 	n.c.RetryMin, n.c.RetryMax = 5*time.Millisecond, 20*time.Millisecond
+	n.c.IdleTimeout = idleTimeout
 	e.t.Cleanup(func() { n.c.Close() })
 	if _, err := n.c.Register(context.Background(), api.Node{Name: name, Addr: tr.Addr(), Device: api.DeviceID("dev-" + name)}); err != nil {
 		e.t.Fatal(err)
@@ -498,5 +505,166 @@ func TestFolderID(t *testing.T) {
 	id, err := newFolderID()
 	if err != nil || len(id) != 11 || id[5] != '-' {
 		t.Fatalf("id = %q, %v", id, err)
+	}
+}
+
+func TestLeaveFolder(t *testing.T) {
+	e := newEnv(t)
+	ctx := ctx(t)
+	a, b, c := e.node("a"), e.node("b"), e.node("c")
+	a.c.AddFolder(ctx, "docs")
+	b.c.JoinFolder(ctx, "docs")
+	c.c.JoinFolder(ctx, "docs")
+	e.srv.SetReceiveOnly(ctx, "docs", c.t.Key(), true)
+	if _, err := a.c.Keep(ctx, "docs", policy()); err != nil {
+		t.Fatal(err)
+	}
+	if k := keepersOf(e, "docs"); !equalKeys(k, []api.NodeKey{a.t.Key(), b.t.Key()}) {
+		t.Fatalf("keepers = %v", k)
+	}
+	ch, err := a.c.Watch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-ch
+
+	// b leaves: c, though receive-only, is the only one left to keep.
+	if err := b.c.LeaveFolder(ctx, "docs"); err != nil {
+		t.Fatal(err)
+	}
+	want := []api.NodeKey{a.t.Key(), c.t.Key()}
+	for m := range ch {
+		f := folderOf(m, "docs")
+		if !contains(f.Members, b.t.Key()) {
+			if !equalKeys(f.Keep.Keepers, want) {
+				t.Fatalf("keepers after b left = %v, want %v", f.Keep.Keepers, want)
+			}
+			break
+		}
+	}
+
+	// Leaving again, or as a non-member, is a no-op.
+	saves := e.store.Saves
+	if err := b.c.LeaveFolder(ctx, "docs"); err != nil {
+		t.Fatal(err)
+	}
+	if e.store.Saves != saves {
+		t.Fatal("no-op leave saved state")
+	}
+	if err := b.c.LeaveFolder(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("leave missing folder: %v", err)
+	}
+
+	// c leaves: it drops out of receive-only too, and a keeps alone.
+	if err := c.c.LeaveFolder(ctx, "docs"); err != nil {
+		t.Fatal(err)
+	}
+	f := folderOf(e.srv.Membership(), "docs")
+	if !equalKeys(f.Members, []api.NodeKey{a.t.Key()}) || len(f.ReceiveOnly) != 0 || !equalKeys(f.Keep.Keepers, []api.NodeKey{a.t.Key()}) {
+		t.Fatalf("after c left: %+v keep=%+v", f, f.Keep)
+	}
+
+	// The last member leaving keeps the folder and its archive.
+	a.c.LeaveFolder(ctx, "docs")
+	f = folderOf(e.srv.Membership(), "docs")
+	if f == nil || f.Keep == nil || len(f.Members) != 0 || len(f.Keep.Keepers) != 0 {
+		t.Fatalf("after everyone left: %+v", f)
+	}
+	// Rejoining brings keeping back.
+	b.c.JoinFolder(ctx, "docs")
+	if k := keepersOf(e, "docs"); !equalKeys(k, []api.NodeKey{b.t.Key()}) {
+		t.Fatalf("keepers after rejoin = %v", k)
+	}
+}
+
+func online(e *env, key api.NodeKey) bool {
+	for _, n := range e.srv.Nodes() {
+		if n.Key == key {
+			return n.Online
+		}
+	}
+	return false
+}
+
+// A node whose connection is open but which has stopped reading and writing
+// (a half-dead tailcat connection) goes offline after the idle timeout, and
+// its keeping moves on after the keeper timeout.
+func TestHeartbeatDropsSilentNode(t *testing.T) {
+	e := newEnv(t)
+	ctx := ctx(t)
+	a, b, c := e.node("a"), e.node("b"), e.node("c")
+	a.c.AddFolder(ctx, "docs")
+	b.c.JoinFolder(ctx, "docs")
+	c.c.JoinFolder(ctx, "docs")
+	a.c.Keep(ctx, "docs", policy())
+
+	// A healthy idle client stays online across many ping intervals.
+	time.Sleep(3 * idleTimeout)
+	if !online(e, b.t.Key()) {
+		t.Fatal("idle but healthy client was dropped")
+	}
+
+	// a's real client goes away and a raw connection that asks to watch,
+	// then never reads or writes again, takes its place.
+	a.c.Close()
+	raw, err := a.t.Dial(ctx, e.srvT.Addr(), api.PortRegistry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Write([]byte(`{"id":1,"method":"watch"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the silent connection to be counted", func() bool { return online(e, a.t.Key()) })
+	silent := time.Now()
+
+	eventually(t, "a to go offline", func() bool { return !online(e, a.t.Key()) })
+	if since := time.Since(silent); since < idleTimeout/2 {
+		t.Fatalf("dropped after %s, well before the %s idle timeout", since, idleTimeout)
+	}
+	eventually(t, "c to take a's keeping", func() bool {
+		return equalKeys(keepersOf(e, "docs"), []api.NodeKey{b.t.Key(), c.t.Key()})
+	})
+}
+
+// A client gives up on a server that stops answering instead of hanging:
+// calls fail and Watch redials.
+func TestClientDropsSilentServer(t *testing.T) {
+	ctx := ctx(t)
+	nw := fake.NewNetwork()
+	mute, node := nw.Transport("mute"), nw.Transport("node")
+	mute.Allow(node.Key())
+	dials := make(chan struct{}, 100)
+	mute.Handle(api.PortRegistry, func(conn net.Conn, peer api.NodeKey) {
+		dials <- struct{}{}
+		buf := make([]byte, 4096)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+	c := NewClient(node, mute.Addr())
+	c.IdleTimeout, c.RetryMin, c.RetryMax = idleTimeout, 5*time.Millisecond, 20*time.Millisecond
+	defer c.Close()
+
+	start := time.Now()
+	if _, err := c.Durable(ctx, nil); err == nil {
+		t.Fatal("call to a mute server succeeded")
+	}
+	if since := time.Since(start); since > 20*idleTimeout {
+		t.Fatalf("call took %s to fail", since)
+	}
+
+	if _, err := c.Watch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// One dial for the call, then the watch's first dial and two redials.
+	for i := 0; i < 4; i++ {
+		select {
+		case <-dials:
+		case <-ctx.Done():
+			t.Fatalf("watch did not redial a mute server (%d dials)", i)
+		}
 	}
 }
