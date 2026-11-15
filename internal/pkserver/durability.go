@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/blobserver"
 	"perkeep.org/pkg/schema"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -185,6 +186,14 @@ func (s *Server) Flush(ctx context.Context) error {
 	defer s.flushMu.Unlock()
 	w := &s.wm
 
+	restarts := s.zfsRestarts()
+	if restarts != s.restarts {
+		if err := s.afterRestart(ctx); err != nil {
+			return err
+		}
+		s.restarts = restarts
+	}
+
 	w.mu.Lock()
 	pending := make([]blob.Ref, 0, len(w.pending))
 	for br := range w.pending {
@@ -219,6 +228,11 @@ func (s *Server) Flush(ctx context.Context) error {
 
 	if err := s.cfg.ZeroFS.Flush(ctx); err != nil {
 		return fmt.Errorf("pkserver: flush: %w", err)
+	}
+	if s.zfsRestarts() != restarts {
+		// What was stat'd above may have died with the old process, and
+		// this flush only covers the new one. The next Flush recovers.
+		return errors.New("pkserver: flush: zerofs restarted during the flush")
 	}
 
 	w.mu.Lock()
@@ -284,4 +298,94 @@ func (s *Server) syncBacklog(ctx context.Context, prefix string) (int, error) {
 		return 0, fmt.Errorf("pkserver: status has no sync %s", prefix)
 	}
 	return sync.BlobsToCopy, nil
+}
+
+// restartCounter is implemented by zerofs.Supervisor.
+type restartCounter interface{ Restarts() uint64 }
+
+// zfsRestarts returns how many times ZeroFS died and was started again, or
+// 0 if the ZeroFS in use doesn't say.
+func (s *Server) zfsRestarts() uint64 {
+	if rc, ok := s.cfg.ZeroFS.(restartCounter); ok {
+		return rc.Restarts()
+	}
+	return 0
+}
+
+// afterRestart repairs the bookkeeping after ZeroFS died and came back.
+// Writes it had not flushed are gone, so blobs seen in the replica since
+// the last successful flush are forgotten (Durable reports them again only
+// once a later flush covers them), and in store mode every blob in the
+// local primary that the replica lost is copied to it again: perkeepd's
+// replication already counted those as copied and won't retry them. In
+// cache mode the primary is the store on ZeroFS, so lost blobs are gone
+// from the server; nodes still hold them, since they were never reported
+// durable.
+func (s *Server) afterRestart(ctx context.Context) error {
+	w := &s.wm
+	w.mu.Lock()
+	forgot := 0
+	for br, g := range w.seen {
+		if g >= w.done {
+			delete(w.seen, br)
+			w.pending[br] = true
+			forgot++
+		}
+	}
+	w.mu.Unlock()
+	if s.cacheMode() {
+		s.logf("pkserver: zerofs restarted; %d blobs it had not flushed are no longer counted as stored", forgot)
+		return nil
+	}
+	copied, err := s.repairReplica(ctx)
+	if err != nil {
+		return fmt.Errorf("pkserver: repairing the replica after a zerofs restart: %w", err)
+	}
+	s.logf("pkserver: zerofs restarted; copied %d blobs it lost back to the replica", copied)
+	return nil
+}
+
+// repairReplica copies every blob in the primary storage that the replica
+// doesn't have, and returns how many it copied.
+func (s *Server) repairReplica(ctx context.Context) (int, error) {
+	copied := 0
+	var batch []blob.Ref
+	check := func() error {
+		have := map[blob.Ref]bool{}
+		err := s.replica.StatBlobs(ctx, batch, func(sb blob.SizedRef) error {
+			have[sb.Ref] = true
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, br := range batch {
+			if have[br] {
+				continue
+			}
+			rc, _, err := s.bs.Fetch(ctx, br)
+			if err != nil {
+				return err
+			}
+			_, err = s.replica.ReceiveBlob(ctx, br, rc)
+			rc.Close()
+			if err != nil {
+				return err
+			}
+			copied++
+		}
+		batch = batch[:0]
+		return nil
+	}
+	err := blobserver.EnumerateAll(ctx, s.bs, func(sb blob.SizedRef) error {
+		batch = append(batch, sb.Ref)
+		if len(batch) == 1000 {
+			return check()
+		}
+		return nil
+	})
+	if err == nil && len(batch) > 0 {
+		err = check()
+	}
+	return copied, err
 }

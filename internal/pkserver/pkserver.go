@@ -169,8 +169,9 @@ type Server struct {
 	treeMu sync.Mutex
 	trees  map[api.BlobRef]*treeNode // cached kept trees, by root permanode
 
-	flushMu sync.Mutex // serializes Flush
-	wm      watermark
+	flushMu  sync.Mutex // serializes Flush
+	restarts uint64     // ZeroFS restarts already handled; guarded by flushMu
+	wm       watermark
 }
 
 var (
@@ -189,6 +190,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		s.logf = log.Printf
 	}
 	s.wm.init()
+	s.restarts = s.zfsRestarts()
 	hermetic(cfg.Dir)
 	id, err := readIdentity(cfg.Dir)
 	if err != nil {
