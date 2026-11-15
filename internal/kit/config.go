@@ -22,6 +22,7 @@ func SourceFor(cfg *config.Server, addr api.Addr) (Source, error) {
 		Storage:        storageOf(cfg),
 		ZeroFSPassword: cfg.ZeroFS.Password,
 		Mode:           cfg.StorageMode(),
+		Mount:          cfg.ZeroFS.Mount,
 		PerkeepDir:     cfg.PerkeepDir(),
 		TailcatKey:     cfg.KeyPath(),
 		ConfigFile:     filepath.Join(cfg.Dir, config.ServerFile),

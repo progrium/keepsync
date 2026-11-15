@@ -27,15 +27,15 @@ import (
 	"github.com/progrium/keepsync/internal/zerofs"
 )
 
-// replicaPrefix is the handler of the diskpacked storage on ZeroFS, as
-// pkserver configures perkeepd.
+// replicaPrefix is the handler of the blob store on ZeroFS, as pkserver
+// configures perkeepd.
 const replicaPrefix = "/sto-zerofs/"
 
-// BucketRegistryPath is where, relative to the ZeroFS mount, the server
-// mirrors its registry state on every change, so recovery gets the
-// current members and folders from the bucket rather than the kit's copy
-// from when it was made. It sits beside the diskpacked packs, which
-// diskpacked ignores.
+// BucketRegistryPath is where, relative to the root of the ZeroFS
+// filesystem, the server mirrors its registry state on every change, so
+// recovery gets the current members and folders from the bucket rather
+// than the kit's copy from when it was made. It sits beside the blob store
+// (diskpacked packs or blobs/), which ignores it.
 const BucketRegistryPath = ".keepsync/registry.json"
 
 // NewZeroFS makes the ZeroFS supervisor a restore runs. The default is
@@ -43,6 +43,16 @@ const BucketRegistryPath = ".keepsync/registry.json"
 type NewZeroFS func(zerofs.Config) (api.ZeroFS, error)
 
 func defaultNewZeroFS(c zerofs.Config) (api.ZeroFS, error) { return zerofs.New(c) }
+
+// readZeroFSFile reads name, relative to the root of the ZeroFS filesystem,
+// through ReadFile when z has it (zerofs.Supervisor, which also works over
+// 9P) or else from its mount.
+func readZeroFSFile(z api.ZeroFS, name string) ([]byte, error) {
+	if r, ok := z.(interface{ ReadFile(string) ([]byte, error) }); ok {
+		return r.ReadFile(name)
+	}
+	return os.ReadFile(filepath.Join(z.Dir(), filepath.FromSlash(name)))
+}
 
 // Credentials override the kit's bucket credentials, which are ideally a
 // read-only token. Empty fields keep the kit's.
@@ -155,7 +165,7 @@ func restore(ctx context.Context, k *Kit, p restoreParams) (_ *restoreEnv, err e
 		}
 	}()
 	e.stats.ZeroFSStart = time.Since(start)
-	if b, err := os.ReadFile(filepath.Join(z.Dir(), BucketRegistryPath)); err == nil {
+	if b, err := readZeroFSFile(z, BucketRegistryPath); err == nil {
 		e.registry = b
 	}
 

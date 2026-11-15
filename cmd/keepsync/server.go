@@ -25,7 +25,7 @@ func (e *env) serverInit(args []string) error {
 	fs.BoolVar(&o.Storage.AllowHTTP, "allow-http", false, "allow a plain-http endpoint")
 	fs.StringVar(&o.ZeroFS, "zerofs", "", "zerofs binary (default: PATH, then the server dir, else download the pinned release)")
 	fs.StringVar(&o.PasswordFile, "zerofs-password-file", "", "adopt an existing bucket's ZeroFS password")
-	fs.StringVar(&o.Mount, "mount", "", "ZeroFS mount mode: fuse (default), v9fs or external")
+	fs.StringVar(&o.Mount, "mount", "", "how to reach ZeroFS: fuse (default), 9p (no mount), v9fs or external")
 	fs.StringVar(&o.MountDir, "mount-dir", "", "ZeroFS mount point (default <server dir>/zerofs/mnt)")
 	fs.BoolVar(&o.NoDownload, "no-download", false, "fail instead of downloading zerofs")
 	fs.StringVar(&o.Mode, "mode", config.ModeStore, "where blobs live: store (local disk, replicated to the bucket) or cache (the bucket only, with a local ZeroFS cache)")

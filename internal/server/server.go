@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -284,9 +283,10 @@ func (s *Server) start(ctx context.Context) error {
 	}
 
 	store := &FileStore{
-		Path:   cfg.RegistryPath(),
-		Mirror: filepath.Join(zfs.Dir(), kit.BucketRegistryPath),
-		Logf:   s.logf,
+		Path:        cfg.RegistryPath(),
+		Mirror:      "zerofs:" + kit.BucketRegistryPath,
+		WriteMirror: func(b []byte) error { return zfs.WriteFile(kit.BucketRegistryPath, b) },
+		Logf:        s.logf,
 	}
 	if err := store.SyncMirror(); err != nil {
 		s.logf("registry: mirror to %s: %v", store.Mirror, err)

@@ -44,7 +44,8 @@ type RecoverOptions struct {
 	// Credentials are write credentials for the bucket. A recovered
 	// server writes to it, so a kit holding a read-only token needs them.
 	Credentials Credentials
-	Mount       zerofs.MountMode
+	// Mount is how to reach ZeroFS; empty means the kit's server's.
+	Mount zerofs.MountMode
 	// Mode is the mode to recover into: config.ModeStore copies every
 	// blob from the bucket to local disk, config.ModeCache only rebuilds
 	// the index. Empty means the kit's mode.
@@ -63,6 +64,14 @@ func modeOr(mode string, k *Kit) string {
 		return k.Manifest.Mode
 	}
 	return config.ModeStore
+}
+
+// mountOr is mount, or else the kit's server's mount mode.
+func mountOr(mount zerofs.MountMode, k *Kit) zerofs.MountMode {
+	if mount != "" {
+		return mount
+	}
+	return zerofs.MountMode(k.Manifest.Mount)
 }
 
 // Recover rebuilds the server from the bucket: it mounts ZeroFS on the
@@ -92,7 +101,7 @@ func Recover(ctx context.Context, k *Kit, o RecoverOptions) (*RestoreStats, erro
 		perkeepDir: l.PerkeepDir,
 		zfsDataDir: l.ZeroFSDataDir,
 		mountDir:   l.ZeroFSMountDir,
-		mount:      o.Mount,
+		mount:      mountOr(o.Mount, k),
 		mode:       o.mode(k),
 		newZeroFS:  o.NewZeroFS,
 		logf:       o.Logf,
@@ -157,7 +166,8 @@ type DrillOptions struct {
 	// Samples is how many kept paths the index check searches for.
 	// Default 5.
 	Samples int
-	Mount   zerofs.MountMode
+	// Mount is how to reach ZeroFS; empty means the kit's server's.
+	Mount zerofs.MountMode
 	// Mode is the mode to restore in; empty means the kit's.
 	Mode      string
 	NewZeroFS NewZeroFS
@@ -251,7 +261,7 @@ func Drill(ctx context.Context, k *Kit, o DrillOptions) (*DrillReport, error) {
 		storage:    st,
 		perkeepDir: filepath.Join(work, "perkeep"),
 		zfsDataDir: filepath.Join(work, "zerofs"),
-		mount:      o.Mount,
+		mount:      mountOr(o.Mount, k),
 		mode:       modeOr(o.Mode, k),
 		newZeroFS:  o.NewZeroFS,
 		logf:       o.Logf,

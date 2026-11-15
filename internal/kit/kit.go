@@ -71,6 +71,9 @@ type Source struct {
 	// Mode is the server's config.ModeStore or config.ModeCache ("" is
 	// store).
 	Mode string
+	// Mount is the server's ZeroFS mount mode (zerofs.MountMode; "" is
+	// the default).
+	Mount string
 	// PerkeepDir is the server's pkserver.Config.Dir. Only the identity's
 	// secret ring is taken from it.
 	PerkeepDir string
@@ -106,9 +109,13 @@ type Manifest struct {
 	HasConfig      bool           `json:"hasConfig"`
 	HasRegistry    bool           `json:"hasRegistry"`
 	// Mode is the server's mode; "" (kits from before modes) is store.
-	// The bucket holds the same diskpacked layout in both modes, so a
-	// server can be recovered into either.
+	// The bucket holds the same layout in both modes, so a server can be
+	// recovered into either.
 	Mode string `json:"mode,omitempty"`
+	// Mount is the server's ZeroFS mount mode, which recovery uses unless
+	// told otherwise; "" is zerofs's default. The bucket's blob layout
+	// (diskpacked or files, see pkserver) is found from the bucket itself.
+	Mount string `json:"mount,omitempty"`
 }
 
 // Build writes an encrypted kit to path and returns the passphrase, which is
@@ -211,6 +218,7 @@ func collect(src Source) (Manifest, []kitFile, error) {
 		HasConfig:      src.ConfigFile != "",
 		HasRegistry:    src.RegistryFile != "",
 		Mode:           src.Mode,
+		Mount:          src.Mount,
 	}
 	pkconf, _ := json.MarshalIndent(pkserver.HighLevelConfig(
 		"$PERKEEP_DIR", "$ZEROFS_MOUNT", keyID, "(generated at start)"), "", "  ")

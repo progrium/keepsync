@@ -93,7 +93,8 @@ type ZeroFS struct {
 	Binary string `toml:"binary,omitempty,omitzero"`
 	// Password is the ZeroFS encryption password.
 	Password string `toml:"password"`
-	// Mount is the mount mode: "fuse" (default), "v9fs" or "external".
+	// Mount is how keepsync reaches ZeroFS: "fuse" (default), "9p" (a
+	// 9P client in keepsync, no mount), "v9fs" or "external".
 	Mount string `toml:"mount,omitempty,omitzero"`
 	// MountDir overrides the mount point (default <server dir>/zerofs/mnt).
 	MountDir      string  `toml:"mount_dir,omitempty,omitzero"`
@@ -227,6 +228,11 @@ func (c *Server) Validate() error {
 	}
 	if gb := c.ZeroFS.CacheSizeGB; gb != 0 && gb < MinCacheSizeGB {
 		return fmt.Errorf("config: zerofs cache_size_gb %g is below the minimum of %d GB (ZeroFS 2.3.7 never uses less)", gb, MinCacheSizeGB)
+	}
+	switch c.ZeroFS.Mount {
+	case "", "fuse", "9p", "v9fs", "external":
+	default:
+		return fmt.Errorf("config: zerofs mount %q: want fuse, 9p, v9fs or external", c.ZeroFS.Mount)
 	}
 	if c.ZeroFS.MemoryCacheGB < 0 || c.ZeroFS.CacheSizeGB < 0 {
 		return errors.New("config: zerofs cache sizes must not be negative")

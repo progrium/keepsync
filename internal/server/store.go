@@ -26,8 +26,19 @@ type FileStore struct {
 	// reported to Logf but does not fail the save: the registry keeps
 	// working while ZeroFS has trouble, and the next save retries.
 	Mirror string
-	Logf   func(format string, args ...any)
-	mu     sync.Mutex
+	// WriteMirror, if set, writes the mirror in place of a plain file
+	// write to Mirror (which then only names it in logs). The server uses
+	// it to write through zerofs.Supervisor.WriteFile, which works over 9P.
+	WriteMirror func(b []byte) error
+	Logf        func(format string, args ...any)
+	mu          sync.Mutex
+}
+
+func (s *FileStore) writeMirror(b []byte) error {
+	if s.WriteMirror != nil {
+		return s.WriteMirror(b)
+	}
+	return writeFileAtomic(s.Mirror, b)
 }
 
 // SyncMirror copies the saved state, if any, to Mirror. The server calls
@@ -46,7 +57,7 @@ func (s *FileStore) SyncMirror() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.Mirror, b)
+	return s.writeMirror(b)
 }
 
 var _ registry.Store = (*FileStore)(nil)
@@ -77,7 +88,7 @@ func (s *FileStore) Save(ctx context.Context, st registry.State) error {
 		return err
 	}
 	if s.Mirror != "" {
-		if err := writeFileAtomic(s.Mirror, b); err != nil && s.Logf != nil {
+		if err := s.writeMirror(b); err != nil && s.Logf != nil {
 			s.Logf("registry: mirror to %s: %v", s.Mirror, err)
 		}
 	}
