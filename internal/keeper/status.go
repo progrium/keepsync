@@ -17,6 +17,9 @@ const (
 	StateKept                   // this version is in the kept tree
 	StateExpirable              // kept, durable and past expire; the next pass removes it
 	StateLagging                // local copy is older than the archive's
+	// StateChanged: the kept version's mtime (or version) but different
+	// content, so it is not the kept version and is never expired.
+	StateChanged
 )
 
 func (s State) String() string {
@@ -31,6 +34,8 @@ func (s State) String() string {
 		return "expirable"
 	case StateLagging:
 		return "lagging"
+	case StateChanged:
+		return "changed"
 	}
 	return fmt.Sprintf("State(%d)", int(s))
 }
@@ -67,8 +72,11 @@ func (s Status) Counts() map[State]int {
 	return c
 }
 
-// Status reports every file's keep state without uploading or changing
-// anything. It works on any member node, keeper or not.
+// Status reports every file's keep state without changing anything. Like
+// expiry, it re-puts each file it would report expirable to check its
+// content is the kept version; the server already has a kept version's
+// blobs, so normally nothing is sent. It works on any member node, keeper
+// or not.
 func (k *Keeper) Status(ctx context.Context) (Status, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -84,13 +92,17 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 	now := k.cfg.Clock.Now()
 	var expIdx []int
 	var expRefs [][]api.BlobRef
+	byPath := make(map[string]file, len(files))
 	for _, f := range files {
+		byPath[f.rel] = f
 		fs := FileStatus{Path: f.rel, ModTime: f.mtime, Size: f.size}
 		e := tree[f.rel]
 		fst := k.fileState(f.rel)
 		switch {
 		case fst.notCurrent():
 			fs.State = StateLagging
+		case keptVersion(f, fst, tree) && k.cachedOtherRef(f, e.File):
+			fs.State = StateChanged
 		case keptVersion(f, fst, tree):
 			fs.State = StateKept
 			if k.policy.Expire > 0 {
@@ -130,12 +142,32 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 			break
 		}
 		for i, d := range ok {
-			if d {
-				st.Files[expIdx[start+i]].State = StateExpirable
+			if !d {
+				continue
+			}
+			// Report expirable only what expiry would remove: it checks
+			// the content first, and so does this.
+			fs := &st.Files[expIdx[start+i]]
+			f := byPath[fs.Path]
+			ref, err := k.verifyRef(ctx, f)
+			switch {
+			case err != nil:
+				// Leave it as kept; the next pass reports the error.
+			case ref != tree[f.rel].File:
+				fs.State, fs.ExpireAt = StateChanged, time.Time{}
+			default:
+				fs.State = StateExpirable
 			}
 		}
 	}
 	return st, nil
+}
+
+// cachedOtherRef reports whether this keeper put f's exact mtime and size
+// and got a different ref than want: same version marker, other content.
+func (k *Keeper) cachedOtherRef(f file, want api.BlobRef) bool {
+	c, ok := k.putCache[f.rel]
+	return ok && c.mtime.Equal(f.mtime) && c.size == f.size && c.ref != want
 }
 
 func (k *Keeper) cachedRejected(f file) bool {

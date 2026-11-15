@@ -583,3 +583,26 @@ func TestExpiryRehashesSameSizeSameMtimeEdit(t *testing.T) {
 		t.Fatalf("an unkept edit was expired: %+v", rep)
 	}
 }
+
+// TestStatusChecksContentBeforeExpirable checks that keep status reports a
+// same-size, same-mtime edit as changed rather than kept or expirable, as
+// expiry would not remove it.
+func TestStatusChecksContentBeforeExpirable(t *testing.T) {
+	e := newEnv(t)
+	e.write("a.txt", "kept one", 31*day)
+	e.write("b.txt", "kept two", 31*day)
+	e.pass()
+	e.write("a.txt", "edited 1", 31*day) // same size, same mtime
+	e.pk.MarkDurable()
+	st, err := e.k.Status(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]State{}
+	for _, f := range st.Files {
+		got[f.Path] = f.State
+	}
+	if got["a.txt"] != StateChanged || got["b.txt"] != StateExpirable {
+		t.Fatalf("states: a.txt %s, b.txt %s", got["a.txt"], got["b.txt"])
+	}
+}
