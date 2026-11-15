@@ -83,6 +83,12 @@ func fakeMain(events string, args []string) int {
 	switch args[0] {
 	case "run":
 		fakeEvent(events, "run")
+		if f := os.Getenv("FAKE_FAIL_START_FILE"); f != "" {
+			if _, err := os.Stat(f); err == nil {
+				fmt.Fprintln(os.Stderr, "fake zerofs: failing on purpose")
+				return 1
+			}
+		}
 		if os.Getenv("FAKE_FAIL_START") != "" {
 			fmt.Fprintln(os.Stderr, "fake zerofs: failing on purpose")
 			return 1

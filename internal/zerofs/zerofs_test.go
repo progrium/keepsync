@@ -296,10 +296,8 @@ func TestSupervisorLifecycle(t *testing.T) {
 	if err := s.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-s.Done():
-	default:
-		t.Fatal("Done not closed after Stop")
+	if h := s.Health(); h.State != HealthStopped {
+		t.Fatalf("health after Stop = %+v", h)
 	}
 	// Stop flushes before signalling.
 	if got := strings.Join(readEvents(t, events), " "); got != "run flush flush term" {
@@ -324,31 +322,97 @@ func TestSupervisorLifecycle(t *testing.T) {
 	}
 }
 
-func TestSupervisorZerofsDies(t *testing.T) {
-	ctx := context.Background()
-	s, events := fakeSupervisor(t)
-	if err := s.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
+func killFake(t *testing.T, s *Supervisor) {
+	t.Helper()
 	c, err := dialUnix(s.rpcSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.Write([]byte("die\n"))
 	c.Close()
+}
+
+func waitHealth(t *testing.T, s *Supervisor, state string) Health {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		h := s.Health()
+		if h.State == state {
+			return h
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("health %+v, want %s", h, state)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSupervisorZerofsDies: a zerofs that exits is restarted and
+// remounted, and the supervisor carries on.
+func TestSupervisorZerofsDies(t *testing.T) {
+	ctx := context.Background()
+	s, events := fakeSupervisor(t)
+	s.cfg.CheckInterval = 50 * time.Millisecond
+	m := s.mount.(*dirMount)
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	killFake(t, s)
+	deadline := time.Now().Add(10 * time.Second)
+	for m.mounts < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("not remounted: mounts=%d health=%+v", m.mounts, s.Health())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitHealth(t, s, HealthUp)
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush after reconnect: %v", err)
+	}
+	if err := s.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-s.Done():
-	case <-time.After(10 * time.Second):
-		t.Fatal("Done not closed after zerofs died")
+		t.Fatal("Done closed though zerofs came back")
+	default:
 	}
-	if err := s.Flush(ctx); err == nil || !strings.Contains(err.Error(), "exited") {
-		t.Fatalf("Flush after death = %v", err)
+	if got := strings.Join(readEvents(t, events), " "); got != "run died run flush flush term" {
+		t.Fatalf("events = %q", got)
+	}
+}
+
+// TestSupervisorGivesUp: a zerofs that won't come back within the window
+// leaves the supervisor down, with Flush and Stop failing and Done closed.
+func TestSupervisorGivesUp(t *testing.T) {
+	ctx := context.Background()
+	flag := filepath.Join(t.TempDir(), "fail")
+	s, _ := fakeSupervisor(t, "FAKE_FAIL_START_FILE="+flag)
+	s.cfg.CheckInterval = 50 * time.Millisecond
+	s.cfg.ReconnectWindow = 1500 * time.Millisecond
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(flag, nil, 0o600)
+	killFake(t, s)
+	h := waitHealth(t, s, HealthReconnecting)
+	if err := s.Flush(ctx); err == nil || !strings.Contains(err.Error(), "reconnecting") {
+		t.Fatalf("Flush while reconnecting = %v (health %+v)", err, h)
+	}
+	select {
+	case <-s.Done():
+	case <-time.After(15 * time.Second):
+		t.Fatalf("Done not closed; health %+v", s.Health())
+	}
+	h = s.Health()
+	if h.State != HealthDown || h.Attempts < 1 || !strings.Contains(h.Error(), "restart `keepsync server run`") {
+		t.Fatalf("health = %+v (%s)", h, h.Error())
+	}
+	if err := s.Flush(ctx); err == nil || !strings.Contains(err.Error(), "gave up") {
+		t.Fatalf("Flush when down = %v", err)
 	}
 	if err := s.Stop(ctx); err == nil {
-		t.Fatal("Stop after death: want an error, data may not be flushed")
-	}
-	if got := readEvents(t, events); got[len(got)-1] != "died" {
-		t.Fatalf("events = %v", got)
+		t.Fatal("Stop when down: want an error, data may not be flushed")
 	}
 }
 

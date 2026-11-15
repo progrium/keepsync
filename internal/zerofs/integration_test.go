@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
+	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
 	"perkeep.org/pkg/blobserver/files"
 	"perkeep.org/pkg/blobserver/storagetest"
@@ -183,6 +185,105 @@ func TestRealZeroFSNineP(t *testing.T) {
 	if _, err := fs.Stat("no/such/deep/path"); !os.IsNotExist(err) {
 		t.Errorf("stat of a missing deep path: %v", err)
 	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRealZeroFSReconnect kills the real zerofs under a 9p supervisor,
+// twice, and checks that the supervisor restarts it and redials the same
+// client, which then reads back what was flushed and takes new writes.
+// Same variables as TestRealZeroFS.
+func TestRealZeroFSReconnect(t *testing.T) {
+	bin := os.Getenv("KEEPSYNC_ZEROFS_BIN")
+	endpoint := os.Getenv("KEEPSYNC_TEST_S3_ENDPOINT")
+	bucket := os.Getenv("KEEPSYNC_TEST_S3_BUCKET")
+	if bin == "" || endpoint == "" || bucket == "" {
+		t.Skip("set KEEPSYNC_ZEROFS_BIN and KEEPSYNC_TEST_S3_* to run against real zerofs")
+	}
+	pw, _ := GeneratePassword()
+	dir, err := os.MkdirTemp("", "zfsrc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	s, err := New(Config{
+		Binary:  bin,
+		DataDir: filepath.Join(dir, "data"),
+		Storage: Storage{
+			URL:             "s3://" + bucket + "/zerofs-reconnect-" + time.Now().Format("20060102-150405"),
+			Endpoint:        endpoint,
+			Region:          "us-east-1",
+			AccessKeyID:     os.Getenv("KEEPSYNC_TEST_S3_KEY"),
+			SecretAccessKey: os.Getenv("KEEPSYNC_TEST_S3_SECRET"),
+			AllowHTTP:       true,
+		},
+		Password:      pw,
+		Mount:         MountNineP,
+		CheckInterval: 200 * time.Millisecond,
+		StartTimeout:  time.Minute,
+		Output:        testWriter{t},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Stop(context.Background()) })
+	fs := s.FS()
+	sto := files.NewStorage(fs, "/blobs")
+	fs.MkdirAll("blobs", 0o700)
+
+	var refs []blob.Ref
+	put := func(i int) {
+		t.Helper()
+		b := []byte(fmt.Sprintf("blob %d %s", i, time.Now()))
+		br := blob.RefFromBytes(b)
+		if _, err := blobserver.Receive(ctx, sto, br, bytes.NewReader(b)); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		refs = append(refs, br)
+	}
+	for round := range 2 {
+		for i := range 20 {
+			put(round*100 + i)
+		}
+		if err := s.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		pid := s.proc.Process.Pid
+		s.mu.Unlock()
+		t0 := time.Now()
+		syscall.Kill(pid, syscall.SIGKILL)
+		deadline := time.Now().Add(2 * time.Minute)
+		for {
+			s.mu.Lock()
+			newPid := 0
+			if s.proc != nil {
+				newPid = s.proc.Process.Pid
+			}
+			s.mu.Unlock()
+			if newPid != pid && s.Health().State == HealthUp {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: not back after kill: %+v", round, s.Health())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Logf("round %d: zerofs back %v after SIGKILL", round, time.Since(t0).Round(time.Millisecond))
+		for _, br := range refs {
+			rc, _, err := sto.Fetch(ctx, br)
+			if err != nil {
+				t.Fatalf("round %d: fetch %s after reconnect: %v", round, br, err)
+			}
+			rc.Close()
+		}
+	}
+	put(999)
 	if err := s.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}

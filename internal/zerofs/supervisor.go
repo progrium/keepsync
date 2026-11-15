@@ -43,6 +43,14 @@ type Config struct {
 	// StartTimeout bounds how long Start waits for zerofs and the mount to
 	// come up. Default 2m (a first start against a remote bucket can be slow).
 	StartTimeout time.Duration
+	// ReconnectWindow is how long the supervisor keeps trying to bring
+	// zerofs back after it exits or stops answering, before it gives up
+	// (Health reports HealthDown, and the server has to be restarted).
+	// Default DefaultReconnectWindow.
+	ReconnectWindow time.Duration
+	// CheckInterval is how often the supervisor checks that zerofs is
+	// alive and reachable. Default 2s.
+	CheckInterval time.Duration
 	// StopTimeout bounds how long Stop waits for zerofs to exit after
 	// SIGTERM before killing it, if ctx has no earlier deadline. Default 2m.
 	StopTimeout time.Duration
@@ -68,6 +76,56 @@ const (
 	DefaultMemoryCacheGB = 0.25
 )
 
+// DefaultReconnectWindow is Config.ReconnectWindow's default.
+const DefaultReconnectWindow = 5 * time.Minute
+
+// Health states (Health.State).
+const (
+	// HealthUp: zerofs is running and reachable.
+	HealthUp = "up"
+	// HealthReconnecting: zerofs exited or stopped answering, and the
+	// supervisor is restarting it and reconnecting, within the window.
+	HealthReconnecting = "reconnecting"
+	// HealthDown: the window passed without zerofs coming back. The
+	// supervisor has stopped trying; restart the server.
+	HealthDown = "down"
+	// HealthStopped: not started, or stopped.
+	HealthStopped = "stopped"
+)
+
+// Health is the supervisor's view of zerofs.
+type Health struct {
+	State string    `json:"state"`
+	Since time.Time `json:"since,omitzero"` // when State began
+	// Attempts is how many restarts have failed since the outage began.
+	Attempts int    `json:"attempts,omitempty"`
+	Err      string `json:"err,omitempty"` // the latest failure
+	// Window is the reconnect window, for messages.
+	Window time.Duration `json:"window,omitempty"`
+	// Restarts counts the times the supervisor killed or found dead the
+	// zerofs process and started it again. Writes zerofs had not flushed
+	// when it died are lost (see Supervisor.Restarts).
+	Restarts uint64 `json:"restarts,omitempty"`
+}
+
+// Error describes an outage, or returns "" when State is HealthUp.
+func (h Health) Error() string {
+	switch h.State {
+	case HealthReconnecting:
+		msg := fmt.Sprintf("zerofs unreachable since %s, reconnecting", h.Since.Format("15:04:05"))
+		if h.Attempts > 0 {
+			msg += fmt.Sprintf(" (%d failed attempts so far)", h.Attempts)
+		}
+		return msg + ": " + h.Err
+	case HealthDown:
+		return fmt.Sprintf("zerofs unreachable since %s; gave up reconnecting after %v; restart `keepsync server run`: %s",
+			h.Since.Format("2006-01-02 15:04:05"), h.Window, h.Err)
+	case HealthStopped:
+		return "zerofs: not running"
+	}
+	return ""
+}
+
 // Supervisor runs ZeroFS as a child process and mounts it over 9P. It
 // implements api.ZeroFS.
 type Supervisor struct {
@@ -78,13 +136,23 @@ type Supervisor struct {
 	ninePSocket string
 	rpcSocket   string
 
-	mu      sync.Mutex
-	running atomic.Bool // mounted and usable; read without mu by wait
-	proc    *exec.Cmd
-	done    chan struct{} // closed when the zerofs process exits
-	exitErr error
-	mount   mounter
-	logFile *os.File
+	mu       sync.Mutex
+	running  atomic.Bool   // mounted and usable; read without mu by wait
+	restarts atomic.Uint64 // process restarts after a death or a kill
+	proc     *exec.Cmd
+	done     chan struct{} // closed when the zerofs process exits
+	exitErr  error
+	mount    mounter
+	logFile  *os.File
+	out      io.Writer // zerofs's output, kept for restarts
+	env      []string  // zerofs's environment, kept for restarts
+
+	stopping bool          // Stop has begun; guarded by mu
+	stop     chan struct{} // closed by Stop, ends watch
+	gaveUp   chan struct{} // closed when the reconnect window passes
+
+	hmu    sync.Mutex
+	health Health
 }
 
 var _ api.ZeroFS = (*Supervisor)(nil)
@@ -128,6 +196,12 @@ func New(cfg Config) (*Supervisor, error) {
 	}
 	if cfg.StopTimeout == 0 {
 		cfg.StopTimeout = 2 * time.Minute
+	}
+	if cfg.ReconnectWindow <= 0 {
+		cfg.ReconnectWindow = DefaultReconnectWindow
+	}
+	if cfg.CheckInterval <= 0 {
+		cfg.CheckInterval = 2 * time.Second
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -216,16 +290,44 @@ func (s *Supervisor) WriteFile(name string, data []byte) error {
 // ConfigPath is the generated zerofs.toml.
 func (s *Supervisor) ConfigPath() string { return s.configPath }
 
-// Done is closed when the zerofs process exits, expectedly or not.
+// Done is closed when the supervisor gives up on zerofs: the reconnect
+// window passed without it coming back (see Health). It is not closed by
+// a zerofs exit the supervisor recovers from, nor by Stop.
 func (s *Supervisor) Done() <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.done == nil {
-		c := make(chan struct{})
-		close(c)
-		return c
+	if s.gaveUp == nil {
+		s.gaveUp = make(chan struct{})
 	}
-	return s.done
+	return s.gaveUp
+}
+
+// Health reports whether zerofs is up, being reconnected, or given up on.
+func (s *Supervisor) Health() Health {
+	s.hmu.Lock()
+	defer s.hmu.Unlock()
+	h := s.health
+	if h.State == "" {
+		h.State = HealthStopped
+	}
+	h.Window = s.cfg.ReconnectWindow
+	h.Restarts = s.restarts.Load()
+	return h
+}
+
+// Restarts counts the times zerofs died, or was killed for not answering,
+// and was started again. Everything written since its last successful
+// Flush may be gone from Dir after one, so a caller that remembers what
+// it wrote compares this before and after a Flush: if it changed, the
+// Flush covers only what the new process holds. A reconnect to a process
+// that kept running (a dropped 9P connection) loses nothing and does not
+// count.
+func (s *Supervisor) Restarts() uint64 { return s.restarts.Load() }
+
+func (s *Supervisor) setHealth(h Health) {
+	s.hmu.Lock()
+	s.health = h
+	s.hmu.Unlock()
 }
 
 // Start writes the config, starts zerofs, waits for its 9P and RPC sockets,
@@ -257,34 +359,49 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 	})), 0o600); err != nil {
 		return err
 	}
+	s.out = s.cfg.Output
+	if s.out == nil {
+		f, err := os.OpenFile(filepath.Join(s.cfg.DataDir, "zerofs.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return err
+		}
+		s.logFile = f
+		s.out = f
+	}
+	s.env = s.environ()
+
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.StartTimeout)
+	defer cancel()
+	if err := s.launchLocked(ctx); err != nil {
+		s.closeLog()
+		return err
+	}
+	s.stopping = false
+	s.stop = make(chan struct{})
+	if s.gaveUp == nil {
+		s.gaveUp = make(chan struct{})
+	}
+	s.setHealth(Health{State: HealthUp, Since: time.Now()})
+	go s.watch(s.stop)
+	return nil
+}
+
+// launchLocked starts the zerofs process, waits for its sockets and mounts
+// (or connects). On failure the process is killed.
+func (s *Supervisor) launchLocked(ctx context.Context) (err error) {
 	// Stale sockets from a crash would make the readiness check pass early.
 	for _, p := range []string{s.ninePSocket, s.rpcSocket} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-
-	out := s.cfg.Output
-	if out == nil {
-		f, err := os.OpenFile(filepath.Join(s.cfg.DataDir, "zerofs.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			return err
-		}
-		s.logFile = f
-		out = f
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.StartTimeout)
-	defer cancel()
-
 	cmd := exec.Command(s.cfg.Binary, "run", "--config", s.configPath)
-	cmd.Env = s.env()
-	cmd.Stdout = out
-	cmd.Stderr = out
+	cmd.Env = s.env
+	cmd.Stdout = s.out
+	cmd.Stderr = s.out
 	cmd.Dir = s.cfg.DataDir
 	setProcAttr(cmd)
 	if err := cmd.Start(); err != nil {
-		s.closeLog()
 		return fmt.Errorf("zerofs: start: %w", err)
 	}
 	s.proc = cmd
@@ -294,7 +411,7 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 
 	defer func() {
 		if err != nil {
-			s.killLocked()
+			s.killProcLocked()
 		}
 	}()
 
@@ -304,9 +421,13 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 			return err
 		}
 	}
+	return s.mountLocked(ctx)
+}
+
+func (s *Supervisor) mountLocked(ctx context.Context) error {
 	if err := s.mount.Mount(ctx, mountSpec{
 		binary: s.cfg.Binary, socket: s.ninePSocket, dir: s.cfg.MountDir,
-		env: cmd.Env, out: out, done: s.done,
+		env: s.env, out: s.out, done: s.done,
 	}); err != nil {
 		return fmt.Errorf("zerofs: mount %s: %w", s.cfg.MountDir, err)
 	}
@@ -319,11 +440,116 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 	return nil
 }
 
+// watch checks zerofs every CheckInterval, and at once when the process
+// exits, and reconnects when it is gone or unreachable.
+func (s *Supervisor) watch(stop chan struct{}) {
+	t := time.NewTicker(s.cfg.CheckInterval)
+	defer t.Stop()
+	for {
+		s.mu.Lock()
+		done := s.done
+		s.mu.Unlock()
+		select {
+		case <-stop:
+			return
+		case <-done:
+		case <-t.C:
+		}
+		err := s.check()
+		if err == nil {
+			continue
+		}
+		if !s.reconnect(stop, err) {
+			return
+		}
+	}
+}
+
+// check returns why zerofs is unusable, or nil.
+func (s *Supervisor) check() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping {
+		return nil
+	}
+	if err := s.exited(); err != nil {
+		return err
+	}
+	return s.mount.Err()
+}
+
+// reconnect brings zerofs back: it restarts the process if it is gone and
+// mounts (or connects) again, retrying with backoff for ReconnectWindow.
+// It returns false if it gave up or Stop was called.
+func (s *Supervisor) reconnect(stop chan struct{}, cause error) bool {
+	since := time.Now()
+	s.setHealth(Health{State: HealthReconnecting, Since: since, Err: cause.Error()})
+	s.log.Warn("zerofs lost; reconnecting", "err", cause, "window", s.cfg.ReconnectWindow)
+	delay := time.Second
+	for attempt := 1; ; attempt++ {
+		s.mu.Lock()
+		if s.stopping {
+			s.mu.Unlock()
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.StartTimeout)
+		err := s.restartLocked(ctx)
+		cancel()
+		s.mu.Unlock()
+		if err == nil {
+			s.setHealth(Health{State: HealthUp, Since: time.Now()})
+			s.log.Info("zerofs reconnected", "after", time.Since(since).Round(time.Millisecond), "attempts", attempt)
+			return true
+		}
+		if time.Since(since) >= s.cfg.ReconnectWindow {
+			s.setHealth(Health{State: HealthDown, Since: since, Attempts: attempt, Err: err.Error()})
+			s.log.Error("zerofs still unreachable; gave up reconnecting. Restart `keepsync server run`",
+				"since", since, "attempts", attempt, "err", err)
+			s.mu.Lock()
+			close(s.gaveUp)
+			s.mu.Unlock()
+			return false
+		}
+		s.setHealth(Health{State: HealthReconnecting, Since: since, Attempts: attempt, Err: err.Error()})
+		s.log.Warn("zerofs reconnect failed", "attempt", attempt, "err", err, "retry_in", delay)
+		select {
+		case <-stop:
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, 30*time.Second)
+	}
+}
+
+// restartLocked mounts (or connects) again: first without restarting
+// zerofs, if it is still running, then by restarting it.
+func (s *Supervisor) restartLocked(ctx context.Context) error {
+	s.running.Store(false)
+	if s.proc != nil && s.exited() == nil {
+		uctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_ = s.mount.Unmount(uctx)
+		cancel()
+		if err := s.mountLocked(ctx); err == nil {
+			if err := s.mount.Err(); err == nil {
+				return nil
+			}
+		}
+		s.running.Store(false)
+		s.log.Warn("zerofs is running but unreachable; restarting it")
+	}
+	s.restarts.Add(1)
+	s.killProcLocked()
+	return s.launchLocked(ctx)
+}
+
 // Flush returns nil only once everything written to Dir so far is in the
 // bucket: it syncs the mount, then asks zerofs to flush to object storage.
 func (s *Supervisor) Flush(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if h := s.Health(); h.State != HealthUp {
+		return errors.New(h.Error())
+	}
 	if !s.running.Load() {
 		return errors.New("zerofs: not running")
 	}
@@ -345,7 +571,7 @@ func (s *Supervisor) flushLocked(ctx context.Context) error {
 		return fmt.Errorf("zerofs: mount: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, s.cfg.Binary, "flush", "--config", s.configPath)
-	cmd.Env = s.env()
+	cmd.Env = s.env
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -362,7 +588,23 @@ func (s *Supervisor) flushLocked(ctx context.Context) error {
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.stopping && s.stop != nil {
+		s.stopping = true
+		close(s.stop)
+	}
+	before := s.Health()
+	defer s.setHealth(Health{State: HealthStopped, Since: time.Now()})
+	defer func() {
+		if m, ok := s.mount.(*ninePMount); ok {
+			m.release()
+		}
+	}()
 	if s.proc == nil {
+		s.closeLog()
+		if before.State == HealthDown {
+			// Whatever was written since zerofs went away may be lost.
+			return errors.New(before.Error())
+		}
 		return nil
 	}
 	if _, ok := ctx.Deadline(); !ok {
@@ -427,7 +669,7 @@ func (s *Supervisor) prepareDirs() error {
 // bytes on macOS and FreeBSD, 108 on Linux, including the NUL).
 const maxSocketPath = 103
 
-func (s *Supervisor) env() []string {
+func (s *Supervisor) environ() []string {
 	env := append(os.Environ(),
 		envPassword+"="+s.cfg.Password,
 		envAccessKey+"="+s.cfg.Storage.AccessKeyID,
@@ -484,18 +726,23 @@ func (s *Supervisor) logHint() string {
 	return "zerofs output"
 }
 
-func (s *Supervisor) killLocked() {
+// killProcLocked unmounts and kills the zerofs process, if any.
+func (s *Supervisor) killProcLocked() {
 	if s.mount != nil {
 		uctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = s.mount.Unmount(uctx)
 		cancel()
 	}
+	s.running.Store(false)
 	if s.proc != nil {
-		_ = s.proc.Process.Kill()
-		<-s.done
+		select {
+		case <-s.done:
+		default:
+			_ = s.proc.Process.Kill()
+			<-s.done
+		}
 		s.proc = nil
 	}
-	s.closeLog()
 }
 
 func (s *Supervisor) closeLog() {

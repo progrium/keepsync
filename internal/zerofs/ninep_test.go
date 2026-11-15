@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/hugelgupf/p9/fsimpl/localfs"
 	"github.com/hugelgupf/p9/p9"
@@ -330,5 +331,55 @@ func TestDirentType(t *testing.T) {
 	}
 	if typ := direntType(p9.Dirent{Type: 8, QID: p9.QID{Type: p9.TypeRegular}}); typ != 0 {
 		t.Errorf("regular entry: %v", typ)
+	}
+}
+
+// TestSupervisorNinePReconnect: when zerofs dies, the supervisor restarts
+// it and redials the same NineP, so a holder of it keeps working.
+func TestSupervisorNinePReconnect(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s, _ := fakeSupervisor(t, "FAKE_NINEP_ROOT="+root)
+	s.cfg.Mount, s.mount = MountNineP, &ninePMount{}
+	s.cfg.CheckInterval = 50 * time.Millisecond
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop(ctx)
+	fs := s.FS()
+	if err := fs.WriteFile("a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	killFake(t, s)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if b, err := fs.ReadFile("a"); err == nil && string(b) == "1" && s.Health().State == HealthUp {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("not back: health %+v", s.Health())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s.FS() != fs {
+		t.Fatal("FS replaced; holders of the old one are stranded")
+	}
+	if err := fs.WriteFile("b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTempFileRemakesDir checks that TempFile makes its directory again
+// when it is gone, as after a ZeroFS restart that lost unflushed writes.
+func TestTempFileRemakesDir(t *testing.T) {
+	dir := t.TempDir()
+	n := serveNineP(t, dir)
+	w, err := n.TempFile("blobs/sha224/13/fc", "x.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if fi, err := os.Stat(filepath.Join(dir, "blobs/sha224/13/fc")); err != nil || !fi.IsDir() {
+		t.Fatalf("dir not made: %v", err)
 	}
 }

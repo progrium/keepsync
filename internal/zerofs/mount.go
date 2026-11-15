@@ -284,32 +284,41 @@ func runQuiet(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-// ninePMount connects a NineP client instead of mounting.
+// ninePMount connects a NineP client instead of mounting. The client is
+// made once and redialled in place after a reconnect, so whoever holds it
+// (perkeepd's blob store) keeps working.
 type ninePMount struct {
 	mu sync.Mutex
 	fs *NineP
 }
 
 func (n *ninePMount) Mount(ctx context.Context, m mountSpec) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.fs != nil {
+		return n.fs.Redial(ctx, m.socket)
+	}
 	fs, err := DialNineP(ctx, m.socket)
 	if err != nil {
 		return err
 	}
-	n.mu.Lock()
 	n.fs = fs
-	n.mu.Unlock()
 	return nil
 }
 
+// Unmount drops the connection but keeps the client for the next Mount.
 func (n *ninePMount) Unmount(context.Context) error {
+	if fs := n.client(); fs != nil {
+		return fs.Close()
+	}
+	return nil
+}
+
+// release forgets the client, after a final Unmount.
+func (n *ninePMount) release() {
 	n.mu.Lock()
-	fs := n.fs
 	n.fs = nil
 	n.mu.Unlock()
-	if fs == nil {
-		return nil
-	}
-	return fs.Close()
 }
 
 func (n *ninePMount) Err() error {

@@ -13,7 +13,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hugelgupf/p9/linux"
@@ -33,13 +32,24 @@ import (
 // it durable in the bucket. A real 9P fsync costs a full zerofs flush per
 // file (tens of milliseconds), which per blob would be the bulk of the
 // write cost.
+//
+// A NineP outlives its connection: Redial replaces a lost one in place, so
+// the blob store holding it keeps working once zerofs is back. While it is
+// disconnected every operation fails with ErrNotConnected.
 type NineP struct {
+	mu   sync.RWMutex
+	sess *ninePSession // nil while disconnected
+}
+
+type ninePSession struct {
 	conn io.Closer
 	c    *p9.Client
 	root p9.File
-
-	broken atomic.Pointer[error] // first connection error
 }
+
+// ErrNotConnected is the error of a NineP operation while the connection
+// is down.
+var ErrNotConnected = errors.New("9p: not connected to zerofs")
 
 var (
 	_ files.VFS       = (*NineP)(nil)
@@ -51,20 +61,35 @@ const ninePMsize = 1 << 20
 
 // DialNineP connects to the 9P server on the unix socket at socket.
 func DialNineP(ctx context.Context, socket string) (*NineP, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", socket)
-	if err != nil {
-		return nil, err
-	}
-	n, err := newNineP(conn)
-	if err != nil {
-		conn.Close()
+	n := &NineP{}
+	if err := n.Redial(ctx, socket); err != nil {
 		return nil, err
 	}
 	return n, nil
 }
 
-func newNineP(conn io.ReadWriteCloser) (*NineP, error) {
+// Redial drops the current connection, if any, and connects again.
+// Operations already under way on the old connection fail.
+func (n *NineP) Redial(ctx context.Context, socket string) error {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", socket)
+	if err != nil {
+		return err
+	}
+	sess, err := newNinePSession(conn)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	n.mu.Lock()
+	old := n.sess
+	n.sess = sess
+	n.mu.Unlock()
+	old.close()
+	return nil
+}
+
+func newNinePSession(conn io.ReadWriteCloser) (*ninePSession, error) {
 	c, err := p9.NewClient(&ninePConn{rwc: conn}, p9.WithMessageSize(ninePMsize))
 	if err != nil {
 		return nil, fmt.Errorf("9p: version: %w", err)
@@ -74,21 +99,65 @@ func newNineP(conn io.ReadWriteCloser) (*NineP, error) {
 		c.Close()
 		return nil, fmt.Errorf("9p: attach: %w", err)
 	}
-	return &NineP{conn: conn, c: c, root: root}, nil
+	return &ninePSession{conn: conn, c: c, root: root}, nil
 }
 
-// Close closes the connection.
-func (n *NineP) Close() error {
-	n.root.Close()
-	return n.c.Close()
-}
-
-// Err reports the error that broke the connection, if one has.
-func (n *NineP) Err() error {
-	if p := n.broken.Load(); p != nil {
-		return *p
+func (s *ninePSession) close() {
+	if s == nil {
+		return
 	}
+	s.root.Close()
+	s.c.Close()
+	s.conn.Close()
+}
+
+// Close drops the connection. Redial can connect again.
+func (n *NineP) Close() error {
+	n.mu.Lock()
+	old := n.sess
+	n.sess = nil
+	n.mu.Unlock()
+	old.close()
 	return nil
+}
+
+func (n *NineP) root() (p9.File, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.sess == nil {
+		return nil, ErrNotConnected
+	}
+	return n.sess.root, nil
+}
+
+// pingTimeout bounds Err's round trip.
+const pingTimeout = 5 * time.Second
+
+// Err reports whether the connection works, with one round trip (a walk
+// of the root, and its clunk). It is nil when zerofs answers within
+// pingTimeout.
+func (n *NineP) Err() error {
+	root, err := n.root()
+	if err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, f, err := root.Walk(nil)
+		if err == nil {
+			clunkAsync(f)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("9p: zerofs not answering: %w", err)
+		}
+		return nil
+	case <-time.After(pingTimeout):
+		return fmt.Errorf("9p: zerofs did not answer within %v", pingTimeout)
+	}
 }
 
 // pathErr wraps a 9P error for op on name. ENOENT and EEXIST become
@@ -96,11 +165,6 @@ func (n *NineP) Err() error {
 func (n *NineP) pathErr(op, name string, err error) error {
 	if err == nil {
 		return nil
-	}
-	var ce p9.ConnError
-	if errors.As(err, &ce) {
-		e := fmt.Errorf("9p connection: %w", err)
-		n.broken.CompareAndSwap(nil, &e)
 	}
 	var errno linux.Errno
 	if errors.As(err, &errno) {
@@ -128,7 +192,11 @@ const maxWalk = 16
 
 // walk returns a new fid for the file at the path elements names.
 func (n *NineP) walk(names []string) (p9.File, error) {
-	f, err := walkOne(n.root, names[:min(len(names), maxWalk)])
+	root, err := n.root()
+	if err != nil {
+		return nil, err
+	}
+	f, err := walkOne(root, names[:min(len(names), maxWalk)])
 	for names = names[min(len(names), maxWalk):]; err == nil && len(names) > 0; names = names[min(len(names), maxWalk):] {
 		var next p9.File
 		next, err = walkOne(f, names[:min(len(names), maxWalk)])
@@ -379,7 +447,19 @@ func (n *NineP) TempFile(dir, pattern string) (files.WritableFile, error) {
 	}
 	d, err := n.walk(split(dir))
 	if err != nil {
-		return nil, n.pathErr("createtemp", dir, err)
+		err = n.pathErr("createtemp", dir, err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		// Perkeep's files storage remembers the directories it made,
+		// but a ZeroFS that died before a flush loses the ones it had
+		// not flushed. Make the directory again.
+		if err := n.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+		if d, err = n.walk(split(dir)); err != nil {
+			return nil, n.pathErr("createtemp", dir, err)
+		}
 	}
 	defer d.Close()
 	for range 10 {
