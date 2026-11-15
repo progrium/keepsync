@@ -359,7 +359,7 @@ When the server is unreachable, sync keeps working, and only keeping, expiry and
 | Server unreachable | Syncing continues with the cached peer list. The registry client reconnects with backoff. The keeper retries next interval; there is no queue to lose, because the walk is idempotent. Expiry pauses. `status` shows how long the server has been unreachable. |
 | Node never approved | `status` shows the `server add` command to run. |
 | Keeper node gone | After 2 minutes the server reassigns its keeper role. The second keeper keeps working meanwhile. |
-| Lagging keeper reports an older file | The server rejects it. `keep status` shows the file as lagging. |
+| A keeper is behind | It does not claim files it does not hold Syncthing's current version of, and the server rejects a claim whose version is older than the kept one. `keep status` shows such files as lagging. |
 | Registry connection goes silent | Both sides drop it within 30 s, and the node reconnects and refetches the membership. |
 | ZeroFS flush failing | Nothing new becomes durable, so expiry stops removing files. `server status` shows the failure. |
 | Conflict hook fails or makes a bad merge | A failure leaves the copy for a human, shown in `conflicts`. Both versions were kept before the hook ran, so a bad merge can be undone with `restore`. |
