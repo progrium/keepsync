@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -24,6 +25,7 @@ const (
 	MethodKeepStatus = "keep.status"
 	MethodRestore    = "restore"
 	MethodGateway    = "gateway"
+	MethodUnkeep     = "unkeep"
 )
 
 // FolderParams is the body of MethodFolderAdd, MethodFolderJoin and
@@ -188,6 +190,12 @@ func (n *Node) handlers() {
 		pol.Permanode = pn
 		return KeepResult{Permanode: pn, Policy: pol}, nil
 	})
+	ctl.HandleFunc(n.ctl, MethodUnkeep, func(ctx context.Context, p FolderParams) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		return n.unkeep(ctx, p.Name)
+	})
 	ctl.HandleFunc(n.ctl, MethodGateway, func(ctx context.Context, _ struct{}) (any, error) {
 		if err := ready(); err != nil {
 			return nil, err
@@ -214,7 +222,7 @@ func (n *Node) handlers() {
 		k := n.keepers[p.Name]
 		n.mu.Unlock()
 		if k == nil {
-			return nil, errors.New("folder " + p.Name + " is not kept (or the server has not confirmed it yet)")
+			return nil, n.notKept(p.Name)
 		}
 		st, err := k.k.Status(ctx)
 		if err != nil {
@@ -229,6 +237,77 @@ func (n *Node) handlers() {
 		n.mu.Unlock()
 		return out, nil
 	})
+}
+
+// UnkeepResult is the result of MethodUnkeep.
+type UnkeepResult struct {
+	Archive api.BlobRef `json:"archive,omitempty"`
+}
+
+// unkeep stops keeping a folder on every node. The archive stays: restore
+// still reads it, and keeping the folder again continues the same tree.
+func (n *Node) unkeep(ctx context.Context, name string) (UnkeepResult, error) {
+	var res UnkeepResult
+	if err := n.reg.Unkeep(ctx, name); err != nil {
+		return res, err
+	}
+	res.Archive = n.archive(name)
+	// Stop this node's keeper now rather than at the next membership
+	// update, so no pass runs after the command returns.
+	n.mu.Lock()
+	for i := range n.member.Folders {
+		if n.member.Folders[i].Name == name {
+			n.member.Folders[i].Keep = nil
+		}
+	}
+	n.mu.Unlock()
+	n.reconcile(n.ctx)
+	return res, nil
+}
+
+// archive returns the root permanode of a folder's kept tree: the
+// registry's Folder.Archive, else the .keepsync file in the folder.
+func (n *Node) archive(name string) api.BlobRef {
+	n.mu.Lock()
+	for _, f := range n.member.Folders {
+		if f.Name == name {
+			if f.Archive != "" {
+				n.mu.Unlock()
+				return f.Archive
+			}
+			if f.Keep != nil && f.Keep.Permanode != "" {
+				n.mu.Unlock()
+				return f.Keep.Permanode
+			}
+		}
+	}
+	n.mu.Unlock()
+	if lf, err := n.localFolder(name); err == nil {
+		if m, err := keeper.ReadMapping(lf.Path); err == nil {
+			return m.Permanode
+		}
+	}
+	return ""
+}
+
+// notKept explains why a folder has no keeper here.
+func (n *Node) notKept(name string) error {
+	n.mu.Lock()
+	var f *api.Folder
+	for i := range n.member.Folders {
+		if n.member.Folders[i].Name == name {
+			f = &n.member.Folders[i]
+		}
+	}
+	keep := f != nil && f.Keep != nil
+	n.mu.Unlock()
+	if keep {
+		return errors.New("folder " + name + " is kept, but its keeper has not started here yet")
+	}
+	if a := n.archive(name); a != "" {
+		return fmt.Errorf("folder %s is not kept; its archive %s stays (restore reads it, and keepsync keep %s resumes it)", name, a, name)
+	}
+	return errors.New("folder " + name + " is not kept")
 }
 
 // attach creates or joins a folder in the registry and attaches it at path.

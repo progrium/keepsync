@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"perkeep.org/pkg/blob"
+
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/ctl"
@@ -116,14 +118,18 @@ type Node struct {
 	cfg  *config.Node
 	logf func(format string, args ...any)
 
-	tr     *tcnet.Transport
-	reg    *registry.Client
-	putter *pkserver.Putter
-	sy     *syncer.Syncer
-	ctl    *ctl.Server
-	gw     *gateway.Gateway
-	gwTok  string
-	up     atomic.Bool
+	// The parts below are interfaces so tests can run a Node on fakes.
+	tr       api.Transport
+	reg      api.RegistryClient
+	closeReg func() error
+	putter   api.BlobPutter
+	sy       api.Syncer
+	// fetcher reads kept files back for restore and the conflict hook.
+	fetcher func() (blob.Fetcher, error)
+	ctl     *ctl.Server
+	gw      *gateway.Gateway
+	gwTok   string
+	up      atomic.Bool
 
 	mu         sync.Mutex
 	member     api.Membership
@@ -158,10 +164,7 @@ type Options struct {
 
 // Run starts the node and blocks until ctx is done.
 func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
-	n := &Node{cfg: cfg, logf: o.Logf, connected: map[api.DeviceID]bool{}, keepers: map[string]*kept{}}
-	if n.logf == nil {
-		n.logf = log.Printf
-	}
+	n := newNode(cfg, o.Logf)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	n.ctx = ctx
@@ -177,14 +180,18 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 	if err != nil {
 		return err
 	}
-	if n.tr, err = tcnet.New(ctx, topts); err != nil {
+	tr, err := tcnet.New(ctx, topts)
+	if err != nil {
 		return err
 	}
+	n.tr = tr
 	server := api.Addr(cfg.Server)
-	n.reg = registry.NewClient(n.tr, server)
+	rc := registry.NewClient(n.tr, server)
+	n.reg, n.closeReg = rc, rc.Close
 	if n.putter, err = pkserver.NewPutter(n.tr, server); err != nil {
 		return err
 	}
+	n.fetcher = n.perkeepFetcher
 	if n.sy, err = syncer.New(syncer.Config{Dir: cfg.SyncthingDir(), Name: cfg.Name, Transport: n.tr}); err != nil {
 		return err
 	}
@@ -206,6 +213,15 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 	go n.health(ctx)
 	n.watch(ctx)
 	return nil
+}
+
+// newNode returns a Node with nothing started; Run (or a test) fills in
+// the transport, registry client, putter and syncer.
+func newNode(cfg *config.Node, logf func(string, ...any)) *Node {
+	if logf == nil {
+		logf = log.Printf
+	}
+	return &Node{cfg: cfg, logf: logf, connected: map[api.DeviceID]bool{}, keepers: map[string]*kept{}}
 }
 
 // healthInterval and healthTimeout set how often `status` learns whether
@@ -282,8 +298,8 @@ func (n *Node) shutdown() {
 		delete(n.keepers, name)
 	}
 	n.mu.Unlock()
-	if n.reg != nil {
-		n.reg.Close()
+	if n.closeReg != nil {
+		n.closeReg()
 	}
 	if n.sy != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

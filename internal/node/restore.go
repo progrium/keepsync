@@ -20,7 +20,6 @@ import (
 	"perkeep.org/pkg/schema"
 
 	"github.com/progrium/keepsync/internal/api"
-	"github.com/progrium/keepsync/internal/keeper"
 )
 
 // RestoreParams is the body of MethodRestore.
@@ -51,9 +50,10 @@ type RestoreResult struct {
 	Reexpire bool `json:"reexpire,omitempty"`
 }
 
-// fetcher returns a Perkeep client that reaches the server's perkeepd over
-// the transport, for reading kept files back (nodes may fetch blobs).
-func (n *Node) fetcher() (*client.Client, error) {
+// perkeepFetcher returns a Perkeep client that reaches the server's
+// perkeepd over the transport, for reading kept files back (nodes may
+// fetch blobs).
+func (n *Node) perkeepFetcher() (blob.Fetcher, error) {
 	c, err := client.New(client.OptionServer("http://perkeep.keepsync"), client.OptionNoExternalConfig())
 	if err != nil {
 		return nil, err
@@ -77,9 +77,9 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 	if err != nil {
 		return res, err
 	}
-	m, err := keeper.ReadMapping(lf.Path)
-	if err != nil {
-		return res, fmt.Errorf("folder %s is not kept here (%w)", p.Folder, err)
+	archive := n.archive(p.Folder)
+	if archive == "" {
+		return res, fmt.Errorf("folder %s has never been kept", p.Folder)
 	}
 	prefix := strings.Trim(path.Clean("/"+filepath.ToSlash(p.Path)), "/")
 	dest := lf.Path
@@ -92,9 +92,9 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 
 	var tree map[string]api.PathEntry
 	if p.At.IsZero() {
-		tree, err = n.reg.Paths(ctx, m.Permanode)
+		tree, err = n.reg.Paths(ctx, archive)
 	} else {
-		tree, err = n.reg.PathsAt(ctx, m.Permanode, p.At)
+		tree, err = n.reg.PathsAt(ctx, archive, p.At)
 	}
 	if err != nil {
 		return res, err

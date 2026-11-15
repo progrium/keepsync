@@ -371,3 +371,20 @@ func (e *env) gatewayConfig(args []string) error {
 	fmt.Fprintln(e.stdout, "search and the web UI need read scope: on the server, keepsync server grant <this node> read")
 	return nil
 }
+
+func (e *env) unkeep(args []string) error {
+	fs := newFlags(e, "unkeep")
+	pos, err := parse(fs, args, 1, 1, "<folder>")
+	if err != nil {
+		return err
+	}
+	var res node.UnkeepResult
+	if err := e.nodeCall(node.MethodUnkeep, node.FolderParams{Name: pos[0]}, &res); err != nil {
+		return err
+	}
+	fmt.Fprintf(e.stdout, "stopped keeping %s on every node: no more uploads or expiry\n", pos[0])
+	if res.Archive != "" {
+		fmt.Fprintf(e.stdout, "the archive stays (%s): restore still reads it, and keepsync keep %s continues the same tree\n", res.Archive, pos[0])
+	}
+	return nil
+}

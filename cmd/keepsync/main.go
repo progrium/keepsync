@@ -43,6 +43,7 @@ Node:
   keep <folder> [--grace 48h] [--max-defer 7d] [--expire 30d]
                                        mark a folder kept
   keep status <folder>                 files in grace, kept, expirable
+  unkeep <folder>                      stop keeping a folder; the archive stays
   restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]
                                        pull kept files back, including expired;
                                        --at is when the server kept them
@@ -154,7 +155,7 @@ func run(e *env, args []string) error {
 			return e.gatewayConfig(a)
 		}
 	case "unkeep":
-		return notYet("unkeep", 2)
+		return e.unkeep(rest)
 	case "restore":
 		return e.restore(rest)
 	case "conflicts":
