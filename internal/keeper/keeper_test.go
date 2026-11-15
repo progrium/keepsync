@@ -567,3 +567,19 @@ func TestStatus(t *testing.T) {
 		t.Fatalf("Status changed the archive: claims %d", e.pk.Claims)
 	}
 }
+
+// TestExpiryRehashesSameSizeSameMtimeEdit checks that expiry hashes the
+// file before removing it, so an in-place edit that kept both size and
+// mtime is not removed on the strength of the put cache.
+func TestExpiryRehashesSameSizeSameMtimeEdit(t *testing.T) {
+	e := newEnv(t)
+	e.write("tags.mp3", "old tags", 31*day)
+	if rep := e.pass(); !slices.Contains(rep.Kept, "tags.mp3") {
+		t.Fatalf("not kept: %+v", rep)
+	}
+	e.write("tags.mp3", "new tags", 31*day) // same size, same mtime
+	e.pk.MarkDurable()
+	if rep := e.pass(); len(rep.Expired) != 0 || !e.exists("tags.mp3") {
+		t.Fatalf("an unkept edit was expired: %+v", rep)
+	}
+}

@@ -584,13 +584,11 @@ func (k *Keeper) allDurable(ctx context.Context, groups [][]api.BlobRef) ([]bool
 	return out, nil
 }
 
-// verifyRef returns the file's blobref, from the cache when this node
-// already put this version, otherwise by putting it again (the server
-// already has it, so nothing is re-sent).
+// verifyRef returns the file's blobref by putting it again (the server
+// already has a kept version, so nothing is re-sent). It never trusts the
+// put cache: an in-place edit that keeps size and mtime would match the
+// cache and then be deleted by expiry (docs/design.md, Edge cases).
 func (k *Keeper) verifyRef(ctx context.Context, f file) (api.BlobRef, error) {
-	if c, ok := k.putCache[f.rel]; ok && c.mtime.Equal(f.mtime) && c.size == f.size {
-		return c.ref, nil
-	}
 	ref, err := k.cfg.Putter.PutFile(ctx, f.abs)
 	if err != nil {
 		return "", err
