@@ -186,19 +186,62 @@ func (p *Perkeep) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResu
 		if cur.File == c.File {
 			return api.ClaimUnchanged, nil
 		}
-		if !c.ModTime.After(cur.ModTime) {
+		if !api.Supersedes(c, cur) {
 			return api.ClaimRejectedOlder, nil
 		}
 	}
 	p.Claims++
 	claim := api.BlobRef(fmt.Sprintf("sha224-claim%04d", p.Claims))
 	p.blobs[claim] = false
-	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claims: []api.BlobRef{claim}}
+	now := time.Now()
+	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claims: []api.BlobRef{claim}, Version: c.Version, KeptAt: now}
+	p.record(c.Permanode, c.Path, tree[c.Path], now)
+	return api.ClaimWritten, nil
+}
+
+func (p *Perkeep) record(pn api.BlobRef, path string, e api.PathEntry, at time.Time) {
 	if p.history == nil {
 		p.history = map[api.BlobRef][]historyEntry{}
 	}
-	p.history[c.Permanode] = append(p.history[c.Permanode], historyEntry{at: time.Now(), path: c.Path, entry: tree[c.Path]})
-	return api.ClaimWritten, nil
+	p.history[pn] = append(p.history[pn], historyEntry{at: at, path: path, entry: e})
+}
+
+func (p *Perkeep) MarkGone(ctx context.Context, g api.GoneClaim) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tree, ok := p.trees[g.Permanode]
+	if !ok {
+		return fmt.Errorf("fake: unknown permanode %s", g.Permanode)
+	}
+	cur, ok := tree[g.Path]
+	if !ok || cur.File != g.File || cur.Gone == g.Reason {
+		return nil
+	}
+	p.Claims++
+	now := time.Now()
+	cur.Gone, cur.GoneAt = g.Reason, now
+	tree[g.Path] = cur
+	p.record(g.Permanode, g.Path, cur, now)
+	return nil
+}
+
+func (p *Perkeep) History(ctx context.Context, permanode api.BlobRef, path string) ([]api.PathEntry, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.trees[permanode]; !ok {
+		return nil, fmt.Errorf("fake: unknown permanode %s", permanode)
+	}
+	var out []api.PathEntry
+	for _, h := range p.history[permanode] {
+		if h.path != path || h.entry.Gone != api.GoneNone {
+			continue
+		}
+		if n := len(out); n > 0 && out[n-1].File == h.entry.File {
+			continue
+		}
+		out = append(out, h.entry)
+	}
+	return out, nil
 }
 
 func (p *Perkeep) Paths(ctx context.Context, permanode api.BlobRef) (map[string]api.PathEntry, error) {
@@ -502,6 +545,14 @@ func (c *registryClient) Durable(ctx context.Context, refs []api.BlobRef) ([]boo
 	return c.r.pk.Durable(ctx, refs)
 }
 
+func (c *registryClient) MarkGone(ctx context.Context, g api.GoneClaim) error {
+	return c.r.pk.MarkGone(ctx, g)
+}
+
+func (c *registryClient) History(ctx context.Context, pn api.BlobRef, path string) ([]api.PathEntry, error) {
+	return c.r.pk.History(ctx, pn, path)
+}
+
 // ZeroFS is a fake api.ZeroFS backed by a local directory. OnFlush, if set,
 // runs on every successful Flush (wire it to Perkeep.MarkDurable).
 type ZeroFS struct {
@@ -559,6 +610,7 @@ type Syncer struct {
 	Scans   []string // "folderID/subpath"
 	events  chan api.SyncEvent
 	modBy   map[string]api.DeviceID
+	states  map[string]api.FileState
 }
 
 func NewSyncer(id api.DeviceID) *Syncer {
@@ -592,6 +644,26 @@ func (s *Syncer) Scan(ctx context.Context, folderID, subpath string) error {
 }
 
 func (s *Syncer) Events() <-chan api.SyncEvent { return s.events }
+
+// SetFileState sets what FileState reports for folderID/path. Paths never
+// set are reported as known and current, with no version.
+func (s *Syncer) SetFileState(folderID, path string, st api.FileState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.states == nil {
+		s.states = map[string]api.FileState{}
+	}
+	s.states[folderID+"/"+path] = st
+}
+
+func (s *Syncer) FileState(folderID, path string) (api.FileState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.states[folderID+"/"+path]; ok {
+		return st, nil
+	}
+	return api.FileState{Known: true, Current: true}, nil
+}
 
 // SetModifiedBy sets what ModifiedBy reports for folderID/path.
 func (s *Syncer) SetModifiedBy(folderID, path string, d api.DeviceID) {

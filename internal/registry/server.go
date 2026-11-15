@@ -611,6 +611,24 @@ func (s *Server) call(ctx context.Context, peer api.NodeKey, req request) (any, 
 			return nil, err
 		}
 		return s.cfg.Signer.PathsAt(ctx, p.Permanode, p.At)
+	case mMarkGone:
+		var p api.GoneClaim
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		if err := s.authorizePermanode(peer, p.Permanode); err != nil {
+			return nil, err
+		}
+		return nil, s.cfg.Signer.MarkGone(ctx, p)
+	case mHistory:
+		var p historyParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		if err := s.authorizePermanode(peer, p.Permanode); err != nil {
+			return nil, err
+		}
+		return s.cfg.Signer.History(ctx, p.Permanode, p.Path)
 	case mDurable:
 		var p refsParams
 		if err := decode(&p); err != nil {

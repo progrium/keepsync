@@ -293,6 +293,18 @@ func (c *Client) PathsAt(ctx context.Context, pn api.BlobRef, at time.Time) (map
 	return out, err
 }
 
+// MarkGone records why a kept file left sync.
+func (c *Client) MarkGone(ctx context.Context, g api.GoneClaim) error {
+	return c.call(ctx, mMarkGone, g, nil)
+}
+
+// History returns every content version kept at path, oldest first.
+func (c *Client) History(ctx context.Context, pn api.BlobRef, path string) ([]api.PathEntry, error) {
+	var out []api.PathEntry
+	err := c.call(ctx, mHistory, historyParams{Permanode: pn, Path: path}, &out)
+	return out, err
+}
+
 func (c *Client) ClaimPath(ctx context.Context, cl api.PathClaim) (api.ClaimResult, error) {
 	var r api.ClaimResult
 	err := c.call(ctx, mClaimPath, cl, &r)

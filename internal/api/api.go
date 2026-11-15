@@ -105,6 +105,11 @@ type PathClaim struct {
 	Path      string
 	File      BlobRef
 	ModTime   time.Time
+	// Version is the file's Syncthing version. The server accepts a
+	// version that descends from the kept one and rejects one the kept
+	// version descends from (ClaimRejectedOlder). For concurrent versions,
+	// or when either side has none, it falls back to the newer-mtime rule.
+	Version Version
 }
 
 // ClaimResult reports what the server did with a PathClaim.
@@ -113,8 +118,27 @@ type ClaimResult int
 const (
 	ClaimWritten       ClaimResult = iota // a new signed claim was written
 	ClaimUnchanged                        // Path already pointed at File
-	ClaimRejectedOlder                    // ModTime not newer than the current entry
+	ClaimRejectedOlder                    // Version (or ModTime) not newer than the current entry
 )
+
+// GoneReason records why a kept file left the sync folder.
+type GoneReason string
+
+const (
+	GoneNone    GoneReason = ""        // still in sync, or never marked
+	GoneExpired GoneReason = "expired" // a keeper expired it
+	GoneDeleted GoneReason = "deleted" // deleted (or renamed away) in sync
+)
+
+// GoneClaim asks the server to record that the file at Path left sync.
+type GoneClaim struct {
+	Permanode BlobRef
+	Path      string
+	Reason    GoneReason
+	// File is the kept content the mark applies to. If the path has been
+	// kept with other content since, the mark is ignored.
+	File BlobRef
+}
 
 // PathEntry is the current value of one path in a kept tree.
 type PathEntry struct {
@@ -126,6 +150,14 @@ type PathEntry struct {
 	// directory between it and the root, with the claims naming them. Empty
 	// means the server could not say, and the path must not be expired.
 	Claims []BlobRef
+	// Version is the Syncthing version the content was kept with, if any.
+	Version Version
+	// KeptAt is when the server signed the claim that set the content.
+	KeptAt time.Time
+	// Gone says why the file left sync, if it did, and GoneAt when that
+	// was recorded. Keeping the path again clears it.
+	Gone   GoneReason
+	GoneAt time.Time
 }
 
 // RegistryClient is what a node uses to talk to the server's registry.
@@ -150,6 +182,10 @@ type RegistryClient interface {
 	// before at count. at is when the server kept a version, not file mtime.
 	PathsAt(ctx context.Context, permanode BlobRef, at time.Time) (map[string]PathEntry, error)
 	Durable(ctx context.Context, refs []BlobRef) ([]bool, error)
+	// MarkGone records why a kept file left sync (see GoneClaim).
+	MarkGone(ctx context.Context, g GoneClaim) error
+	// History returns every content version kept at path, oldest first.
+	History(ctx context.Context, permanode BlobRef, path string) ([]PathEntry, error)
 }
 
 // Signer is the server-side Perkeep identity: the only holder of the key.
@@ -161,6 +197,11 @@ type Signer interface {
 	Paths(ctx context.Context, permanode BlobRef) (map[string]PathEntry, error)
 	// PathsAt is Paths counting only claims signed at or before at.
 	PathsAt(ctx context.Context, permanode BlobRef, at time.Time) (map[string]PathEntry, error)
+	// MarkGone records why a kept file left sync. It writes nothing if the
+	// path already has that mark, or now holds other content than g.File.
+	MarkGone(ctx context.Context, g GoneClaim) error
+	// History returns every content version kept at path, oldest first.
+	History(ctx context.Context, permanode BlobRef, path string) ([]PathEntry, error)
 }
 
 // Durability answers whether blobs have reached the bucket.
@@ -222,6 +263,19 @@ type SyncEvent struct {
 	Time   time.Time
 }
 
+// FileState is one path as Syncthing knows it.
+type FileState struct {
+	// Known is false if the global index has no entry for the path.
+	Known bool
+	// Version is the global (current) version.
+	Version Version
+	Deleted bool
+	Dir     bool
+	// Current is true when this node holds the global version: its index
+	// entry has the global version and it needs nothing for the path.
+	Current bool
+}
+
 // Syncer is the embedded Syncthing instance.
 type Syncer interface {
 	Start(ctx context.Context) error
@@ -234,6 +288,9 @@ type Syncer interface {
 	// index. For a conflict copy that is the device whose losing version
 	// it holds (the copy's name carries the winner's ID instead).
 	ModifiedBy(folderID, path string) (DeviceID, bool)
+	// FileState reports path in Syncthing's global index and whether this
+	// node's copy is the current version.
+	FileState(folderID, path string) (FileState, error)
 	Events() <-chan SyncEvent
 	Stop(ctx context.Context) error
 }

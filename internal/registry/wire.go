@@ -40,6 +40,8 @@ const (
 	mClaimPath  = "claimPath"
 	mPaths      = "paths"
 	mPathsAt    = "paths_at"
+	mMarkGone   = "mark_gone"
+	mHistory    = "history"
 	mDurable    = "durable"
 	mLeave      = "leaveFolder"
 	mUnkeep     = "unkeep"
@@ -75,6 +77,11 @@ type keepParams struct {
 
 type permanodeParams struct {
 	Permanode api.BlobRef `json:"permanode"`
+}
+
+type historyParams struct {
+	Permanode api.BlobRef `json:"permanode"`
+	Path      string      `json:"path"`
 }
 
 type pathsAtParams struct {
