@@ -588,6 +588,9 @@ func (n *Node) runKeeper(ctx context.Context, name string, k *kept) {
 		} else if len(rep.Kept)+len(rep.Expired)+len(rep.Errors) > 0 {
 			n.logf("keep %s: kept %d, expired %d, errors %d", name, len(rep.Kept), len(rep.Expired), len(rep.Errors))
 		}
+		if len(rep.Reput) > 0 {
+			n.logf("keep %s: put %d kept files again, not yet durable on the server: %v", name, len(rep.Reput), rep.Reput)
+		}
 		select {
 		case <-ctx.Done():
 			return
