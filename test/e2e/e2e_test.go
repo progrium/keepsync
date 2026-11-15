@@ -113,6 +113,37 @@ func TestCluster(t *testing.T) {
 		}
 	})
 
+	step("join-merge", func(t *testing.T) {
+		if err := a.call(node.MethodFolderAdd, node.FolderParams{Name: "shared", Path: a.dir("shared")}, nil); err != nil {
+			t.Fatalf("folder add shared: %v", err)
+		}
+		b.write("shared", "mine.txt", "already on b")
+		join := func(n *testNode, merge bool) error {
+			return n.call(node.MethodFolderJoin, node.FolderParams{Name: "shared", Path: n.dir("shared"), Merge: merge}, nil)
+		}
+		if err := join(b, false); err == nil || !strings.Contains(err.Error(), "not empty") {
+			t.Fatalf("join from a non-empty directory without merge: err=%v, want a refusal", err)
+		}
+		if f, err := serverFolder(c, "shared"); err != nil {
+			t.Fatal(err)
+		} else if slices.Contains(f.Members, b.key) {
+			t.Fatal("a refused join still made b a member")
+		}
+		if err := join(b, true); err != nil {
+			t.Fatalf("join with merge: %v", err)
+		}
+		// Rejoining at the path it is attached at needs no merge.
+		if err := join(b, false); err != nil {
+			t.Fatalf("rejoin at the same path: %v", err)
+		}
+		if err := join(cc, false); err != nil {
+			t.Fatalf("join from an empty directory: %v", err)
+		}
+		for _, n := range []*testNode{a, cc} {
+			eventually(t, syncTimeout, "merged file reaches "+n.name, func() error { return n.hasContent("shared", "mine.txt", "already on b") })
+		}
+	})
+
 	step("keep-grace", func(t *testing.T) {
 		const grace = 6 * time.Second
 		keep(t, a, "docs", node.KeepParams{Grace: grace, MaxDefer: 30 * time.Second})
