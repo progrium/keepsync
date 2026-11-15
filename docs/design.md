@@ -227,7 +227,7 @@ The version rule (see "Signing") is checked per file permanode. `History` return
 2. Ask Syncthing for each file's state. A file this node does not hold the current version of (not `Current`, unknown, deleted or a directory) is reported as lagging, and is not put or claimed. A node that is behind therefore never claims.
 3. Put each remaining file past grace, or past max-defer, through Perkeep. A put cache makes unchanged files free, and blobs the server already has are not re-sent.
 4. Ask the server to keep the fileref at the file's path, with its Syncthing version.
-5. A missing file is never translated into a delete. Instead, for each kept path with no file on disk, no gone mark yet, and a state that Syncthing reports as known, current and deleted, the keeper asks the server to mark it gone: `expired` if the kept version is past the expire window and its recovery set is durable (only then could a keeper have expired it), otherwise `deleted`. If the server cannot answer the durability check, the marks wait for a later pass. Unknown or not-current state marks nothing.
+5. A missing file is never translated into a delete. Instead, for each kept path with no file on disk, no gone mark yet, and a state that Syncthing reports as known, current and deleted, the keeper asks the server to mark it gone: `expired` only if a keeper could have expired it: the kept version is past the expire window, its recovery set is known, and the server reports it durable. Otherwise it is `deleted`, so a file deleted by hand before its flush is not brought back by a plain restore. If the server cannot answer the durability check, the marks wait for a later pass. Unknown or not-current state marks nothing. A file this node expired itself is always marked `expired`, and if that mark fails, it is retried as `expired` on later passes rather than judged again.
 
 Whether a file is "already kept" or "lagging" is decided by versions when both the file and the tree have one and they are not concurrent; otherwise by mtimes compared to the second, so filesystems with coarse mtimes agree with fine ones. Running two keepers is harmless, because the server deduplicates claims. Grace and max-defer are measured from when the keeper first saw a version, if the mtime is in the future. That state is in memory, so after a restart it is measured from the first version seen after the restart.
 
@@ -249,7 +249,7 @@ Whether a file is "already kept" or "lagging" is decided by versions when both t
 
 ## Syncthing
 
-Syncthing v2.1.7 runs in-process through `lib/syncthing`. It is vendored and pruned in `third_party/syncthing`, wired in with a `go.mod` replace. Two reasons: the published module does not build as a library without generated GUI assets, and v2 has no importable module version. It carries two small patches: a stub `gui.files.go`, and an `Internals.LocalFileInfo` accessor that `FileState` uses (see `third_party/syncthing/KEEPSYNC.md`). `internal/syncer/README.md` lists the Syncthing internals touched and how stable each one is.
+Syncthing v2.1.7 runs in-process through `lib/syncthing`. It is vendored and pruned in `third_party/syncthing`, wired in with a `go.mod` replace. Two reasons: the published module does not build as a library without generated GUI assets, and v2 has no importable module version. It carries three small patches (see `third_party/syncthing/KEEPSYNC.md`): a stub `gui.files.go`; an `Internals.LocalFileInfo` accessor that `FileState` uses; and conflict copies named after the losing version's device instead of the winner's (see "Conflicts"). `internal/syncer/README.md` lists the Syncthing internals touched and how stable each one is.
 
 **Config.** Peers and folders come from the registry, never from introducers or a config file at startup. Global and local discovery, relays, NAT, usage and crash reporting, upgrades and the GUI are off.
 
@@ -427,15 +427,18 @@ When the server is unreachable, sync keeps working, and only keeping, expiry and
 Every package has unit tests against the fakes in `internal/api/fake`.
 
 `test/e2e` starts a server and three nodes in one process, with tailcat on an in-process derper. Its steps cover:
-- join and sync
+- join and sync, and `folder join --merge`
 - keeping after grace
 - expiry gated on durability
 - a delete after a node restart propagating, not coming back as a conflict copy
-- leaving a folder
+- leaving a folder, and `unkeep`
+- the conflict hook: one run per conflict, the losing node's name, both versions kept first, and an exact base
+- keep rules: a file recreated with an old mtime, two kept files swapped, file to directory checked against `restore --at`, a lagging node that never rolls the archive back, and delete versus expiry with `restore --deleted` (including a hand delete past the window before a flush)
+- disk and bucket use in `server status` and the node's server summary
 - `recover --drill`
 - keeper reassignment
 
-With `KEEPSYNC_ZEROFS_BIN` and `KEEPSYNC_MINIO_BIN` set, it runs against a real ZeroFS and MinIO; without them those steps skip. All steps pass against ZeroFS 2.3.7 and MinIO.
+With `KEEPSYNC_ZEROFS_BIN` and `KEEPSYNC_MINIO_BIN` set, it runs against a real ZeroFS and MinIO; without them those steps skip. `KEEPSYNC_E2E_MODE` picks the server's mode (`store` or `cache`). A check for a known, still-open bug logs instead of failing unless `KEEPSYNC_E2E_KNOWN_BUGS=1`. All steps pass against ZeroFS 2.3.7 and MinIO.
 
 Not yet measured: keep throughput, bucket write operations and restore time on a real 30 GB set.
 
@@ -462,7 +465,7 @@ keepsync itself is MIT. Every embedded dependency is compatible with that, and Z
 **Obligations**
 
 - Release binaries ship a third-party notices file: Apache-2.0 NOTICE text, BSD copyright lines, and a pointer to the Syncthing source (MPL).
-- Patched Syncthing files (the `gui.files.go` stub and the `LocalFileInfo` accessor) stay MPL-2.0 and are published.
+- Patched Syncthing files (the `gui.files.go` stub, the `LocalFileInfo` accessor and the conflict-copy naming in `folder_sendrecv.go`) stay MPL-2.0 and are published.
 - The recovery kit carries ZeroFS's license text and a link to the exact source for the pinned version.
 - ZeroFS is never linked or modified. A patched ZeroFS would fall under the AGPL network clause.
 

@@ -123,7 +123,7 @@ keepsync folder join docs ~/Documents
 keepsync folder join docs ~/Documents --merge
 ```
 
-`keepsync folder ls` lists folders and their members. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk.
+`keepsync folder ls` lists folders and their members. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk. If the server can't be reached, the node stops syncing anyway and tells the server later.
 
 At this point the folder syncs between nodes but isn't archived yet.
 
@@ -143,7 +143,9 @@ keepsync keep docs --grace 48h --max-defer 7d --expire 30d
 
 Durations take Go syntax plus a `d` suffix. Grace must be shorter than max-defer, and max-defer shorter than expire.
 
-`keep` creates the folder's archive root and writes a `.keepsync` file into the folder, which syncs to every node. Up to two connected nodes are picked as the folder's keepers. They upload files past grace every 5 minutes. A deleted file is never deleted from the archive.
+`keep` creates the folder's archive root and writes a `.keepsync` file into the folder, which syncs to every node. Up to two connected nodes are picked as the folder's keepers. They upload files past grace every 5 minutes. A deleted file is never deleted from the archive; it is marked as deleted (or expired, if expiry removed it), so a plain restore can skip it.
+
+Each kept version records Syncthing's version of the file, so the archive knows which edit came after which, whatever the mtimes say. A file copied in with an old mtime (`cp -p`, an unzip) is still kept as the newest version, and a node that was offline and is behind never rolls the archive back.
 
 Expiry only removes a file after the server confirms the file, and everything needed to find it by name, is durable in the bucket. If the server can't answer, expiry waits and the folder simply grows.
 
@@ -175,7 +177,13 @@ keepsync restore docs --to /tmp/docs-copy     # somewhere other than the folder
 keepsync restore docs reports/q3.txt --force  # overwrite a local file that differs
 ```
 
-Files keep their relative paths. A local file with the same size and mtime as the kept version is left alone, and one that differs is skipped unless you pass `--force`.
+Files keep their relative paths and permissions. A local file with the same size and mtime as the kept version is left alone, and one that differs is skipped unless you pass `--force`.
+
+Files that were deleted in sync on purpose (including old names of renamed files and conflict copies a hook resolved) are skipped and counted, so a full restore brings back what expired, not what you deleted. To get those back too, add `--deleted`:
+
+```sh
+keepsync restore docs --deleted
+```
 
 To restore the archive as it was at an earlier time, use `--at`:
 
@@ -227,7 +235,7 @@ name = "docs"
 conflict_hook = "/home/me/bin/merge-docs"   # overrides the default for this folder
 ```
 
-Only one node runs the hook per folder: the first keeper on a kept folder, or the first member on an unkept one. Set the hook on every node so it runs wherever that role lands. Before it runs on a kept folder, both versions are kept right away, so anything the hook does can be undone with `restore`.
+Only one node runs the hook per folder: the first keeper on a kept folder, or the first member on an unkept one. If several nodes make identical copies of the same conflict, the hook runs once and the duplicates are removed. Set the hook on every node so it runs wherever that role lands. Before it runs on a kept folder, both versions are kept right away, so anything the hook does can be undone with `restore`.
 
 The script runs in the folder root with:
 
@@ -237,7 +245,8 @@ The script runs in the folder root with:
 | `KEEPSYNC_ORIGINAL` | Absolute path of the current file |
 | `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
 | `KEEPSYNC_CONFLICT_NODE` | Name of the node whose change lost, else its short device ID |
-| `KEEPSYNC_BASE` | A temp file with the last kept version, for a three-way merge, or empty if there is none |
+| `KEEPSYNC_BASE` | A temp file with the common ancestor of both versions, for a three-way merge, or empty if there is none |
+| `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor; `0` if it is only the last kept version, a guess |
 
 To resolve, write the result to `$KEEPSYNC_ORIGINAL`, delete `$KEEPSYNC_CONFLICT` and exit 0. A non-zero exit, a timeout, or a copy left in place leaves the conflict for you.
 
@@ -246,7 +255,7 @@ A minimal hook that uses `git merge-file`:
 ```sh
 #!/bin/sh
 set -e
-[ -n "$KEEPSYNC_BASE" ] || exit 1   # no base: leave it for a human
+[ "$KEEPSYNC_BASE_EXACT" = 1 ] || exit 1   # no reliable base: leave it for a human
 git merge-file "$KEEPSYNC_ORIGINAL" "$KEEPSYNC_BASE" "$KEEPSYNC_CONFLICT"
 rm "$KEEPSYNC_CONFLICT"
 ```

@@ -38,13 +38,14 @@ Node:
   node run                             run the node
   status                               server connection, peers, folders
   folder add <name> <path>             create a synced folder
-  folder join <name> <path> [--merge] attach an existing folder here;
+  folder join <name> <path> [--merge]
+                                       attach an existing folder here;
                                        --merge if <path> already has files
   folder ls                            list folders
   folder rm <name>                     stop syncing a folder here (files stay)
   keep <folder> [--grace 48h] [--max-defer 7d] [--expire 30d]
                                        mark a folder kept
-  keep status <folder>                 files in grace, kept, expirable
+  keep status <folder> [-v]            files in grace, kept, expirable
   unkeep <folder>                      stop keeping a folder; the archive stays
   conflicts                            list conflict copies and hook state
   conflicts resolve <path>             run the conflict hook now, on this node
@@ -54,7 +55,7 @@ Node:
   gateway config [--path <file>]       point Perkeep tools at this node's gateway
 
 Any:
-  recover <kit>                        rebuild the server from the bucket
+  recover <kit> [--mode store|cache]   rebuild the server from the bucket
   recover <kit> --drill --bucket <copy> [--baseline <file>]
                                        restore a bucket copy and check it
 
