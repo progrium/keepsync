@@ -438,7 +438,7 @@ Every package has unit tests against the fakes in `internal/api/fake`.
 - `recover --drill`
 - keeper reassignment
 
-With `KEEPSYNC_ZEROFS_BIN` and `KEEPSYNC_MINIO_BIN` set, it runs against a real ZeroFS and MinIO; without them those steps skip. `KEEPSYNC_E2E_MODE` picks the server's mode (`store` or `cache`). A check for a known, still-open bug logs instead of failing unless `KEEPSYNC_E2E_KNOWN_BUGS=1`. All steps pass against ZeroFS 2.3.7 and MinIO.
+With `KEEPSYNC_ZEROFS_BIN` and `KEEPSYNC_MINIO_BIN` set, it runs against a real ZeroFS and MinIO; without them those steps skip. `KEEPSYNC_E2E_MODE` picks the server's mode (`store` or `cache`). All steps pass, with no known bugs, against ZeroFS 2.3.7 and MinIO.
 
 Not yet measured: keep throughput, bucket write operations and restore time on a real 30 GB set.
 
