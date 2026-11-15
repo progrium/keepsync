@@ -840,6 +840,17 @@ func TestCluster(t *testing.T) {
 			out, _ := exec.Command("pgrep", "-f", "run --config "+cfgPath).Output()
 			return strings.TrimSpace(string(out))
 		}
+		// In store mode, a file kept since the last flush: its blobs are
+		// only in zerofs's memory, so the kill loses them, and the server
+		// must copy them back from local disk; recover-drill checks the
+		// bucket has it. In cache mode the server puts back the claims it
+		// signed (TestCacheModePutsBackLostSignedBlobs), but lost content
+		// comes back only when the keeper puts the file again before
+		// expiring it, so the drill would not find it here.
+		if e2eMode() == "store" {
+			a.write("docs", "before-kill.txt", "kept just before zerofs was killed")
+			eventually(t, time.Minute, "before-kill.txt kept", func() error { return wantState(a, "docs", "before-kill.txt", keeper.StateKept) })
+		}
 		pid := pidOf()
 		if pid == "" || strings.Contains(pid, "\n") {
 			t.Fatalf("zerofs pid %q", pid)
