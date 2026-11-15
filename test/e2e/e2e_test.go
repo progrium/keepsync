@@ -393,15 +393,8 @@ func TestCluster(t *testing.T) {
 
 		for _, n := range nodes() {
 			eventually(t, 2*syncTimeout, "merge reaches "+n.name, func() error {
-				b, err := os.ReadFile(n.path("notes", "f.txt"))
-				if err != nil {
+				if err := n.hasContent("notes", "f.txt", "from "+hookN.name+"\nfrom "+loser.name+"\n"); err != nil {
 					return err
-				}
-				// The winning side, then the losing side once per conflict
-				// copy the hook merged (see the known bug below).
-				rest, ok := strings.CutPrefix(string(b), "from "+hookN.name+"\n")
-				if !ok || rest == "" || strings.ReplaceAll(rest, "from "+loser.name+"\n", "") != "" {
-					return fmt.Errorf("f.txt on %s holds %q", n.name, b)
 				}
 				if cps := copies(n, "notes", "f.sync-conflict-*"); len(cps) > 0 {
 					return fmt.Errorf("conflict copies on %s: %v", n.name, cps)
@@ -419,18 +412,12 @@ func TestCluster(t *testing.T) {
 				t.Errorf("hook run %q is not on %s (Keepers[0])", r, hookN.name)
 			}
 		}
-		ncopies := len(runs)
-		if ncopies > 1 {
-			merged, _ := os.ReadFile(hookN.path("notes", "f.txt"))
-			knownBug(t, "one conflict made %d conflict copies of the same losing version (on different nodes), and the hook ran for each, so f.txt holds %q", ncopies, merged)
+		// One conflict makes one copy, so the hook runs once.
+		const ncopies = 1
+		if len(runs) != ncopies {
+			t.Fatalf("hook runs for f.txt: %q, want exactly one", runs)
 		}
-		// With one copy, every check is strict. With the duplicate copies
-		// above, the later run sees the first merge, so its checks are
-		// reported with the known bug.
 		check := t.Errorf
-		if ncopies > 1 {
-			check = func(format string, args ...any) { t.Helper(); knownBug(t, format, args...) }
-		}
 		for _, r := range runs {
 			f := strings.Fields(r)
 			if len(f) < 7 {
@@ -445,10 +432,7 @@ func TestCluster(t *testing.T) {
 				check("hook run %q: want KEEPSYNC_BASE_EXACT=1", r)
 			}
 			if f[3] != loser.name {
-				// With three nodes, the copy can be made on a node that
-				// neither made the losing change nor won, and the copy's
-				// ModifiedBy names that node.
-				knownBug(t, "hook run %q: KEEPSYNC_CONFLICT_NODE is %q, want %q, whose change the copy holds", r, f[3], loser.name)
+				check("hook run %q: KEEPSYNC_CONFLICT_NODE is %q, want %q, whose change the copy holds", r, f[3], loser.name)
 			}
 			if b, err := os.ReadFile(filepath.Join(c.root, "hookbase-"+hookN.name+"-"+f[6])); err != nil || string(b) != "base\n" {
 				check("hook run %q: KEEPSYNC_BASE held %q (%v), want the last kept version", r, b, err)
@@ -782,7 +766,7 @@ func TestCluster(t *testing.T) {
 				t.Fatalf("d.txt deleted by hand is marked %q, want %q", g, api.GoneDeleted)
 			}
 			if g := mark("d-old.txt"); g != string(api.GoneDeleted) {
-				knownBug(t, "d-old.txt, deleted by hand past the expire window but never durable (so never expired), is marked %q, so a plain restore brings it back", g)
+				t.Errorf("d-old.txt, deleted by hand past the expire window but never durable (so never expired), is marked %q, want %q", g, api.GoneDeleted)
 			}
 			c.flush("")
 			for _, n := range nodes() {

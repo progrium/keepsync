@@ -50,20 +50,6 @@ import (
 	"github.com/progrium/keepsync/internal/zerofs"
 )
 
-// knownBugEnv turns known bugs from log lines into failures.
-const knownBugEnv = "KEEPSYNC_E2E_KNOWN_BUGS"
-
-// knownBug reports a bug that is known and not fixed yet: a failure with
-// KEEPSYNC_E2E_KNOWN_BUGS=1, else a log line, so the suite stays green.
-func knownBug(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv(knownBugEnv) != "" {
-		t.Errorf("known bug: "+format, args...)
-		return
-	}
-	t.Logf("KNOWN BUG (set %s=1 to fail on it): "+format, append([]any{knownBugEnv}, args...)...)
-}
-
 // binary finds a required external binary, or skips the test.
 func binary(t *testing.T, env, name string) string {
 	t.Helper()
