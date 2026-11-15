@@ -42,8 +42,23 @@ const replicaName = "zerofs"
 // in-process or over tailcat, so the host is never resolved.
 const baseURL = "http://perkeep.keepsync"
 
+// Storage modes (Config.Mode).
+const (
+	// ModeStore keeps every blob on local disk (packRelated) and replicates
+	// it asynchronously to diskpacked on ZeroFS. Reads are local.
+	ModeStore = "store"
+	// ModeCache has no local blob storage: perkeepd's primary storage is
+	// the diskpacked store on ZeroFS, so local disk holds only ZeroFS's
+	// cache. The index, the identity and perkeepd's small queues and
+	// caches stay in Dir. The bucket holds the same diskpacked layout in
+	// both modes.
+	ModeCache = "cache"
+)
+
 // Config configures a Server.
 type Config struct {
+	// Mode is ModeStore (the default, also for "") or ModeCache.
+	Mode string
 	// Dir holds the identity, the local blob storage and the index. It must
 	// not be on ZeroFS.
 	Dir string
@@ -196,14 +211,9 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	// that somehow arrive without one: give those a password nobody has.
 	pw := make([]byte, 16)
 	rand.Read(pw)
-	high := HighLevelConfig(cfg.Dir, cfg.ZeroFS.Dir(), id.KeyID, "userpass:keepsync:"+hex.EncodeToString(pw))
-	raw, err := json.Marshal(high)
+	pkconf, err := loadConfig(cfg.Mode, cfg.Dir, cfg.ZeroFS.Dir(), id.KeyID, "userpass:keepsync:"+hex.EncodeToString(pw))
 	if err != nil {
 		return nil, err
-	}
-	pkconf, err := serverinit.Load(raw)
-	if err != nil {
-		return nil, fmt.Errorf("pkserver: perkeepd config: %w", err)
 	}
 	mux := http.NewServeMux()
 	s.shutdown, err = pkconf.InstallHandlers(mux, baseURL)
@@ -230,7 +240,12 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		s.Close()
 		return nil, err
 	}
-	s.replica, err = s.newClient("/sto-" + replicaName + "/")
+	if s.cacheMode() {
+		// The primary storage is the diskpacked store on ZeroFS.
+		s.replica = s.bs
+	} else {
+		s.replica, err = s.newClient("/sto-" + replicaName + "/")
+	}
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -249,6 +264,66 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		})
 	}
 	return s, nil
+}
+
+func (s *Server) cacheMode() bool { return s.cfg.Mode == ModeCache }
+
+// CheckMode reports an unknown mode.
+func CheckMode(mode string) error {
+	switch mode {
+	case "", ModeStore, ModeCache:
+		return nil
+	}
+	return fmt.Errorf("pkserver: unknown mode %q (want %s or %s)", mode, ModeStore, ModeCache)
+}
+
+// loadConfig builds the perkeepd config for mode. Store mode is
+// HighLevelConfig as is. Cache mode starts from the same config's low-level
+// form and makes the diskpacked store on ZeroFS the primary blob storage
+// (/bs/), dropping the local blob storage and the replication to ZeroFS.
+// Everything else that genconfig puts in the local blob dir (the index
+// sync queue, the thumbnail cache and its metadata, the importer cache)
+// stays local, so the mount sees only blob writes and diskpacked's own
+// index.
+func loadConfig(mode, dir, replicaDir, keyID, authSpec string) (*serverinit.Config, error) {
+	if err := CheckMode(mode); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(HighLevelConfig(dir, replicaDir, keyID, authSpec))
+	if err != nil {
+		return nil, err
+	}
+	conf, err := serverinit.Load(raw)
+	if err != nil {
+		return nil, fmt.Errorf("pkserver: perkeepd config: %w", err)
+	}
+	if mode != ModeCache {
+		return conf, nil
+	}
+	low := conf.LowLevelJSONConfig()
+	prefixes, ok := low["prefixes"].(map[string]any)
+	if !ok {
+		return nil, errors.New("pkserver: perkeepd config has no prefixes")
+	}
+	sto := "/sto-" + replicaName + "/"
+	replica, ok := prefixes[sto]
+	if !ok {
+		return nil, fmt.Errorf("pkserver: perkeepd config has no %s", sto)
+	}
+	prefixes["/bs/"] = replica
+	for _, p := range []string{sto, "/sync-to-" + replicaName + "/", "/bs-loose/", "/bs-packed/"} {
+		delete(prefixes, p)
+	}
+	delete(low, "_knownkeys")
+	raw, err = json.Marshal(low)
+	if err != nil {
+		return nil, err
+	}
+	conf, err = serverinit.Load(raw)
+	if err != nil {
+		return nil, fmt.Errorf("pkserver: perkeepd cache-mode config: %w", err)
+	}
+	return conf, nil
 }
 
 func readIdentity(dir string) (Identity, error) {

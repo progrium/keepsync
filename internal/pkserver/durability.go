@@ -232,7 +232,13 @@ func (s *Server) Flush(ctx context.Context) error {
 // Drain waits until the asynchronous replication to the diskpacked replica
 // has copied everything it has queued, so that a Flush after it puts every
 // blob stored so far in the bucket. A clean stop is Drain, Flush, Close.
+//
+// In cache mode blobs are written straight to ZeroFS, so there is nothing
+// to drain.
 func (s *Server) Drain(ctx context.Context) error {
+	if s.cacheMode() {
+		return nil
+	}
 	prefix := "/sync-to-" + replicaName + "/"
 	for {
 		n, err := s.syncBacklog(ctx, prefix)

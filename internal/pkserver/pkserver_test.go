@@ -32,7 +32,9 @@ type env struct {
 	dir    string
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { t.Helper(); return newEnvMode(t, ModeStore) }
+
+func newEnvMode(t *testing.T, mode string) *env {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -48,7 +50,7 @@ func newEnv(t *testing.T) *env {
 	e.server = nw.Transport("server")
 	e.node = nw.Transport("node")
 	e.server.Allow(e.node.Key())
-	srv, err := Start(ctx, Config{Dir: e.dir, ZeroFS: e.zfs, Transport: e.server, Logf: t.Logf})
+	srv, err := Start(ctx, Config{Mode: mode, Dir: e.dir, ZeroFS: e.zfs, Transport: e.server, Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -980,5 +982,73 @@ func TestRestoreAfterExpiryClearsMark(t *testing.T) {
 	k.checkCache()
 	if h, err := k.srv.History(ctx, k.root, "r/f"); err != nil || len(h) != 1 {
 		t.Errorf("history after restores: %v %v, want the one content version", h, err)
+	}
+}
+
+func TestCacheMode(t *testing.T) {
+	ctx := context.Background()
+	e := newEnvMode(t, ModeCache)
+	files := t.TempDir()
+	body := strings.Repeat("cache mode ", 20000)
+	ref, err := e.putter.PutFile(ctx, writeFile(t, files, "a.txt", body, time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pn, err := e.srv.NewPermanode(ctx, "photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: "a.txt", File: ref, ModTime: time.Now()}); err != nil || r != api.ClaimWritten {
+		t.Fatalf("claim: %v, %v", r, err)
+	}
+
+	// Nothing durable before a flush; Drain has nothing to wait for.
+	if d, err := e.srv.Durable(ctx, []api.BlobRef{ref}); err != nil || d[0] {
+		t.Fatalf("before flush: %v, %v", d, err)
+	}
+	if err := e.srv.Drain(ctx); err != nil {
+		t.Fatalf("Drain in cache mode: %v", err)
+	}
+	if err := e.srv.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := e.srv.Durable(ctx, []api.BlobRef{ref}); err != nil || !d[0] {
+		t.Fatalf("after flush: %v, %v", d, err)
+	}
+
+	// The blobs are in diskpacked packs on ZeroFS, and none on local disk.
+	packs, _ := filepath.Glob(filepath.Join(e.zfs.Dir(), "pack-*.blobs"))
+	if len(packs) == 0 {
+		t.Fatal("no diskpacked packs on ZeroFS")
+	}
+	var local int64
+	filepath.Walk(e.dir, func(p string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() && strings.HasPrefix(fi.Name(), "sha224-") {
+			local += fi.Size()
+		}
+		return nil
+	})
+	if local > 0 {
+		t.Fatalf("%d bytes of loose blobs on local disk in cache mode", local)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "blobs", "packed")); err == nil {
+		t.Fatal("packRelated storage created on local disk in cache mode")
+	}
+
+	// And they read back through the primary storage.
+	paths, err := e.srv.Paths(ctx, pn)
+	if err != nil || paths["a.txt"].File != ref {
+		t.Fatalf("paths %v, %v", paths, err)
+	}
+}
+
+func TestCheckMode(t *testing.T) {
+	for _, m := range []string{"", ModeStore, ModeCache} {
+		if err := CheckMode(m); err != nil {
+			t.Errorf("%q: %v", m, err)
+		}
+	}
+	if err := CheckMode("mirror"); err == nil {
+		t.Error("unknown mode accepted")
 	}
 }
