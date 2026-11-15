@@ -198,7 +198,7 @@ func TestCluster(t *testing.T) {
 
 	step("expiry-gated-on-durability", func(t *testing.T) {
 		addFolder(t, a, "photos", b, cc)
-		keep(t, a, "photos", node.KeepParams{Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: 20 * time.Second})
+		keep(t, a, "photos", node.KeepParams{Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: time.Minute})
 		old := time.Now().Add(-time.Hour)
 		a.write("photos", "old.jpg", "old photo")
 		if err := os.Chtimes(a.path("photos", "old.jpg"), old, old); err != nil {
@@ -337,7 +337,7 @@ func TestCluster(t *testing.T) {
 		}
 		// Keeping again continues the same tree.
 		var kr node.KeepResult
-		if err := a.call(node.MethodKeep, node.KeepParams{Folder: "photos", Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: 20 * time.Second}, &kr); err != nil {
+		if err := a.call(node.MethodKeep, node.KeepParams{Folder: "photos", Grace: 2 * time.Second, MaxDefer: 4 * time.Second, Expire: time.Minute}, &kr); err != nil {
 			t.Fatalf("keep again: %v", err)
 		}
 		if kr.Permanode != res.Archive {
@@ -840,17 +840,14 @@ func TestCluster(t *testing.T) {
 			out, _ := exec.Command("pgrep", "-f", "run --config "+cfgPath).Output()
 			return strings.TrimSpace(string(out))
 		}
-		// In store mode, a file kept since the last flush: its blobs are
-		// only in zerofs's memory, so the kill loses them, and the server
-		// must copy them back from local disk; recover-drill checks the
-		// bucket has it. In cache mode the server puts back the claims it
-		// signed (TestCacheModePutsBackLostSignedBlobs), but lost content
-		// comes back only when the keeper puts the file again before
-		// expiring it, so the drill would not find it here.
-		if e2eMode() == "store" {
-			a.write("docs", "before-kill.txt", "kept just before zerofs was killed")
-			eventually(t, time.Minute, "before-kill.txt kept", func() error { return wantState(a, "docs", "before-kill.txt", keeper.StateKept) })
-		}
+		// A file kept since the last flush: its blobs are only in
+		// zerofs's memory, so the kill loses them. Store mode copies them
+		// back from local disk; in cache mode the server puts back the
+		// claims it signed, and the keeper puts the file again since the
+		// server doesn't report it durable. recover-drill checks the
+		// bucket has it.
+		a.write("docs", "before-kill.txt", "kept just before zerofs was killed")
+		eventually(t, time.Minute, "before-kill.txt kept", func() error { return wantState(a, "docs", "before-kill.txt", keeper.StateKept) })
 		pid := pidOf()
 		if pid == "" || strings.Contains(pid, "\n") {
 			t.Fatalf("zerofs pid %q", pid)
@@ -875,7 +872,11 @@ func TestCluster(t *testing.T) {
 		t.Logf("zerofs back %v after SIGKILL", time.Since(killed).Round(time.Millisecond))
 		a.write("docs", "after-restart.txt", "written after zerofs restarted")
 		eventually(t, time.Minute, "after-restart.txt kept", func() error { return wantState(a, "docs", "after-restart.txt", keeper.StateKept) })
-		c.flush("")
+		// The baseline reads every kept file back, so it passes once
+		// before-kill.txt's content is on the server again.
+		eventually(t, time.Minute, "baseline after the restart", func() error {
+			return c.serverCall(server.MethodBaseline, server.BaselineParams{Path: filepath.Join(c.root, "baseline-flush.json")}, nil)
+		})
 		eventually(t, time.Minute, "node summary says zerofs up", func() error {
 			ns, err := a.status()
 			if err != nil {
