@@ -176,7 +176,7 @@ Syncthing is embedded as a library, with folder membership driven by the registr
 
 ## Perkeep gateway
 
-Every node can expose the server's Perkeep on localhost, so stock Perkeep tools (web UI, `pk`, `pk-get`, `pk-mount`, the search API) work against the archive with no extra ports or DNS. Phase 1 is read-only. Signed writes come in phase 2.
+Every node can expose the server's Perkeep on localhost, so stock Perkeep tools (web UI, `pk`, `pk-get`, `pk-mount`, the search API) work against the archive with no extra ports or DNS. Only read-only access is planned now. Signed writes are future work.
 
 **How it works.** `node run` listens on `127.0.0.1:3179` (`gateway.listen` in node.toml, empty to disable) and proxies HTTP to the server's perkeepd over tailcat on `api.PortPerkeep`, reusing the tcnet round tripper. It binds to localhost only.
 
@@ -188,9 +188,9 @@ Every node can expose the server's Perkeep on localhost, so stock Perkeep tools 
 | --- | --- | --- |
 | `blobs` | Upload and fetch blobs (what the keeper needs) | Every node, by default |
 | `read` | `blobs` plus search, web UI, `pk-get`, `pk-mount` | `keepsync server grant <name> read` |
-| `write` (phase 2) | `read` plus signed claims through the server's signer | `keepsync server grant <name> write` |
+| `write` (future) | `read` plus signed claims through the server's signer | `keepsync server grant <name> write` |
 
-**Phase 2 writes.** The server keeps the only identity. Web UI edits already sign through the server's signing handler, so `write` scope just opens that handler. CLI tools such as `pk put` sign locally with their own key, and Perkeep does not honour a second signer's claims on the server's permanodes by default. Phase 2 therefore either proxies CLI signing to the server through the gateway, or has the server trust a second signer. One identity is preferred; this is an open question.
+**Future: signed writes.** The server keeps the only identity. Web UI edits already sign through the server's signing handler, so `write` scope just opens that handler. CLI tools such as `pk put` sign locally with their own key, and Perkeep does not honour a second signer's claims on the server's permanodes by default. A future design therefore either proxies CLI signing to the server through the gateway, or has the server trust a second signer. One identity is preferred; this is an open question.
 
 **Limits.** No scope can delete blobs. Purge stays a server-side admin step.
 
@@ -245,7 +245,7 @@ When the server is unreachable, sync keeps working and only keeping, expiry and 
 4. Recovery kit, `recover` and `--drill`.
 5. Conflict reporting and the conflict hook.
 6. ZeroFS 9P mode, and a native tailcat transport inside Syncthing.
-7. Perkeep gateway: read-only first, then signed writes.
+7. Perkeep gateway, read-only. Signed writes are future work, not scheduled.
 
 **Open questions**
 
