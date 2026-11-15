@@ -1,14 +1,14 @@
-# keepsync design
+# keepsync spec
 
-Status: draft, 2026-11-14
+Status: describes the code on `dev` as of 2026-11-15. Where the code differs from the original design, this document follows the code and says so. Work that is not built yet is listed under "Not built yet". One exception: the per-file permanode layout under "Kept tree layout" is in progress in `pkserver`; until it lands, the signer sets `camliPath:<path>` on the root permanode straight to filerefs.
 
 ## Overview
 
-keepsync is one Go binary that keeps a set of folders synced across machines with embedded Syncthing, and archives them for the long term in Perkeep, replicated through ZeroFS to any S3-compatible bucket (R2, S3, MinIO and so on). Nodes and the server reach each other over tailcat, so nothing needs a public IP, open ports or DNS.
+keepsync is one Go binary. It keeps a set of folders synced across machines with embedded Syncthing, and archives them in Perkeep. Perkeep's blobs are replicated through ZeroFS to any S3-compatible bucket (R2, S3, MinIO and so on). Nodes and the server reach each other over tailcat, so nothing needs a public IP, open ports or DNS.
 
 **Goals**
 
-- A synced folder can be a recent subset (say the last 30 days) of a permanent archive, with no file ever lost by expiry.
+- A synced folder can be a recent subset (say the last 30 days) of a permanent archive, and expiry never loses a file.
 - Everything needed to rebuild the server from the bucket fits in one encrypted recovery kit.
 - Joining a node is one command plus approval on the server.
 - Prove out embedding Syncthing as a library.
@@ -16,23 +16,23 @@ keepsync is one Go binary that keeps a set of folders synced across machines wit
 **Non-goals**
 
 - Replacing Syncthing's sync engine or conflict detection.
-- Physical deletion from the archive as a normal operation (purge is a rare manual admin step).
+- Physical deletion from the archive as a normal operation.
 
 ## Architecture
 
-One binary plays two roles. Every host runs `keepsync node`. One host runs `keepsync server`, which holds Perkeep, ZeroFS and the registry. Nodes never touch ZeroFS or the bucket, and they reach the server only through tailcat.
+One binary plays two roles. Every host runs `keepsync node run`. One host runs `keepsync server run`, which holds Perkeep, ZeroFS and the registry. Nodes never touch ZeroFS or the bucket, and they reach the server only through tailcat. One machine can run both roles, because each role has its own directory.
 
 ```
  +---------------------------+                         +---------------------------+
  | Node A                    |  Syncthing over tailcat | Node B                    |
  |  embedded Syncthing       |<----------------------->|  embedded Syncthing       |
  |  keeper: grace/keep/expire|     direct or DERP      |  keeper: grace/keep/expire|
- |  tailcat listener :22000  |                         |  tailcat listener :22000  |
+ |  gateway 127.0.0.1:3179   |                         |  gateway 127.0.0.1:3179   |
  +-------------+-------------+                         +-------------+-------------+
                |   register, upload blobs, request claims (tailcat)  |
                v                                                     v
         +--------------------------------------------------------------------+
-        | keepsync server (Linux, macOS, FreeBSD)                            |
+        | keepsync server                                                    |
         |   +-------------+      +-----------------+      +----------------+ |
         |   | registry :1 | ---> | perkeepd :3179  | ---> | ZeroFS         | |
         |   | members     |      | signs claims    |      | diskpacked, 9P | |
@@ -45,11 +45,55 @@ One binary plays two roles. Every host runs `keepsync node`. One host runs `keep
                                                           +----------------+
 ```
 
-Syncthing traffic runs node to node. The server is only on the path for membership, keeping and recovery, so sync carries on when it is down. The code is a Go library package (`keepsync`) plus a thin `cmd/keepsync`.
+Syncthing traffic runs node to node. The server is only on the path for membership, keeping and recovery, so sync carries on while it is down.
+
+**Code layout.** `cmd/keepsync` is the CLI. The packages under `internal/` each implement one or more interfaces from `internal/api`, and depend on each other only through those interfaces. `internal/api/fake` has test doubles for all of them.
+
+| Package | Does |
+| --- | --- |
+| `api`, `api/fake` | Shared types and interfaces, and fakes for tests |
+| `tcnet` | `api.Transport` on tailcat |
+| `registry` | Registry server and client (members, folders, keepers, claims) |
+| `pkserver` | Embedded perkeepd, the signer, durability watermark and node scopes |
+| `zerofs` | ZeroFS pin, download and supervisor |
+| `syncer` | Embedded Syncthing |
+| `keeper` | Keep loop, expiry and `keep status` |
+| `gateway` | Local read-only Perkeep gateway on a node |
+| `kit` | Recovery kit, recover and drill |
+| `config`, `ctl` | On-disk config and the control socket |
+| `server`, `node` | Wiring for each role |
+
+## Directories and config
+
+The base directory is `--dir`, else `$KEEPSYNC_DIR`, else `$XDG_DATA_HOME/keepsync`, else `~/.local/share/keepsync`. The server lives in `<base>/server` and the node in `<base>/node`. Config files are TOML, owner-only, because `server.toml` holds the bucket credentials and the ZeroFS password.
+
+**Server directory**
+
+| Path | Holds |
+| --- | --- |
+| `server.toml` | `[network]` (DERP map, region), `[storage]` (bucket URL, endpoint, region, keys, `allow_http`), `[zerofs]` (binary, password, mount mode, mount dir, cache sizes), `flush_interval` (default 1m) |
+| `tailcat.key.json` | The server's tailcat identity |
+| `perkeep/` | Perkeep identity, local blobs (`packRelated`), `index.leveldb` |
+| `zerofs/` | ZeroFS config, cache, sockets, default mount point `zerofs/mnt`, and keepsync's own copy of the binary |
+| `registry.json` | Registry state |
+| `ctl.sock` | Control socket |
+
+**Node directory**
+
+| Path | Holds |
+| --- | --- |
+| `node.toml` | `name`, `server` (tc address), `[network]`, `keep_interval` (default 5m), `[gateway] listen` (default `127.0.0.1:3179`, empty disables), `conflict_hook` (read, not used yet), and `[[folder]]` entries (name, path, Syncthing folder ID) |
+| `tailcat.key.json` | The node's tailcat identity |
+| `syncthing/` | Device certificate, `config.xml`, the `index-v2` SQLite index |
+| `membership.json` | The last membership seen, so the node syncs with known peers when it starts while the server is unreachable |
+| `gateway-token` | The gateway's local token |
+| `ctl.sock` | Control socket |
+
+**Control socket.** `init`, `run` and `recover` work standalone. Every other command talks to the running process over `ctl.sock`: JSON over HTTP on a Unix socket, one POST to `/<method>` per call.
 
 ## Networking over tailcat
 
-Every keepsync process runs one `tailcat.Server` and dispatches incoming connections by virtual port with `OnTCP(port)`. Clients reach a service with `DialTCPPort(port)`, which returns a `net.Conn`. No service listens on a real port.
+Every keepsync process runs one tailcat server and dispatches incoming connections by virtual port. Nothing listens on a real port except the node's gateway on loopback and Syncthing's loopback bridge.
 
 | Virtual port | Service | Where |
 | --- | --- | --- |
@@ -57,214 +101,252 @@ Every keepsync process runs one `tailcat.Server` and dispatches incoming connect
 | 3179 | perkeepd HTTP | Server |
 | 22000 | Syncthing BEP | Every node |
 
-**Bootstrap.** A node needs only the server's `tc…` address. DNS TXT is an optional convenience: `node init` resolves it once and saves the real address. Publishing the address is safe only because the server allow-lists node keys.
+**Identity and allow lists.** A process is identified by its server key (`nodekey:…`). Each transport keeps its own allow list, and only allowed keys can connect. The server allows approved nodes, and a node allows its current peers and the server. Handlers see the authenticated key of the remote end.
+
+**Dial keys.** A process does not dial with its server key. Several tailcat clients sharing one key fight over DERP routing (in a three-peer test, concurrent dials took up to 7 s with a shared key against 1 s with distinct keys). So the dial key for each (dialer, target) pair is derived from an X25519 exchange between their server keys. The target can derive the same public key, so allowing an identity admits exactly the key that identity dials it with, and nobody else can compute it.
+
+**Relays.** Traffic goes direct when NAT traversal works and falls back to DERP otherwise. tailcat's public DERP relays are rate-limited, so for real sync volumes the user may run their own `derper` and pass `--derp-map` (URL or local JSON file) and `--derp-region` to `server init` and `node init`.
+
+**Bootstrap.** A node needs only the server's `tc…` address. `node init --server` also accepts a DNS name whose TXT record holds the address, bare or as `keepsync=tc…`. It is resolved once at init and the address is saved. Publishing the address is safe because the server allow-lists node keys.
 
 **Join flow**
 
-1. `keepsync server init` creates a saved tailcat key (region pinned to the user's derper if they run one) and prints the server address.
-2. `keepsync node init --server tc…` writes the node's config, its tailcat key and its Syncthing device cert, prints the node key, and exits.
-3. `keepsync server add <nodekey>` puts the key on the server's allow list. The allow list is the membership list.
-4. `keepsync node run` starts the node's tailcat listener (port 22000 to Syncthing) and embedded Syncthing with global discovery, local discovery and relays off. It registers `{nodekey, tc address, device ID}` on port 1 and receives the member list and its folder assignments over a held-open connection.
-5. For each peer, the node adds the peer's key to its own allow list, opens a `tailcat.Client` to the peer, and adds the peer as a Syncthing device. If two nodes dial each other at once, Syncthing drops the duplicate connection.
+1. `keepsync server init --bucket <url>` creates the server and prints its address.
+2. `keepsync node init --server tc…` writes the node's config, tailcat key and Syncthing device certificate. It prints the device ID, the node key and the `server add` command to run, then exits. It needs no network except for a DNS lookup.
+3. `keepsync server add <nodekey> [--name]` approves the node. The approved nodes are the allow list.
+4. `keepsync node run` starts tailcat and Syncthing, then registers `{name, key, address, device ID}` with the registry and watches the membership over a held-open connection.
+5. For each peer, the node allows the peer's key and adds it as a Syncthing device.
 
-**Syncthing transport.** First version: Syncthing binds to localhost and a small bridge connects it to tailcat on both sides. Target: a `tailcat` dialer and listener registered inside Syncthing's connection layer. That is an internal API, so it is part of proving out embedding.
+## Registry
 
-**Relays.** Traffic goes direct when NAT traversal works and falls back to DERP when it does not. tailcat's free DERP relays are rate-limited, so the docs recommend running your own `derper` for real sync volumes. That choice is the user's.
+The registry runs on the server on port 1. It holds the approved nodes, folders, keep policies, keeper assignments and node scopes.
+
+**Wire protocol.** Each side writes a stream of JSON values. Requests carry an ID and responses can arrive in any order, so one connection carries many concurrent calls. A `watch` request turns its connection into a stream: the current membership, then one response per change. The caller's identity is always the tailcat key of the connection, never a request field.
+
+**Heartbeat.** The server pings every connection every 10 s, and the client answers with a pong. Either side drops a connection that has been silent for 30 s, because a tailcat connection to a vanished peer never resets. So a node stops counting as online within 30 s of going silent.
+
+**Folders.** `folder add` creates a folder with a random Syncthing-style ID (`abcde-fghij`) and makes the caller its first member. `folder join` adds the caller to an existing folder. `folder rm` calls LeaveFolder, which removes the node from the folder's members and keepers. Files on disk stay.
+
+**Keepers.** Each kept folder gets up to two keepers, chosen from its connected members, with send-receive nodes ahead of receive-only ones. A keeper disconnected for 2 minutes is replaced if another connected member can take over. `Keepers[0]` stays first while it is healthy; it is the node meant to run the conflict hook.
+
+**Claims and durability.** The registry forwards `ClaimPath`, `Paths`, `PathsAt` and `Durable` to the server's signer and durability watermark. It only allows them on permanodes of folders the calling node is a member of.
+
+**Persistence.** The state is saved to `registry.json` before each change is published. Each save is also mirrored to `.keepsync/registry.json` on the ZeroFS mount, so the next flush carries it to the bucket for recovery. (The original design stored registry state in Perkeep. This JSON file plus bucket mirror replaces that.)
 
 ## Keep server
 
-The server runs perkeepd with local blob storage and a `diskpacked` replica on ZeroFS, which persists to an S3-compatible bucket. It is the only machine that holds the Perkeep identity key, and the only one that runs ZeroFS. It runs on Linux, macOS or FreeBSD, because ZeroFS ships no Windows build. Nodes can run anywhere.
+The server runs perkeepd, configured like the proof of concept: `packRelated` local storage, a `diskpacked` storage named `zerofs` on the ZeroFS mount, and `replicateTo` it, which is an asynchronous sync handler. It is the only machine that holds the Perkeep identity key and the only one that runs ZeroFS.
 
-**Perkeep config** follows the current proof of concept: `packRelated: true` for local storage, a `diskpacked` storage at the ZeroFS directory, and `replicateTo` that storage, which sets up an asynchronous sync handler.
+**Startup and shutdown.** `server run` starts ZeroFS, waits for its sockets, mounts it, then starts perkeepd, the registry and the tailcat listener. On stop it drains the replication queue, flushes, closes perkeepd, then stops ZeroFS, which flushes again. A clean stop means everything is in the bucket.
 
-**ZeroFS, two modes.** Both write the same `diskpacked` on-disk format, so a bucket written by either mode can be read or restored by either.
+**ZeroFS.** keepsync pins ZeroFS v2.3.7 and checks SHA-256 for both the release tarball and the platform binary. Builds exist for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and freebsd/amd64. The binary is looked up as `--zerofs`, then on PATH, then in `zerofs/` in the server directory. If none is found, `server init` downloads the pin, unless `--no-download` is given. `run` never downloads. A binary that does not match the pin produces a warning, never an upgrade.
 
-1. **Mount mode (first).** `keepsync server run` generates the ZeroFS config, starts `zerofs`, mounts it **over 9P, not NFS** (ZeroFS reports NFS writes as stable while they are still buffered), waits for health, then starts perkeepd. On stop it drains the sync queue and flushes ZeroFS, so a clean stop means everything is in the bucket. Needs root to mount.
-2. **9P mode (later).** No mount and no root. A Perkeep blobserver writes `diskpacked` packs through a Go 9P client straight to ZeroFS's 9P listener. Most of the work is reimplementing diskpacked's writer on a 9P file handle instead of `os.File`.
+The supervisor writes `zerofs.toml` with 9P and RPC on private Unix sockets only, no NFS and telemetry off. Secrets go in the environment, never in the file. ZeroFS is always reached over 9P, because it reports NFS writes as stable while they are still buffered. The mount mode is set at init with `--mount`:
 
-**Getting ZeroFS.** Lookup order: `--zerofs` (flag or config), then `zerofs` on PATH, then keepsync's own copy in its data dir. If none is found, `server init` downloads the version pinned in keepsync's source and checks its SHA-256. `run` never downloads. There are no auto-upgrades, because the bucket's format is tied to the ZeroFS version. A binary that does not match the pin produces a warning.
+| Mode | How | Needs |
+| --- | --- | --- |
+| `fuse` (default) | ZeroFS's own 9P client (`zerofs mount`) through FUSE, as the current user. Reconnects if zerofs restarts. | Linux, `/dev/fuse`, `fusermount3`. No root. |
+| `v9fs` | The Linux kernel 9P client (`mount -t 9p`) | Linux, root, the `9p` and `9pnet_fd` modules |
+| `external` | Mounts nothing. The operator has mounted the 9P export at `--mount-dir`; keepsync checks it is a mount point, so it never writes to a plain local directory. | Any platform, including macOS and FreeBSD |
 
-**ZeroFS encryption password.** `server init` generates it (32 random bytes) and stores it in the server's config with owner-only permissions and in the recovery kit. Nobody types it. To adopt an existing bucket, such as the current proof of concept, `server init --zerofs-password-file <path>` imports the existing one instead.
+The original design said mount mode needs root. The FUSE mode removed that.
 
-**Signing.** Nodes upload file blobs, which are content-addressed and unsigned. They then ask the server over the registry API to keep a fileref at a path in a kept folder, and the server signs the claims (see "Kept tree layout"). The server writes nothing if the path already holds that ref, and accepts a new ref for a path only if its mtime is newer than the current one, so a lagging node cannot roll a file back.
+**ZeroFS password.** `server init` generates it from 32 random bytes and stores it in `server.toml` and the recovery kit. `--zerofs-password-file` adopts an existing bucket's password instead.
 
-**Durability watermark.** After each ZeroFS flush, the server records which blobs are now in the bucket. Nodes ask "are these refs durable?" before expiring anything. This is the blob verification tooling, built early because expiry depends on it.
+**Durability watermark.** Every `flush_interval` (default 1m) the server flushes ZeroFS. A blob is durable once it was seen in the diskpacked replica before a flush started, and that flush succeeded. Only blobs someone asked about are tracked: `Durable` queues the unseen ones, and each flush checks the queue against the replica first. A ref counts as durable only if its whole closure is: a file's parts, recursively; a claim's permanodes; and, for a claim or permanode, the server's public key, which a reindex needs to verify it. A ref the server doesn't have is not durable. `server status` shows the last flush, or that flushing is failing.
 
-**Registry state** (members, folders, assignments) is stored in Perkeep itself, so it comes back from the bucket on recovery.
+**Signing.** Nodes upload file blobs, which are content-addressed and unsigned. Then they ask the registry to keep a fileref at a path in a kept folder, and the server signs the claims (see "Kept tree layout"). Signing is serialised. The server writes nothing if the path already holds that ref (`ClaimUnchanged`), and rejects a ref whose mtime is not newer than the current one (`ClaimRejectedOlder`), so a lagging node cannot roll a file back. Claim dates strictly increase, so a later claim always wins, even within one clock tick.
+
+**Node scopes.** Every tunnelled connection to perkeepd is checked against the node's scope.
+
+| Scope | Allows | Granted by |
+| --- | --- | --- |
+| `blobs` (default) | Upload, stat and fetch blobs, plus discovery. Not sign, enumerate, search or remove. | Every node |
+| `read` | `blobs` plus search, the web UI, `pk-get` and `pk-mount` | `keepsync server grant <name> read` |
+
+The scope is stored on the node's registry record. No scope can sign or delete.
 
 ## Keeping and expiry
 
-A kept folder maps to one permanode whose tree only ever grows. Expiry removes files from the sync folder only after they are durable in the bucket. Each timer is measured from a file's mtime.
+A kept folder maps to one root permanode whose tree only ever grows. Expiry removes files from the sync folder only after they are durable in the bucket. Each timer is measured from a file's mtime.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `--grace` | 48h | A file must be unmodified this long before it is kept. Deletes and edits inside this window never reach the archive. |
+| `--grace` | 48h | A file must be unmodified this long before it is kept. Edits and deletes inside this window never reach the archive. |
 | `--max-defer` | 7d | Cap for files that never settle. Past it, the file is kept anyway, and again each time it hits the cap. |
-| `--expire` | 30d | The file is removed from sync on every node once unmodified this long and durable in the bucket. `0` or omitted means nothing expires. |
+| `--expire` | never | The file is removed from sync on every node once unmodified this long and durable. `0` or omitted means nothing expires. (The original design defaulted to 30d.) |
 
-The config is rejected unless grace < max-defer < expire.
+Durations accept Go syntax plus a `d` suffix. A policy is rejected unless grace < max-defer, and max-defer < expire when expire is set.
 
-**Mapping.** `keepsync keep <folder>` asks the server to create the permanode and writes its ref into a `.keepsync` file inside the folder. Syncthing carries that file to every node, so all nodes agree on the permanode.
+**Mapping.** `keepsync keep <folder>` asks the server to create the root permanode and writes its ref to a `.keepsync` file inside the folder. Syncthing carries that file to every node, so all nodes agree on the permanode.
 
 **Kept tree layout.** The tree uses Perkeep's own conventions, so the web UI, search and `pk-mount` show kept folders as ordinary directories:
 
-- The folder's root permanode has `title` and `camliRoot` set to the folder name, so it appears under `pk-mount`'s `roots/`.
+- The root permanode has `title` and `camliRoot` set to the folder name, so it appears under `pk-mount`'s `roots/`.
 - Every directory below the root has its own permanode. Its parent names it with `camliPath:<name> → dir permanode`.
 - Every file has its own permanode, with `camliContent → fileref` and `keepsyncMtime`. Its directory names it with `camliPath:<name> → file permanode`.
 
 Each change is one signed multi claim:
 
-- A changed file gets one claim on its permanode, setting `camliContent` and `keepsyncMtime` together. Nothing above it changes.
+- A changed file gets one claim on its permanode, which sets `camliContent` and `keepsyncMtime` together. Nothing above it changes.
 - A new file gets a new permanode, and one claim sets its content and mtime and names it in its directory. A missing directory gets a permanode too, named in the same claim.
 
-The server keeps the mtime rule per file permanode. A path is recoverable by name only when the fileref, the file's permanode and every claim and permanode from the root down to it are durable. The registry returns that set with each path entry, and expiry checks all of it. `PathsAt`, `restore --at` and `pk-mount`'s `at/` all fold the same claims as of a time.
+The mtime rule is checked per file permanode. A path is recoverable by name only when the fileref, the file's permanode and every claim and permanode from the root down to it are durable. The registry returns that set with each path entry (`PathEntry.Claims`), and expiry checks all of it. `PathsAt`, `restore --at` and `pk-mount`'s `at/` all fold the same claims as of a time.
 
-**The keeper loop**, every interval:
+**The keeper loop.** Each keeper node makes a pass right away and then every `keep_interval` (default 5m):
 
 1. Walk the folder, skipping excluded files.
-2. For each file past grace (or past max-defer), `pk-put` it. The stat cache makes unchanged files free, and blobs the server already has are not re-uploaded.
+2. Put each file past grace, or past max-defer, through Perkeep. A put cache makes unchanged files free, and blobs the server already has are not re-sent.
 3. Ask the server to keep the fileref at the file's path.
 4. A missing file is never translated into a delete.
 
-**Two keepers per folder.** The server assigns two keeper nodes per folder when available, for redundancy, and reassigns if one goes away. Running both is harmless, because the server deduplicates claims.
+Running two keepers is harmless, because the server deduplicates claims. max-defer is tracked in memory, so after a restart a never-settling file's cap is measured from the first version seen after the restart.
 
-**Expiry.** A file is removed from sync only if its current fileref is already in the tree and the server reports those blobs durable. If the server is unreachable, expiry pauses and sync folders grow past the window. That is the intended failure mode.
+**Expiry.** A pass then removes a file from sync once it is unmodified for the expire window, its current fileref and mtime are what the tree holds, and the server reports the whole recovery set durable. Before removing, the keeper re-checks the file's ref, so a same-mtime file with different content is not removed. If the server cannot answer, expiry pauses and sync folders grow past the window. That is the intended failure mode.
 
-**Excluded from keeping:** Syncthing temp files (`.syncthing.*.tmp`), `.stfolder`, `.stversions`, anything matched by `.stignore`, and an optional `.keepignore`. Conflict copies *are* kept (see Conflicts).
+**Excluded from keeping:** Syncthing temp files (`.syncthing.*.tmp`), `.stfolder`, `.stversions`, `.keepsync`, the ignore files themselves, anything matched by `.stignore`, and an optional `.keepignore`. The built-in matcher covers common `.stignore` syntax. Conflict copies are kept like any other file.
 
-**Deleting from keep** means a claim: `del-attribute` on `camliPath:<name>` in the parent directory's permanode, or a `delete` claim on a permanode. Both are reversible and history stays. Perkeep has no garbage collector, so physical deletion is `keepsync purge`, a rare manual admin step.
+**`keep status <folder>`** lists files as in grace (with when they will be kept), due, kept, lagging (the archive has a newer version), or expirable. It reports when durability is unknown.
 
-## Syncthing, conflicts and the conflict hook
+**Restore.** `keepsync restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]` reads kept files back from the server over tailcat, including expired ones:
 
-Syncthing is embedded as a library, with folder membership driven by the registry instead of introducers. Conflicts stay Syncthing's job, and keepsync adds archiving and an optional script hook.
+- It reads the current tree, or the tree as of `--at`. `--at` is when the server kept a version, not a file mtime. It takes RFC 3339, `YYYY-MM-DD[ HH:MM]` in local time, or an age such as `3d` or `12h`.
+- Files go back into the folder, or into `--to`, keeping their relative paths.
+- A local file with the kept size and mtime is left alone.
+- A local file that differs is skipped unless `--force` is given.
+- If a restored file is already past the folder's expire window, the result says so, because the next pass expires it again.
 
-**Folder types.** Every node defaults to send-receive. A folder can mark specific nodes receive-only, for mirrors that should never push changes. Syncthing file versioning (trash can or staggered) is recommended on kept folders, to cover files that have not passed grace yet.
+## Syncthing
 
-**Conflicts.** Syncthing writes `.sync-conflict-<date>-<device>` copies. keepsync reports them in `keepsync status` and `keepsync conflicts`. Conflict copies are kept in Perkeep under their own name, next to the original. After that they expire under the normal rule, so a losing version is never lost and unresolved conflicts do not pile up in sync.
+Syncthing v2.1.7 runs in-process through `lib/syncthing`. It is vendored and pruned in `third_party/syncthing`, wired in with a `go.mod` replace. Two reasons: the published module does not build as a library without generated GUI assets, and v2 has no importable module version. The only patch is a stub `gui.files.go`. `internal/syncer/README.md` lists the Syncthing internals touched and how stable each one is.
 
-**Conflict hook.** Configured as `conflict_hook = "/path/to/script"`, per folder or globally, so an LLM or any tool can resolve conflicts. The script receives:
+**Config.** Peers and folders come from the registry, never from introducers or a config file at startup. Global and local discovery, relays, NAT, usage and crash reporting, upgrades and the GUI are off.
 
-| Variable | Value |
-| --- | --- |
-| `KEEPSYNC_FOLDER` | Folder name |
-| `KEEPSYNC_ORIGINAL` | Path of the current file |
-| `KEEPSYNC_CONFLICT` | Path of the conflict copy |
-| `KEEPSYNC_CONFLICT_NODE` | Name of the node that made the conflicting change |
-| `KEEPSYNC_BASE` | Last kept version from Perkeep in a temp file (the common ancestor, for a three-way merge) |
+**Transport bridge.** Syncthing listens only on `127.0.0.1:<free port>`.
+- Inbound: the port 22000 handler checks the caller is a current peer, dials Syncthing's loopback listener and splices the two connections.
+- Outbound: each peer gets its own loopback listener, which is that device's only address in Syncthing's config, and each connection to it is dialed to the peer over tailcat.
 
-**Contract.** To resolve, the script writes the result to the original path, deletes the conflict copy, and exits 0. Syncthing syncs that like any other edit. A non-zero exit, or a conflict copy still in place, leaves it for a human. `keepsync conflicts resolve <path>` reruns the hook by hand.
+BEP's TLS runs end to end, so Syncthing still checks device IDs.
 
-**Hook safety**
+**Restarts.** On start, the syncer restores the previous run's folders and peers from `config.xml`. Without this, Syncthing would drop the index of any folder missing at startup, every file would be rescanned as a new version, and a delete on another node (such as expiry) would come back as a conflict copy.
 
-- Before the hook runs, keepsync keeps both versions immediately, skipping grace, so anything the hook does is recoverable.
-- Only one node runs the hook: the folder's first assigned keeper.
-- Hooks run one at a time per folder, with a timeout and a short debounce.
+**Folder types.** Every node defaults to send-receive. A folder's `ReceiveOnly` list marks nodes as receive-only.
 
-## Recovery kit
-
-`keepsync server init` writes an encrypted recovery kit holding everything needed to rebuild the server from the bucket that does not live in the bucket. `keepsync recover` uses it, and its drill mode is the recovery check.
-
-**Contents**
-
-- `keepsync` and the pinned `zerofs` binaries for the current platform.
-- S3 endpoint, region, bucket and credentials, ideally a read-only token. `recover` asks for write credentials only when actually standing the server back up.
-- ZeroFS encryption password, Perkeep identity secret key, perkeepd config.
-- The server's tailcat key, so a recovered server comes back at the same address and nodes reconnect without re-init.
-- `RECOVER.md` with the steps, plus checksums.
-
-**Encryption.** The kit can read all data and impersonate the server. It is written as `keepsync-recovery.zip.age` (age with a scrypt passphrase). The passphrase is shown once at init. The docs say to store the kit and the passphrase separately and offline, and never in the same bucket.
-
-**Commands**
-
-- `keepsync recover <kit>` mounts ZeroFS on the bucket, starts perkeepd with a fresh index and reindexes, then brings the server up with the same tailcat key.
-- `keepsync recover <kit> --drill --bucket <copy>` runs the same path against a copy of the bucket without taking over the identity. On R2 or S3, `rclone copy` makes the copy server-side with no egress cost. ZeroFS is single-writer, so the drill must never mount the live bucket while the server runs.
-- `keepsync server kit` regenerates the kit. It only goes stale when keys rotate or keepsync pins a new ZeroFS, because registry state lives in Perkeep.
-
-**What the drill checks**
-
-1. Blob check: diff the blobref lists of the live and restored servers, and read every restored blob so its hash is verified.
-2. File check: extract files from the restored server and compare sha256 against the originals.
-3. Index check: compare permanode counts and a few searches.
-4. Record restore time and bucket operation counts.
+**Conflicts.** Syncthing writes `.sync-conflict-<date>-<device>` copies. The node logs each conflict event, and conflict copies are kept in Perkeep and expire like any other file. Reporting conflicts and running the conflict hook are not built yet.
 
 ## Perkeep gateway
 
-Every node can expose the server's Perkeep on localhost, so stock Perkeep tools (web UI, `pk`, `pk-get`, `pk-mount`, the search API) work against the archive with no extra ports or DNS. Only read-only access is planned now. Signed writes are future work.
+Each node serves the server's Perkeep on `127.0.0.1:3179`, so stock Perkeep tools work against the archive with no extra ports or DNS. The gateway proxies HTTP to the server's perkeepd over tailcat on port 3179. A gateway that cannot start is logged, and the node runs without it.
 
-**How it works.** `node run` listens on `127.0.0.1:3179` (`gateway.listen` in node.toml, empty to disable) and proxies HTTP to the server's perkeepd over tailcat on `api.PortPerkeep`, reusing the tcnet round tripper. It binds to localhost only.
+**Local auth.** The gateway requires the per-node token in `gateway-token` as the password of HTTP basic auth, the way Perkeep's userpass auth sends it. `keepsync gateway config [--path]` writes a Perkeep client config that points at the gateway with that token. By default it writes Perkeep's own `client-config.json`.
 
-**Local auth.** The gateway requires a random per-node token (Perkeep userpass auth). `keepsync gateway config` writes a Perkeep client config pointing at the gateway with that token, so stock tools work without flags.
+What a node can reach through the gateway is its scope (see "Node scopes"). With `blobs`, the tools can fetch blobs by ref and nothing more. `read` opens search, the web UI, `pk-get` and `pk-mount`.
 
-**Access scopes.** The server grants each node a scope, and pkserver enforces it on every tunnelled connection, extending the per-connection grant it already applies to nodes.
+## Recovery kit
 
-| Scope | Allows | How it is granted |
-| --- | --- | --- |
-| `blobs` | Upload and fetch blobs (what the keeper needs) | Every node, by default |
-| `read` | `blobs` plus search, web UI, `pk-get`, `pk-mount` | `keepsync server grant <name> read` |
-| `write` (future) | `read` plus signed claims through the server's signer | `keepsync server grant <name> write` |
+`server init` writes an encrypted recovery kit holding everything needed to rebuild the server that does not live in the bucket. `server kit [--out]` regenerates it.
 
-**Future: signed writes.** The server keeps the only identity. Web UI edits already sign through the server's signing handler, so `write` scope just opens that handler. CLI tools such as `pk put` sign locally with their own key, and Perkeep does not honour a second signer's claims on the server's permanodes by default. A future design therefore either proxies CLI signing to the server through the gateway, or has the server trust a second signer. One identity is preferred; this is an open question.
+**Format.** `keepsync-recovery.zip.age`: a zip encrypted with age under a scrypt passphrase (work factor 2^18). The passphrase is generated, shown once and stored nowhere. Store the kit and the passphrase separately and offline, never in the same bucket.
 
-**Limits.** No scope can delete blobs. Purge stays a server-side admin step.
+**Contents**
+
+| Entry | Holds |
+| --- | --- |
+| `kit.json` | Format, creation time, platform, server address, Perkeep key ID, bucket location and credentials, ZeroFS password, pinned ZeroFS version and whether the bundled binary matches it |
+| `bin/keepsync`, `bin/zerofs` | The binaries for the current platform |
+| `perkeep/identity-secring.gpg`, `perkeep/perkeepd.json` | The Perkeep identity and config |
+| `tailcat/server.key` | The server's tailcat key, so a recovered server comes back at the same address |
+| `server/config`, `server/registry` | `server.toml`, and the registry as of the kit's creation |
+| `RECOVER.md`, `SHA256SUMS` | Steps and checksums |
+| `licenses/ZEROFS-LICENSE`, `licenses/ZEROFS-SOURCE` | ZeroFS's license and a link to the pinned source |
+
+**`keepsync recover <kit>`**
+
+1. Mounts ZeroFS on the kit's bucket.
+2. Starts perkeepd on fresh local storage and a fresh index.
+3. Copies every blob of the bucket's diskpacked replica into it, which reindexes them.
+4. Installs the tailcat key, config and registry. It prefers the registry mirrored in the bucket, and falls back to the kit's copy.
+
+Then `server run` brings the server back at the same address and nodes reconnect on their own. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. `--access-key`/`--secret-key` supply write credentials when the kit holds a read-only token, and `--mount` picks the mount mode. ZeroFS is single-writer, so never recover while the old server may still be running against the bucket.
+
+**Drill.** Run `keepsync server baseline <out.json>` on the live server first. It flushes and snapshots every blob, kept tree and file hash. Then copy the bucket (on R2 or S3, `rclone copy` copies server-side with no egress cost) and run `keepsync recover <kit> --drill --bucket <copy> --baseline <out.json>`. The drill runs the same restore without installing the identity, and checks:
+
+1. Blobs: every restored blob reads back and matches its hash, and every baseline blob was restored.
+2. Files: every kept file reads back with the baseline's SHA-256.
+3. Index: the index finds every permanode, and finds sample kept paths by search.
+4. Registry: where recovery would get the registry from. A registry only in the kit, or nowhere, is a warning.
+5. Timing: restore time, ZeroFS start time, and copy-and-reindex throughput.
+
+perkeepd runs once per process, so a live server, a recovered server and a drill each need their own process.
 
 ## CLI reference
 
-`init` and `run` commands work standalone. Every other command talks to the local running process over a control socket.
-
 | Command | Role | What it does |
 | --- | --- | --- |
-| `server init` | Server | Creates the tailcat key, perkeepd config and identity, and ZeroFS config. Fetches pinned ZeroFS if needed. Writes the recovery kit. Prints the server address. |
-| `server run` | Server | Supervises ZeroFS, perkeepd and the tailcat listener. Drains and flushes on stop. |
-| `server add <nodekey> [--name]` | Server | Approves a node (adds it to the allow list). |
+| `server init --bucket <url> [flags]` | Server | Creates the tailcat key, Perkeep identity and ZeroFS config, finds or downloads ZeroFS, writes the kit, prints the address. Flags: `--endpoint`, `--region`, `--access-key`, `--secret-key` (default `$AWS_*`), `--allow-http`, `--zerofs`, `--zerofs-password-file`, `--mount`, `--mount-dir`, `--no-download`, `--kit`, `--derp-map`, `--derp-region`. |
+| `server run` | Server | Supervises ZeroFS, perkeepd, the registry and tailcat. Drains and flushes on stop. |
+| `server add <nodekey> [--name]` | Server | Approves a node. The name defaults to the one the node registers with. |
 | `server remove <name>` | Server | Removes a node. |
 | `server nodes` | Server | Lists members. |
-| `server kit` | Server | Regenerates the recovery kit. |
-| `node init --server <tc… or name>` | Node | Writes config and keys, prints the node key, exits. |
-| `node run` | Node | Runs Syncthing, the keeper and expiry. |
-| `status` | Node | Server connection, peers (direct or DERP), per-folder sync state. |
-| `folder add <name> <path>` | Node | Creates a synced folder in the registry. |
-| `folder join <name> <path>` | Node | Attaches an existing folder on this node. |
-| `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here (files stay). |
+| `server status` | Server | Address, key, last flush or flush failure, folders. |
+| `server kit [--out]` | Server | Regenerates the recovery kit. |
+| `server baseline <out.json>` | Server | Flushes and snapshots the server for a drill. |
+| `server grant <name> <blobs\|read>` | Server | Sets a node's Perkeep scope. |
+| `node init --server <tc… or DNS name> [--name]` | Node | Writes config and keys, prints the node key, exits. The name defaults to the hostname. |
+| `node run` | Node | Runs tailcat, Syncthing, the keepers and the gateway. |
+| `status` | Node | Server connection (or how long it has been unreachable), peers, folders. |
+| `folder add <name> <path>` | Node | Creates a synced folder in the registry and attaches it here. |
+| `folder join <name> <path>` | Node | Attaches an existing folder here. |
+| `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here. Files stay. |
 | `keep <folder> [--grace] [--max-defer] [--expire]` | Node | Marks a folder kept. Creates the permanode and `.keepsync`. |
-| `unkeep <folder>` | Node | Stops keeping. The archive stays. |
-| `keep status <folder>` | Node | Files in grace, kept, and eligible to expire. |
-| `restore <folder> <path> [--at <time>]` | Node | Pulls files back out of Perkeep, including expired ones. |
-| `conflicts` / `conflicts resolve <path>` | Node | Lists conflicts, or reruns the hook. |
-| `recover <kit> [--drill --bucket <copy>]` | Any | Rebuilds the server from the bucket, or runs the drill. |
-| `server grant <name> <blobs\|read\|write>` | Server | Sets a node's Perkeep gateway scope. |
-| `gateway config` | Node | Writes a Perkeep client config pointing at the local gateway. |
-| `purge` (later) | Server | Rare manual physical delete. |
+| `keep status <folder> [-v]` | Node | Files in grace, kept, lagging and expirable. |
+| `restore <folder> [<path>] [--at] [--to] [--force]` | Node | Pulls kept files back, including expired ones. |
+| `gateway config [--path]` | Node | Writes a Perkeep client config for the local gateway. |
+| `recover <kit> [--drill --bucket <copy> --baseline <file>]` | Any | Rebuilds the server from the bucket, or runs the drill. |
 
-## Failure modes, testing and milestones
+`unkeep`, `conflicts` and `purge` exist as commands but report "not implemented yet".
 
-When the server is unreachable, sync keeps working and only keeping, expiry and membership changes wait. No failure path can expire a file that is not durable in the bucket.
+## Failure modes
+
+When the server is unreachable, sync keeps working, and only keeping, expiry and membership changes wait. No failure path can expire a file whose recovery set is not durable in the bucket.
 
 | Failure | Behaviour |
 | --- | --- |
-| Server unreachable | Syncing continues with the cached peer list. The keeper retries next interval (no queue to lose, the walk is idempotent). Expiry pauses. `status` flags it after a threshold. |
-| Keeper node gone | The server reassigns the folder's keeper. The second keeper keeps working meanwhile. |
-| Lagging keeper reports an older file | The server rejects refs whose mtime is not newer than the current one. |
-| tailcat or registry stream drops | The node reconnects and refetches the member list. |
-| Server lost | `keepsync recover <kit>` from the bucket. Same tailcat key, so nodes reconnect on their own. |
-| Conflict hook makes a bad merge | Both versions were kept before it ran, so restore from Perkeep. |
+| Server unreachable | Syncing continues with the cached peer list. The registry client reconnects with backoff. The keeper retries next interval; there is no queue to lose, because the walk is idempotent. Expiry pauses. `status` shows how long the server has been unreachable. |
+| Node never approved | `status` shows the `server add` command to run. |
+| Keeper node gone | After 2 minutes the server reassigns its keeper role. The second keeper keeps working meanwhile. |
+| Lagging keeper reports an older file | The server rejects it. `keep status` shows the file as lagging. |
+| Registry connection goes silent | Both sides drop it within 30 s, and the node reconnects and refetches the membership. |
+| ZeroFS flush failing | Nothing new becomes durable, so expiry stops removing files. `server status` shows the failure. |
+| Server lost | `keepsync recover <kit>` from the bucket. The tailcat key is the same, so nodes reconnect on their own. |
 
-**Testing.** tailcat runs in-process, so one test binary can start a server and three nodes against a local derper and a MinIO or local bucket. That gives end-to-end tests for join, sync, keep, expiry, conflicts and recover without touching a cloud bucket. Measure keep throughput, bucket write operations and restore time on a real 30 GB set.
+## Testing
 
-**Milestones**
+Every package has unit tests against the fakes in `internal/api/fake`.
 
-1. `server run` in mount mode, `node init`/`run` with embedded Syncthing over tailcat (localhost bridge), registry, `folder add`/`join`.
-2. `keep` with grace and max-defer, server-side signing, two keepers.
-3. Durability watermark and expiry.
-4. Recovery kit, `recover` and `--drill`.
-5. Conflict reporting and the conflict hook.
-6. ZeroFS 9P mode, and a native tailcat transport inside Syncthing.
-7. Perkeep gateway, read-only. Signed writes are future work, not scheduled.
+`test/e2e` starts a server and three nodes in one process, with tailcat on an in-process derper. Its steps cover:
+- join and sync
+- keeping after grace
+- expiry gated on durability
+- a delete after a node restart propagating, not coming back as a conflict copy
+- leaving a folder
+- `recover --drill`
+- keeper reassignment
 
-**Open questions**
+With `KEEPSYNC_ZEROFS_BIN` and `KEEPSYNC_MINIO_BIN` set, it runs against a real ZeroFS and MinIO; without them those steps skip. All steps pass against ZeroFS 2.3.7 and MinIO.
 
-- Does the tailcat Go library expose the CLI's `--allow` check as a field, or does each `OnTCP` handler check the peer key itself?
-- Do `folder add` and `folder join` both earn their place, or should folders appear on every node automatically?
-- Which Syncthing internals does embedding need, and how stable are they across Syncthing releases?
+Not yet measured: keep throughput, bucket write operations and restore time on a real 30 GB set.
+
+## Not built yet
+
+- **Conflict reporting and the conflict hook.** The plan: `keepsync conflicts` and `conflicts resolve <path>`, and a `conflict_hook` script run by `Keepers[0]`, one at a time per folder, with a timeout and a debounce. The script gets `KEEPSYNC_FOLDER`, `KEEPSYNC_ORIGINAL`, `KEEPSYNC_CONFLICT`, `KEEPSYNC_CONFLICT_NODE` and `KEEPSYNC_BASE` (the last kept version, for a three-way merge). Before the hook runs, both versions are kept immediately, skipping grace (`keeper.KeepNow` exists for this). To resolve, the script writes the original, deletes the copy and exits 0. Anything else leaves the conflict for a human.
+- **`unkeep`**, which stops keeping a folder and leaves the archive.
+- **Deleting from keep**, as a `del-attribute` on `camliPath:<name>` in the parent directory's permanode, or a `delete` claim. Both are reversible. **`purge`**, the rare manual physical delete, since Perkeep has no garbage collector.
+- **ZeroFS without a mount**: a Perkeep blobserver that writes diskpacked packs through a Go 9P client straight to ZeroFS.
+- **A native tailcat transport inside Syncthing**, replacing the loopback bridge. It needs a patch to the vendored `lib/connections`.
+- **Signed writes through the gateway** (a `write` scope). The server keeps the only identity. Web UI edits already sign through the server's signing handler, but CLI tools such as `pk put` sign with their own key, and Perkeep does not honour a second signer by default. Either CLI signing is proxied to the server, or the server trusts a second signer. One identity is preferred, so this is still an open question.
+- **Persisting max-defer state** across keeper restarts.
+- **Release packaging**: the third-party notices file described under Licensing.
 
 ## Licensing
 
@@ -272,7 +354,7 @@ keepsync itself is MIT. Every embedded dependency is compatible with that, and Z
 
 | Component | License | How keepsync uses it |
 | --- | --- | --- |
-| Syncthing | MPL-2.0 | Embedded library |
+| Syncthing | MPL-2.0 | Embedded library, vendored in `third_party/syncthing` |
 | Perkeep | Apache-2.0 | Embedded (perkeepd and client) |
 | tailcat | BSD-3-Clause | Embedded library |
 | ZeroFS | AGPL-3.0 or commercial | Separate binary, run as a subprocess, spoken to over 9P |
@@ -280,8 +362,8 @@ keepsync itself is MIT. Every embedded dependency is compatible with that, and Z
 **Obligations**
 
 - Release binaries ship a third-party notices file: Apache-2.0 NOTICE text, BSD copyright lines, and a pointer to the Syncthing source (MPL).
-- Any patched Syncthing source files stay MPL-2.0 and are published.
-- The recovery kit and the ZeroFS download carry ZeroFS's license text and a link to the exact source for the pinned version.
+- Patched Syncthing files (the `gui.files.go` stub) stay MPL-2.0 and are published.
+- The recovery kit carries ZeroFS's license text and a link to the exact source for the pinned version.
 - ZeroFS is never linked or modified. A patched ZeroFS would fall under the AGPL network clause.
 
 This is a reading of the licenses, not legal advice.
