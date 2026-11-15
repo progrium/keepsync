@@ -36,7 +36,7 @@ const testPassword = "0123456789abcdef0123456789abcdef"
 // identity, a tailcat key, a server.toml and a stand-in zerofs binary.
 func newServerDir(t *testing.T, dir, bucket string) *config.Server {
 	t.Helper()
-	cfg := &config.Server{Dir: dir}
+	cfg := &config.Server{Dir: dir, Mode: os.Getenv("KIT_MODE")}
 	cfg.Storage.URL = bucket
 	cfg.Storage.AccessKeyID = "ro-key"
 	cfg.Storage.SecretAccessKey = "ro-secret"
@@ -234,9 +234,13 @@ func TestRecoverAndDrill(t *testing.T) {
 		case "drill":
 			phaseDrill(t, root)
 		case "recover":
-			phaseRecover(t, root)
+			phaseRecover(t, root, "recovered", "")
 		case "run":
-			phaseRun(t, root)
+			phaseRun(t, root, "recovered")
+		case "recover-other":
+			phaseRecover(t, root, "recovered-other", otherMode(os.Getenv("KIT_MODE")))
+		case "run-other":
+			phaseRun(t, root, "recovered-other")
 		case "corrupt":
 			phaseCorrupt(t, root)
 		}
@@ -246,12 +250,28 @@ func TestRecoverAndDrill(t *testing.T) {
 		return
 	}
 	if testing.Short() {
-		t.Skip("starts perkeepd four times")
+		t.Skip("starts perkeepd many times")
 	}
+	for _, mode := range []string{config.ModeStore, config.ModeCache} {
+		t.Run(mode, func(t *testing.T) { testRecoverAndDrill(t, mode) })
+	}
+}
+
+func otherMode(m string) string {
+	if m == config.ModeCache {
+		return config.ModeStore
+	}
+	return config.ModeCache
+}
+
+// testRecoverAndDrill runs each phase in a child process, because perkeepd
+// keeps its queue locks until the process exits. A server in mode is
+// recovered in the same mode and, from the same bucket, in the other one.
+func testRecoverAndDrill(t *testing.T, mode string) {
 	root := t.TempDir()
 	child := func(phase string) string {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestRecoverAndDrill$", "-test.v")
-		cmd.Env = append(os.Environ(), "KIT_PHASE="+phase, "KIT_ROOT="+root)
+		cmd.Env = append(os.Environ(), "KIT_PHASE="+phase, "KIT_ROOT="+root, "KIT_MODE="+mode)
 		out, err := cmd.CombinedOutput()
 		if err != nil || !strings.Contains(string(out), "kit child ok") {
 			t.Fatalf("%s phase: %v\n%s", phase, err, lastLines(string(out), 40))
@@ -282,6 +302,8 @@ func TestRecoverAndDrill(t *testing.T) {
 	}
 	child("recover")
 	child("run")
+	child("recover-other")
+	child("run-other")
 }
 
 // corruptPack flips a byte in the middle of the largest diskpacked pack.
@@ -349,7 +371,7 @@ func phaseLive(t *testing.T, root string) {
 	nw := fake.NewNetwork()
 	st, nt := nw.Transport("server"), nw.Transport("node")
 	st.Allow(nt.Key())
-	srv, err := pkserver.Start(ctx, pkserver.Config{Dir: cfg.PerkeepDir(), ZeroFS: zfs, Transport: st, Logf: t.Logf})
+	srv, err := pkserver.Start(ctx, pkserver.Config{Mode: cfg.StorageMode(), Dir: cfg.PerkeepDir(), ZeroFS: zfs, Transport: st, Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +479,7 @@ func phaseDrill(t *testing.T, root string) {
 	}
 }
 
-func phaseRecover(t *testing.T, root string) {
+func phaseRecover(t *testing.T, root, sub, mode string) {
 	ctx := context.Background()
 	var c liveCase
 	readJSON(t, filepath.Join(root, "case.json"), &c)
@@ -467,13 +489,14 @@ func phaseRecover(t *testing.T, root string) {
 	}
 	defer k.Close()
 	// The live server is gone; recover from its bucket onto a fresh dir.
-	dir := filepath.Join(root, "recovered")
+	dir := filepath.Join(root, sub)
 	var gotCreds zerofs.Storage
 	newZFS := func(cfg zerofs.Config) (api.ZeroFS, error) {
 		gotCreds = cfg.Storage
 		return fakeBuckets(filepath.Join(root, "buckets"))(cfg)
 	}
 	st, err := RecoverDir(ctx, k, dir, RecoverOptions{
+		Mode:        mode,
 		Credentials: Credentials{AccessKeyID: "rw-key", SecretAccessKey: "rw-secret"},
 		NewZeroFS:   newZFS,
 		Logf:        t.Logf,
@@ -494,6 +517,21 @@ func phaseRecover(t *testing.T, root string) {
 	if cfg.Storage.URL != "s3://test/live" || cfg.ZeroFS.Password != testPassword {
 		t.Errorf("recovered config: %+v", cfg)
 	}
+	wantMode := mode
+	if wantMode == "" {
+		wantMode = (&config.Server{Mode: os.Getenv("KIT_MODE")}).StorageMode()
+	}
+	if cfg.StorageMode() != wantMode {
+		t.Errorf("recovered in %s mode, want %s", cfg.StorageMode(), wantMode)
+	}
+	if err := cfg.CheckModeFile(); err != nil {
+		t.Error(err)
+	}
+	// Store mode copies every blob to local disk; cache mode keeps none.
+	packed, _ := filepath.Glob(filepath.Join(cfg.PerkeepDir(), "blobs", "packed", "*"))
+	if (wantMode == config.ModeStore) != (len(packed) > 0) {
+		t.Errorf("%s mode: %d local packed files", wantMode, len(packed))
+	}
 	if _, err := tcnet.LoadKey(cfg.KeyPath()); err != nil {
 		t.Error(err)
 	}
@@ -506,17 +544,17 @@ func phaseRecover(t *testing.T, root string) {
 	}
 }
 
-func phaseRun(t *testing.T, root string) {
+func phaseRun(t *testing.T, root, sub string) {
 	ctx := context.Background()
 	var c liveCase
 	readJSON(t, filepath.Join(root, "case.json"), &c)
-	cfg, err := config.LoadServer(filepath.Join(root, "recovered"))
+	cfg, err := config.LoadServer(filepath.Join(root, sub))
 	if err != nil {
 		t.Fatal(err)
 	}
 	zfs := &fake.ZeroFS{DirPath: filepath.Join(root, "buckets", "live")}
 	zfs.Start(ctx)
-	srv, err := pkserver.Start(ctx, pkserver.Config{Dir: cfg.PerkeepDir(), ZeroFS: zfs, Logf: t.Logf})
+	srv, err := pkserver.Start(ctx, pkserver.Config{Mode: cfg.StorageMode(), Dir: cfg.PerkeepDir(), ZeroFS: zfs, Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}

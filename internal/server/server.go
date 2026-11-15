@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -136,7 +135,7 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	res.Addr, res.Key = tr.Addr(), tr.Key()
 	tr.Close()
 
-	if err := writeModeMarker(cfg); err != nil {
+	if err := cfg.WriteModeFile(); err != nil {
 		return nil, err
 	}
 	if err := cfg.Save(); err != nil {
@@ -212,7 +211,7 @@ func (s *Server) start(ctx context.Context) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	if err := checkModeMarker(cfg); err != nil {
+	if err := cfg.CheckModeFile(); err != nil {
 		return err
 	}
 	// Claim the control socket first, so a second `server run` fails
@@ -363,33 +362,6 @@ func (s *Server) Addr() api.Addr { return s.tr.Addr() }
 
 // Registry is the running registry.
 func (s *Server) Registry() *registry.Server { return s.reg }
-
-// modeFile records the mode a server directory was initialized with, so a
-// hand edit of server.toml cannot switch it: a store-mode server's blobs
-// are on local disk and a cache-mode server has none there.
-const modeFile = "mode"
-
-func writeModeMarker(cfg *config.Server) error {
-	return os.WriteFile(filepath.Join(cfg.Dir, modeFile), []byte(cfg.StorageMode()+"\n"), 0o600)
-}
-
-func checkModeMarker(cfg *config.Server) error {
-	b, err := os.ReadFile(filepath.Join(cfg.Dir, modeFile))
-	if errors.Is(err, os.ErrNotExist) {
-		// Initialized before modes existed: those were all store mode.
-		if cfg.StorageMode() != config.ModeStore {
-			return fmt.Errorf("server: %s was initialized in store mode; server.toml says %s", cfg.Dir, cfg.StorageMode())
-		}
-		return writeModeMarker(cfg)
-	}
-	if err != nil {
-		return err
-	}
-	if was := strings.TrimSpace(string(b)); was != cfg.StorageMode() {
-		return fmt.Errorf("server: %s was initialized in %s mode; server.toml says %s (the mode cannot change after init)", cfg.Dir, was, cfg.StorageMode())
-	}
-	return nil
-}
 
 // summary is what member nodes see of the server (registry.ServerSummary).
 func (s *Server) summary(context.Context) (registry.ServerSummary, error) {

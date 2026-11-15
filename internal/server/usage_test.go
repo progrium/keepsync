@@ -81,27 +81,3 @@ func TestBucketSizeS3Pages(t *testing.T) {
 		t.Fatalf("got %d bytes, %d objects, %d pages, %v", b, n, pages, err)
 	}
 }
-
-func TestModeMarker(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &config.Server{Dir: dir, Mode: config.ModeCache}
-	if err := writeModeMarker(cfg); err != nil {
-		t.Fatal(err)
-	}
-	if err := checkModeMarker(cfg); err != nil {
-		t.Fatal(err)
-	}
-	cfg.Mode = ""
-	if err := checkModeMarker(cfg); err == nil {
-		t.Fatal("switching cache to store mode was allowed")
-	}
-	// A server from before modes is store mode.
-	old := &config.Server{Dir: t.TempDir()}
-	if err := checkModeMarker(old); err != nil {
-		t.Fatal(err)
-	}
-	old2 := &config.Server{Dir: t.TempDir(), Mode: config.ModeCache}
-	if err := checkModeMarker(old2); err == nil {
-		t.Fatal("pre-mode server switched to cache mode")
-	}
-}

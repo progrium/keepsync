@@ -87,6 +87,7 @@ func (e *env) recover(args []string) error {
 	accessKey := fs.String("access-key", "", "bucket write credentials, if the kit holds a read-only token")
 	secretKey := fs.String("secret-key", "", "bucket secret key for --access-key")
 	mount := fs.String("mount", "", "ZeroFS mount mode: fuse (default), v9fs or external")
+	mode := fs.String("mode", "", "server mode to recover into: store (copy every blob to local disk) or cache (rebuild only the index); default the kit's")
 	pos, err := parse(fs, args, 1, 1, "<kit> [--drill --bucket <copy> [--baseline <file>]]")
 	if err != nil {
 		return err
@@ -94,6 +95,9 @@ func (e *env) recover(args []string) error {
 	pass, err := e.passphrase(*passFile)
 	if err != nil {
 		return err
+	}
+	if *mode != "" && *mode != config.ModeStore && *mode != config.ModeCache {
+		return fmt.Errorf("--mode %q: want %s or %s", *mode, config.ModeStore, config.ModeCache)
 	}
 	k, err := kit.Open(pos[0], pass)
 	if err != nil {
@@ -109,7 +113,7 @@ func (e *env) recover(args []string) error {
 		if *bucket == "" {
 			return errors.New("--drill needs --bucket <copy of the bucket>")
 		}
-		o := kit.DrillOptions{Bucket: *bucket, Credentials: creds, Mount: zerofs.MountMode(*mount), Logf: logf}
+		o := kit.DrillOptions{Bucket: *bucket, Credentials: creds, Mount: zerofs.MountMode(*mount), Mode: *mode, Logf: logf}
 		if *baseline != "" {
 			b, err := os.ReadFile(*baseline)
 			if err != nil {
@@ -132,11 +136,15 @@ func (e *env) recover(args []string) error {
 	}
 
 	dir := e.serverDir()
-	stats, err := kit.RecoverDir(ctx, k, dir, kit.RecoverOptions{Credentials: creds, Mount: zerofs.MountMode(*mount), Logf: logf})
+	stats, err := kit.RecoverDir(ctx, k, dir, kit.RecoverOptions{Credentials: creds, Mount: zerofs.MountMode(*mount), Mode: *mode, Logf: logf})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.stdout, "recovered %d blobs (%d bytes) into %s in %s\n", stats.Blobs, stats.Bytes, dir, stats.Total.Round(1e9))
+	verb := "recovered"
+	if (&config.Server{Mode: *mode}).StorageMode() == config.ModeCache || *mode == "" && k.Manifest.Mode == config.ModeCache {
+		verb = "indexed"
+	}
+	fmt.Fprintf(e.stdout, "%s %d blobs (%d bytes) into %s in %s\n", verb, stats.Blobs, stats.Bytes, dir, stats.Total.Round(1e9))
 	if len(stats.BadBlobs) > 0 {
 		fmt.Fprintf(e.stdout, "WARNING: %d blobs failed their hash check and were not restored\n", len(stats.BadBlobs))
 	}

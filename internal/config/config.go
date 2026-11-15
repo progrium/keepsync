@@ -162,6 +162,35 @@ const (
 	DefaultMemoryCacheGB = 0.25
 )
 
+// ModeFile records the mode a server directory was initialized with, so a
+// hand edit of server.toml cannot switch it: a store-mode server's blobs
+// are on local disk and a cache-mode server has none there.
+func (c *Server) ModeFile() string { return filepath.Join(c.Dir, "mode") }
+
+// WriteModeFile records the current mode (see ModeFile).
+func (c *Server) WriteModeFile() error {
+	return os.WriteFile(c.ModeFile(), []byte(c.StorageMode()+"\n"), 0o600)
+}
+
+// CheckModeFile fails if the directory was initialized in another mode. A
+// directory from before modes existed is store mode, and gets its file.
+func (c *Server) CheckModeFile() error {
+	b, err := os.ReadFile(c.ModeFile())
+	if errors.Is(err, fs.ErrNotExist) {
+		if c.StorageMode() != ModeStore {
+			return fmt.Errorf("config: %s was initialized in store mode; server.toml says %s", c.Dir, c.StorageMode())
+		}
+		return c.WriteModeFile()
+	}
+	if err != nil {
+		return err
+	}
+	if was := strings.TrimSpace(string(b)); was != c.StorageMode() {
+		return fmt.Errorf("config: %s was initialized in %s mode; server.toml says %s (the mode cannot change after init)", c.Dir, was, c.StorageMode())
+	}
+	return nil
+}
+
 // StorageMode is Mode, defaulting to ModeStore.
 func (c *Server) StorageMode() string {
 	if c.Mode == "" {

@@ -22,6 +22,7 @@ import (
 	"perkeep.org/pkg/schema"
 
 	"github.com/progrium/keepsync/internal/api"
+	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/pkserver"
 	"github.com/progrium/keepsync/internal/zerofs"
 )
@@ -88,6 +89,7 @@ type restoreParams struct {
 	zfsDataDir string
 	mountDir   string
 	mount      zerofs.MountMode
+	mode       string // config.ModeStore or config.ModeCache
 	newZeroFS  NewZeroFS
 	logf       func(string, ...any)
 	workers    int
@@ -97,6 +99,10 @@ type restoreParams struct {
 // storage and index, and copies every blob of the diskpacked replica into
 // it, which indexes them. The replica already holds every blob, so
 // replicating them back writes nothing to the bucket.
+//
+// In cache mode the diskpacked store on ZeroFS is perkeepd's primary
+// storage, so nothing is copied: every blob is read from the bucket,
+// checked, and fed to the index.
 func restore(ctx context.Context, k *Kit, p restoreParams) (_ *restoreEnv, err error) {
 	start := time.Now()
 	if p.newZeroFS == nil {
@@ -153,7 +159,12 @@ func restore(ctx context.Context, k *Kit, p restoreParams) (_ *restoreEnv, err e
 		e.registry = b
 	}
 
-	e.srv, err = pkserver.Start(ctx, pkserver.Config{Dir: p.perkeepDir, ZeroFS: z, Logf: p.logf})
+	cache := p.mode == config.ModeCache
+	mode := pkserver.ModeStore
+	if cache {
+		mode = pkserver.ModeCache
+	}
+	e.srv, err = pkserver.Start(ctx, pkserver.Config{Mode: mode, Dir: p.perkeepDir, ZeroFS: z, Logf: p.logf})
 	if err != nil {
 		return e, err
 	}
@@ -161,15 +172,22 @@ func restore(ctx context.Context, k *Kit, p restoreParams) (_ *restoreEnv, err e
 	if err != nil {
 		return e, err
 	}
-	replica, err := ownerClient(e.srv, replicaPrefix)
+	from, to, queues := replicaPrefix, e.owner, []string{"/sync/", "/sync-to-zerofs/"}
+	if cache {
+		from, queues = "/bs/", []string{"/sync/"}
+		if to, err = ownerClient(e.srv, "/index/"); err != nil {
+			return e, err
+		}
+	}
+	replica, err := ownerClient(e.srv, from)
 	if err != nil {
 		return e, err
 	}
 	copyStart := time.Now()
-	if err := copyBlobs(ctx, replica, e.owner, p.workers, &e.stats); err != nil {
+	if err := copyBlobs(ctx, replica, to, p.workers, &e.stats); err != nil {
 		return e, err
 	}
-	for _, q := range []string{"/sync/", "/sync-to-zerofs/"} {
+	for _, q := range queues {
 		if err := waitSynced(ctx, e.srv, q); err != nil {
 			return e, err
 		}

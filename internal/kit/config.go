@@ -21,6 +21,7 @@ func SourceFor(cfg *config.Server, addr api.Addr) (Source, error) {
 		ServerAddr:     addr,
 		Storage:        storageOf(cfg),
 		ZeroFSPassword: cfg.ZeroFS.Password,
+		Mode:           cfg.StorageMode(),
 		PerkeepDir:     cfg.PerkeepDir(),
 		TailcatKey:     cfg.KeyPath(),
 		ConfigFile:     filepath.Join(cfg.Dir, config.ServerFile),
@@ -65,7 +66,27 @@ func RecoverDir(ctx context.Context, k *Kit, dir string, o RecoverOptions) (*Res
 		return nil, errors.New("kit: no server directory")
 	}
 	o.Layout = LayoutFor(dir)
-	return Recover(ctx, k, o)
+	stats, err := Recover(ctx, k, o)
+	if err != nil {
+		return stats, err
+	}
+	// The recovered server.toml is the old server's; record the mode it
+	// was recovered in, which may differ.
+	mode := o.mode(k)
+	cfg, err := config.LoadServer(dir)
+	switch {
+	case errors.Is(err, config.ErrNotInitialized):
+		cfg = &config.Server{Dir: dir, Mode: mode} // no config in the kit
+	case err != nil:
+		return stats, err
+	case cfg.StorageMode() != mode:
+		cfg.Mode = mode
+		if err := cfg.Save(); err != nil {
+			return stats, err
+		}
+	}
+	cfg.Mode = mode
+	return stats, cfg.WriteModeFile()
 }
 
 func storageOf(cfg *config.Server) zerofs.Storage {

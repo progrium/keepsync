@@ -105,3 +105,24 @@ func TestServerModeAndCache(t *testing.T) {
 		t.Fatal("unknown mode accepted")
 	}
 }
+
+func TestModeFile(t *testing.T) {
+	cfg := &Server{Dir: t.TempDir(), Mode: ModeCache}
+	if err := cfg.WriteModeFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.CheckModeFile(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Mode = ""
+	if err := cfg.CheckModeFile(); err == nil {
+		t.Fatal("switching cache to store mode was allowed")
+	}
+	// A server from before modes is store mode.
+	if err := (&Server{Dir: t.TempDir()}).CheckModeFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Server{Dir: t.TempDir(), Mode: ModeCache}).CheckModeFile(); err == nil {
+		t.Fatal("pre-mode server switched to cache mode")
+	}
+}

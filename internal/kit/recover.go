@@ -14,6 +14,7 @@ import (
 	"perkeep.org/pkg/search"
 
 	"github.com/progrium/keepsync/internal/api"
+	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/zerofs"
 )
 
@@ -44,8 +45,24 @@ type RecoverOptions struct {
 	// server writes to it, so a kit holding a read-only token needs them.
 	Credentials Credentials
 	Mount       zerofs.MountMode
-	NewZeroFS   NewZeroFS
-	Logf        func(string, ...any)
+	// Mode is the mode to recover into: config.ModeStore copies every
+	// blob from the bucket to local disk, config.ModeCache only rebuilds
+	// the index. Empty means the kit's mode.
+	Mode      string
+	NewZeroFS NewZeroFS
+	Logf      func(string, ...any)
+}
+
+func (o RecoverOptions) mode(k *Kit) string { return modeOr(o.Mode, k) }
+
+func modeOr(mode string, k *Kit) string {
+	if mode != "" {
+		return mode
+	}
+	if k.Manifest.Mode != "" {
+		return k.Manifest.Mode
+	}
+	return config.ModeStore
 }
 
 // Recover rebuilds the server from the bucket: it mounts ZeroFS on the
@@ -76,6 +93,7 @@ func Recover(ctx context.Context, k *Kit, o RecoverOptions) (*RestoreStats, erro
 		zfsDataDir: l.ZeroFSDataDir,
 		mountDir:   l.ZeroFSMountDir,
 		mount:      o.Mount,
+		mode:       o.mode(k),
 		newZeroFS:  o.NewZeroFS,
 		logf:       o.Logf,
 	})
@@ -138,8 +156,10 @@ type DrillOptions struct {
 	WorkDir string
 	// Samples is how many kept paths the index check searches for.
 	// Default 5.
-	Samples   int
-	Mount     zerofs.MountMode
+	Samples int
+	Mount   zerofs.MountMode
+	// Mode is the mode to restore in; empty means the kit's.
+	Mode      string
 	NewZeroFS NewZeroFS
 	Logf      func(string, ...any)
 }
@@ -232,6 +252,7 @@ func Drill(ctx context.Context, k *Kit, o DrillOptions) (*DrillReport, error) {
 		perkeepDir: filepath.Join(work, "perkeep"),
 		zfsDataDir: filepath.Join(work, "zerofs"),
 		mount:      o.Mount,
+		mode:       modeOr(o.Mode, k),
 		newZeroFS:  o.NewZeroFS,
 		logf:       o.Logf,
 	})
