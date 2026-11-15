@@ -141,6 +141,7 @@ type Node struct {
 	serverSeen time.Time
 	connected  map[api.DeviceID]bool
 	keepers    map[string]*kept // by folder name
+	cf         *conflicts
 	ctx        context.Context
 	cfgMu      sync.Mutex // serializes config edits and saves
 	recMu      sync.Mutex // serializes reconcile
@@ -367,7 +368,16 @@ func (n *Node) events() {
 			n.mu.Unlock()
 			n.logf("peer %s %s", short(ev.Device), map[bool]string{true: "connected", false: "disconnected"}[ev.Type == api.SyncPeerConnected])
 		case api.SyncConflict:
-			n.logf("conflict in %s: %s", ev.Folder, ev.Path)
+			name, ok := n.folderByID(ev.Folder)
+			if !ok {
+				continue
+			}
+			lf, err := n.localFolder(name)
+			if err != nil {
+				continue
+			}
+			n.logf("conflict in %s: %s", name, ev.Path)
+			n.onConflict(name, filepath.Join(lf.Path, filepath.FromSlash(ev.Path)))
 		}
 	}
 }
@@ -384,6 +394,16 @@ func (n *Node) apply(ctx context.Context, m api.Membership) {
 	n.mu.Unlock()
 	n.saveMembership(m)
 	n.reconcile(ctx)
+	// Once the node knows who runs hooks, look for conflict copies left
+	// from before it started.
+	c := n.conf()
+	c.mu.Lock()
+	first := !c.scanned
+	c.scanned = true
+	c.mu.Unlock()
+	if first {
+		go n.scanConflicts()
+	}
 }
 
 // reconcile applies the current membership and config.

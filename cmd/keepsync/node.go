@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -387,4 +389,57 @@ func (e *env) unkeep(args []string) error {
 		fmt.Fprintf(e.stdout, "the archive stays (%s): restore still reads it, and keepsync keep %s continues the same tree\n", res.Archive, pos[0])
 	}
 	return nil
+}
+
+func (e *env) conflicts(args []string) error {
+	fs := newFlags(e, "conflicts")
+	if _, err := parse(fs, args, 0, 0, ""); err != nil {
+		return err
+	}
+	var list []node.ConflictInfo
+	if err := e.nodeCall(node.MethodConflicts, nil, &list); err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Fprintln(e.stdout, "no conflicts")
+		return nil
+	}
+	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "FOLDER\tCONFLICT COPY\tORIGINAL\tNODE\tHOOK")
+	for _, c := range list {
+		state := c.State
+		if c.Reason != "" {
+			state += ": " + c.Reason
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", c.Folder, c.Path, c.Original, c.Node, state)
+	}
+	return tw.Flush()
+}
+
+func (e *env) conflictsResolve(args []string) error {
+	fs := newFlags(e, "conflicts resolve")
+	pos, err := parse(fs, args, 1, 1, "<conflict copy path>")
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(pos[0])
+	if err != nil {
+		return err
+	}
+	// The hook may run for its whole timeout, so wait longer than other calls.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	var ci node.ConflictInfo
+	sock := (&config.Node{Dir: e.nodeDir()}).SocketPath()
+	if err := ctl.Call(ctx, sock, node.MethodResolve, node.FolderParams{Path: abs}, &ci); err != nil {
+		if isNotRunning(err) {
+			return fmt.Errorf("the node is not running (start it with `keepsync node run`): %w", err)
+		}
+		return err
+	}
+	if ci.State == node.HookResolved {
+		fmt.Fprintf(e.stdout, "resolved %s\n", ci.Original)
+		return nil
+	}
+	return fmt.Errorf("not resolved (%s): %s", ci.State, ci.Reason)
 }

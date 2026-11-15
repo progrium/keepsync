@@ -26,6 +26,8 @@ const (
 	MethodRestore    = "restore"
 	MethodGateway    = "gateway"
 	MethodUnkeep     = "unkeep"
+	MethodConflicts  = "conflicts"
+	MethodResolve    = "conflicts.resolve"
 )
 
 // FolderParams is the body of MethodFolderAdd, MethodFolderJoin and
@@ -190,6 +192,18 @@ func (n *Node) handlers() {
 		pol.Permanode = pn
 		return KeepResult{Permanode: pn, Policy: pol}, nil
 	})
+	ctl.HandleFunc(n.ctl, MethodConflicts, func(ctx context.Context, _ struct{}) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		return n.listConflicts(), nil
+	})
+	ctl.HandleFunc(n.ctl, MethodResolve, func(ctx context.Context, p FolderParams) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		return n.resolveConflict(ctx, p.Path)
+	})
 	ctl.HandleFunc(n.ctl, MethodUnkeep, func(ctx context.Context, p FolderParams) (any, error) {
 		if err := ready(); err != nil {
 			return nil, err
@@ -352,6 +366,7 @@ func (n *Node) attach(ctx context.Context, p FolderParams, call func(context.Con
 	}
 	n.mu.Unlock()
 	n.reconcile(n.ctx)
+	go n.scanConflicts(f.Name)
 	return FolderInfo{Name: f.Name, ID: f.ID, Path: dir, Attached: true}, nil
 }
 

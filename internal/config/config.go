@@ -173,6 +173,8 @@ type Folder struct {
 	Path string `toml:"path"`
 	// ID is the Syncthing folder ID, from the registry.
 	ID string `toml:"id,omitempty,omitzero"`
+	// ConflictHook overrides Node.ConflictHook for this folder.
+	ConflictHook string `toml:"conflict_hook,omitempty,omitzero"`
 }
 
 // Node is node.toml.
@@ -189,8 +191,11 @@ type Node struct {
 	KeepInterval Duration `toml:"keep_interval,omitempty,omitzero"`
 	// Gateway configures the local Perkeep gateway.
 	Gateway Gateway `toml:"gateway"`
-	// ConflictHook is the global conflict hook script (milestone 5).
-	ConflictHook string   `toml:"conflict_hook,omitempty,omitzero"`
+	// ConflictHook is the conflict hook script for every folder that does
+	// not set its own.
+	ConflictHook string `toml:"conflict_hook,omitempty,omitzero"`
+	// ConflictHookTimeout bounds one hook run. Default 5m.
+	ConflictHookTimeout Duration `toml:"conflict_hook_timeout,omitempty,omitzero"`
 	Folders      []Folder `toml:"folder"`
 }
 
@@ -215,6 +220,15 @@ func (c *Node) GatewayListen() string {
 
 // GatewayTokenPath holds the gateway's per-node token.
 func (c *Node) GatewayTokenPath() string { return filepath.Join(c.Dir, "gateway-token") }
+
+// HookFor returns the conflict hook for a folder: its own, else the
+// global one, else "".
+func (c *Node) HookFor(folder string) string {
+	if f, ok := c.Folder(folder); ok && f.ConflictHook != "" {
+		return f.ConflictHook
+	}
+	return c.ConflictHook
+}
 
 // KeyPath is the node's tailcat identity.
 func (c *Node) KeyPath() string { return filepath.Join(c.Dir, KeyFile) }

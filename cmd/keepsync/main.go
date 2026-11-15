@@ -44,6 +44,8 @@ Node:
                                        mark a folder kept
   keep status <folder>                 files in grace, kept, expirable
   unkeep <folder>                      stop keeping a folder; the archive stays
+  conflicts                            list conflict copies and hook state
+  conflicts resolve <path>             run the conflict hook now, on this node
   restore <folder> [<path>] [--at <time>] [--to <dir>] [--force]
                                        pull kept files back, including expired;
                                        --at is when the server kept them
@@ -159,7 +161,10 @@ func run(e *env, args []string) error {
 	case "restore":
 		return e.restore(rest)
 	case "conflicts":
-		return notYet("conflicts", 5)
+		if len(rest) > 0 && rest[0] == "resolve" {
+			return e.conflictsResolve(rest[1:])
+		}
+		return e.conflicts(rest)
 	case "recover":
 		return e.recover(rest)
 	case "purge":

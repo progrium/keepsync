@@ -58,6 +58,13 @@ type testNode struct {
 // fast keeper interval.
 func newTestNode(t *testing.T, putter func(*fake.Perkeep) api.BlobPutter) *testNode {
 	t.Helper()
+	return newTestNodeOpts(t, putter, false)
+}
+
+// newTestNodeOpts is newTestNode; with otherFirst, another node creates
+// "docs" first, so it is the folder's first member and keeper.
+func newTestNodeOpts(t *testing.T, putter func(*fake.Perkeep) api.BlobPutter, otherFirst bool) *testNode {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	pk := fake.NewPerkeep()
@@ -70,7 +77,18 @@ func newTestNode(t *testing.T, putter func(*fake.Perkeep) api.BlobPutter) *testN
 	if _, err := n.reg.Register(ctx, api.Node{Name: "a", Key: tr.Key(), Addr: tr.Addr(), Device: "DEVICE-A"}); err != nil {
 		t.Fatal(err)
 	}
-	f, err := n.reg.AddFolder(ctx, "docs")
+	var f api.Folder
+	var err error
+	if otherFirst {
+		other := reg.Client("nodekey:other")
+		other.Register(ctx, api.Node{Name: "other", Key: "nodekey:other", Device: "OTHERDV-XXXXXXX"})
+		if _, err := other.AddFolder(ctx, "docs"); err != nil {
+			t.Fatal(err)
+		}
+		f, err = n.reg.JoinFolder(ctx, "docs")
+	} else {
+		f, err = n.reg.AddFolder(ctx, "docs")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,5 +220,15 @@ func TestRekeepContinuesPermanode(t *testing.T) {
 	tn.mu.Unlock()
 	if nk != 1 {
 		t.Fatalf("%d keepers after re-keep, want 1", nk)
+	}
+}
+
+// stopKeepers stops the background keeper loops but keeps the keepers, so
+// a test can call KeepNow without a pass racing it.
+func (tn *testNode) stopKeepers() {
+	tn.mu.Lock()
+	defer tn.mu.Unlock()
+	for _, k := range tn.keepers {
+		k.cancel()
 	}
 }
