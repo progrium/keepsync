@@ -364,10 +364,12 @@ func indexCheck(ctx context.Context, e *restoreEnv, s *scan, base *Baseline, sam
 	found := 0
 	tried := pick(keys, samples)
 	for _, k := range tried {
-		pn, path, _ := strings.Cut(k, "/")
+		// Each kept file has its own permanode whose camliContent is the
+		// file (docs/design.md, "Kept tree layout").
+		_, path, _ := strings.Cut(k, "/")
 		r, err := e.owner.Query(ctx, &search.SearchQuery{
 			Constraint: &search.Constraint{Permanode: &search.PermanodeConstraint{
-				Attr:  "camliPath:" + path,
+				Attr:  "camliContent",
 				Value: string(s.Files[k].File),
 			}},
 		})
@@ -375,11 +377,7 @@ func indexCheck(ctx context.Context, e *restoreEnv, s *scan, base *Baseline, sam
 			problems = append(problems, fmt.Sprintf("search for %s: %v", path, err))
 			continue
 		}
-		hit := false
-		for _, b := range r.Blobs {
-			hit = hit || b.Blob.String() == pn
-		}
-		if !hit {
+		if len(r.Blobs) == 0 {
 			problems = append(problems, fmt.Sprintf("search for %s does not find its permanode", path))
 			continue
 		}

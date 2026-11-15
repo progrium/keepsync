@@ -403,7 +403,7 @@ func phaseLive(t *testing.T, root string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(base.Files) != 4 || len(base.Permanodes) != 2 {
+	if len(base.Files) != 4 || len(base.Permanodes) != 7 {
 		t.Fatalf("baseline: %d files, %d permanodes", len(base.Files), len(base.Permanodes))
 	}
 	writeJSON(t, filepath.Join(root, "baseline.json"), base)
@@ -449,7 +449,7 @@ func phaseDrill(t *testing.T, root string) {
 	if !strings.Contains(rep.String(), "current registry in the bucket") {
 		t.Error("drill did not find the registry in the bucket")
 	}
-	if rep.Files != 4 || rep.Permanodes != 2 || rep.Blobs != len(base.Blobs) {
+	if rep.Files != 4 || rep.Permanodes != 7 || rep.Blobs != len(base.Blobs) {
 		t.Errorf("restored %d files %d permanodes %d blobs; baseline %d blobs", rep.Files, rep.Permanodes, rep.Blobs, len(base.Blobs))
 	}
 	if after := dirSnapshot(t, filepath.Join(root, "buckets", "live")); after != before {

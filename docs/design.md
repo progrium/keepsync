@@ -1,6 +1,6 @@
 # keepsync spec
 
-Status: describes the code on `dev` as of 2026-11-15. Where the code differs from the original design, this document follows the code and says so. Work that is not built yet is listed under "Not built yet". One exception: the per-file permanode layout under "Kept tree layout" is in progress in `pkserver`; until it lands, the signer sets `camliPath:<path>` on the root permanode straight to filerefs.
+Status: describes the code on `dev` as of 2026-11-15. Where the code differs from the original design, this document follows the code and says so. Work that is not built yet is listed under "Not built yet".
 
 ## Overview
 
@@ -273,7 +273,7 @@ Then `server run` brings the server back at the same address and nodes reconnect
 
 1. Blobs: every restored blob reads back and matches its hash, and every baseline blob was restored.
 2. Files: every kept file reads back with the baseline's SHA-256.
-3. Index: the index finds every permanode, and finds sample kept paths by search.
+3. Index: the index finds every permanode, and a search on `camliContent` finds the permanode of sample kept files.
 4. Registry: where recovery would get the registry from. A registry only in the kit, or nowhere, is a warning.
 5. Timing: restore time, ZeroFS start time, and copy-and-reindex throughput.
 
