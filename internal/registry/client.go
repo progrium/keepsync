@@ -398,3 +398,9 @@ func readWatch(conn net.Conn, latest chan api.Membership) error {
 		latest <- m
 	}
 }
+
+// LeaveFolder is a placeholder until the registry implements leave
+// (workstream B).
+func (c *Client) LeaveFolder(ctx context.Context, name string) error {
+	return errors.New("registry: LeaveFolder not implemented yet")
+}

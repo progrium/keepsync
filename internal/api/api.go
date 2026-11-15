@@ -126,6 +126,9 @@ type RegistryClient interface {
 	Watch(ctx context.Context) (<-chan Membership, error)
 	AddFolder(ctx context.Context, name string) (Folder, error)
 	JoinFolder(ctx context.Context, name string) (Folder, error)
+	// LeaveFolder removes the calling node from a folder's members (and its
+	// keepers, triggering reassignment). Files on disk are untouched.
+	LeaveFolder(ctx context.Context, name string) error
 	// Keep marks a folder kept, creating its permanode on first use.
 	Keep(ctx context.Context, folder string, p KeepPolicy) (BlobRef, error)
 	ClaimPath(ctx context.Context, c PathClaim) (ClaimResult, error)

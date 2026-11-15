@@ -361,6 +361,49 @@ func (c *registryClient) JoinFolder(ctx context.Context, name string) (api.Folde
 	return *c.folderLocked(name), nil
 }
 
+func (c *registryClient) LeaveFolder(ctx context.Context, name string) error {
+	c.r.mu.Lock()
+	defer c.r.mu.Unlock()
+	f := c.folderLocked(name)
+	if f == nil {
+		return fmt.Errorf("fake: no folder %q", name)
+	}
+	f.Members = without(f.Members, c.self)
+	f.ReceiveOnly = without(f.ReceiveOnly, c.self)
+	if f.Keep != nil {
+		f.Keep.Keepers = without(f.Keep.Keepers, c.self)
+		for _, m := range f.Members {
+			if len(f.Keep.Keepers) >= 2 {
+				break
+			}
+			if !contains(f.Keep.Keepers, m) {
+				f.Keep.Keepers = append(f.Keep.Keepers, m)
+			}
+		}
+	}
+	c.r.publishLocked()
+	return nil
+}
+
+func without(ks []api.NodeKey, k api.NodeKey) []api.NodeKey {
+	out := ks[:0:0]
+	for _, x := range ks {
+		if x != k {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func contains(ks []api.NodeKey, k api.NodeKey) bool {
+	for _, x := range ks {
+		if x == k {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *registryClient) Keep(ctx context.Context, folder string, p api.KeepPolicy) (api.BlobRef, error) {
 	c.r.mu.Lock()
 	f := c.folderLocked(folder)

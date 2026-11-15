@@ -79,6 +79,9 @@ func (l *liveClient) AddFolder(ctx context.Context, name string) (api.Folder, er
 func (l *liveClient) JoinFolder(ctx context.Context, name string) (api.Folder, error) {
 	return l.c().JoinFolder(ctx, name)
 }
+func (l *liveClient) LeaveFolder(ctx context.Context, name string) error {
+	return l.c().LeaveFolder(ctx, name)
+}
 func (l *liveClient) Keep(ctx context.Context, folder string, p api.KeepPolicy) (api.BlobRef, error) {
 	return l.c().Keep(ctx, folder, p)
 }
