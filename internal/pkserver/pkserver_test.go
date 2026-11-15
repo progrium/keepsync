@@ -416,3 +416,68 @@ func lastLines(s string, n int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+func TestPathsAt(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	files := t.TempDir()
+	t0 := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	pn, err := e.srv.NewPermanode(ctx, "history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAny := time.Now()
+	put := func(name, body string, mt time.Time) api.BlobRef {
+		t.Helper()
+		ref, err := e.putter.PutFile(ctx, writeFile(t, files, name, body, mt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ref
+	}
+	claim := func(path string, ref api.BlobRef, mt time.Time) {
+		t.Helper()
+		if r, err := e.srv.ClaimPath(ctx, api.PathClaim{Permanode: pn, Path: path, File: ref, ModTime: mt}); err != nil || r != api.ClaimWritten {
+			t.Fatalf("claim %s: %v %v", path, r, err)
+		}
+	}
+	v1 := put("a1", "one", t0)
+	claim("a", v1, t0)
+	time.Sleep(5 * time.Millisecond)
+	afterV1 := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	v2 := put("a2", "two", t0.Add(time.Hour))
+	claim("a", v2, t0.Add(time.Hour))
+	claim("b", put("b", "bee", t0), t0)
+	afterAll := time.Now()
+
+	at := func(when time.Time) map[string]api.PathEntry {
+		t.Helper()
+		m, err := e.srv.PathsAt(ctx, pn, when)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if m := at(beforeAny); len(m) != 0 {
+		t.Errorf("before any claim: %v, want empty", m)
+	}
+	m := at(afterV1)
+	if m["a"].File != v1 || !m["a"].ModTime.Equal(t0) || m["a"].Claim == "" {
+		t.Errorf("after v1: a = %+v, want %s", m["a"], v1)
+	}
+	if _, ok := m["b"]; ok {
+		t.Errorf("after v1: b present, but it was claimed later")
+	}
+	m = at(afterAll)
+	cur, err := e.srv.Paths(ctx, pn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 2 || m["a"] != cur["a"] || m["b"] != cur["b"] {
+		t.Errorf("after all: %v, want current %v", m, cur)
+	}
+	if _, err := e.srv.PathsAt(ctx, "sha224-00000000000000000000000000000000000000000000000000000000", afterAll); err == nil {
+		t.Error("PathsAt of an unknown permanode succeeded")
+	}
+}

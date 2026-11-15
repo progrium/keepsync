@@ -115,6 +115,17 @@ func (s *Server) Paths(ctx context.Context, permanode api.BlobRef) (map[string]a
 	return out, nil
 }
 
+// PathsAt returns the entries of a kept folder's tree as it was at time
+// at: the result of the claims signed at or before at. A path first
+// claimed later is absent, and a path changed later has its earlier entry.
+// at is when the server kept a version, not the file's mtime.
+func (s *Server) PathsAt(ctx context.Context, permanode api.BlobRef, at time.Time) (map[string]api.PathEntry, error) {
+	if at.IsZero() {
+		return nil, fmt.Errorf("pkserver: PathsAt needs a time")
+	}
+	return s.loadTree(ctx, permanode, at)
+}
+
 // treeLocked returns the cached tree of permanode, loading it from the
 // index on first use. This server is the only signer, so after loading,
 // ClaimPath keeps the cache current. The caller holds treeMu.
@@ -122,6 +133,18 @@ func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (map[str
 	if t, ok := s.trees[permanode]; ok {
 		return t, nil
 	}
+	t, err := s.loadTree(ctx, permanode, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	s.trees[permanode] = t
+	return t, nil
+}
+
+// loadTree folds the server's claims on permanode, read from the index,
+// into its tree, counting only the claims signed at or before at, or all
+// of them if at is zero.
+func (s *Server) loadTree(ctx context.Context, permanode api.BlobRef, at time.Time) (map[string]api.PathEntry, error) {
 	pn, ok := blob.Parse(string(permanode))
 	if !ok {
 		return nil, fmt.Errorf("pkserver: bad permanode %q", permanode)
@@ -146,6 +169,9 @@ func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (map[str
 		if c.Signer != s.pubRef {
 			continue // only the server's own claims count
 		}
+		if !at.IsZero() && time.Time(c.Date).After(at) {
+			break // sorted by date, so every later claim is after at too
+		}
 		switch c.Type {
 		case "set-attribute", "add-attribute":
 			attrs[c.Attr] = &val{c.Value, c.BlobRef}
@@ -169,7 +195,6 @@ func (s *Server) treeLocked(ctx context.Context, permanode api.BlobRef) (map[str
 		}
 		t[p] = e
 	}
-	s.trees[permanode] = t
 	return t, nil
 }
 
