@@ -606,3 +606,22 @@ func TestStatusChecksContentBeforeExpirable(t *testing.T) {
 		t.Fatalf("states: a.txt %s, b.txt %s", got["a.txt"], got["b.txt"])
 	}
 }
+
+// TestFutureMtimeIsKept checks that a file stamped in the future is kept
+// once grace has passed since the keeper first saw it, rather than waiting
+// for the clock to reach its mtime.
+func TestFutureMtimeIsKept(t *testing.T) {
+	e := newEnv(t)
+	e.write("future.jpg", "from 2099", -70*365*day)
+	if rep := e.pass(); !slices.Contains(rep.InGrace, "future.jpg") {
+		t.Fatalf("not in grace when first seen: %+v", rep)
+	}
+	st, _ := e.k.Status(e.ctx)
+	if f := st.Files[0]; f.State != StateGrace || !f.KeepAt.Equal(e.clock.Now().Add(48*hour)) {
+		t.Fatalf("status: %+v", f)
+	}
+	e.clock.Advance(49 * hour)
+	if rep := e.pass(); !slices.Contains(rep.Kept, "future.jpg") {
+		t.Fatalf("not kept 49h after first seen: %+v", rep)
+	}
+}

@@ -382,13 +382,9 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 
 	forced := false
 	if !force {
-		first, ok := k.dirty[f.rel]
-		if !ok || f.mtime.Before(first) {
-			first = f.mtime
-			k.dirty[f.rel] = first
-		}
+		first := k.firstSeen(f, now)
 		switch {
-		case now.Sub(f.mtime) >= k.policy.Grace:
+		case now.Sub(graceBase(f, first, now)) >= k.policy.Grace:
 		case now.Sub(first) >= k.policy.MaxDefer:
 			forced = true
 		default:
@@ -435,6 +431,36 @@ func (k *Keeper) keepOne(ctx context.Context, f file, tree map[string]api.PathEn
 	case api.ClaimRejectedOlder:
 		rep.Lagging = append(rep.Lagging, f.rel)
 	}
+}
+
+// firstSeen records and returns when the unkept version of f started:
+// its mtime, or now if that is in the future, or an earlier time already
+// recorded for the path. max-defer is measured from it.
+func (k *Keeper) firstSeen(f file, now time.Time) time.Time {
+	first, ok := k.dirty[f.rel]
+	switch {
+	case !ok:
+		first = f.mtime
+		if first.After(now) {
+			first = now // a future mtime counts from when it was first seen
+		}
+		k.dirty[f.rel] = first
+	case f.mtime.Before(first):
+		first = f.mtime
+		k.dirty[f.rel] = first
+	}
+	return first
+}
+
+// graceBase is the time grace is measured from: the mtime, or, for an
+// mtime in the future (a bad clock, bogus dates in an archive), when the
+// keeper first saw the file. Otherwise such a file would wait in grace
+// until the clock reached its mtime (docs/design.md, Edge cases).
+func graceBase(f file, first, now time.Time) time.Time {
+	if f.mtime.After(now) {
+		return first
+	}
+	return f.mtime
 }
 
 // expire removes kept files past the expire window, but only once their

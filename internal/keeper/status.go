@@ -118,10 +118,13 @@ func (k *Keeper) Status(ctx context.Context) (Status, error) {
 			fs.State = StateLagging
 		default:
 			first := f.mtime
+			if first.After(now) {
+				first = now
+			}
 			if d, ok := k.dirty[f.rel]; ok && d.Before(first) {
 				first = d
 			}
-			keepAt := f.mtime.Add(k.policy.Grace)
+			keepAt := graceBase(f, first, now).Add(k.policy.Grace)
 			if capAt := first.Add(k.policy.MaxDefer); capAt.Before(keepAt) {
 				keepAt = capAt
 			}
