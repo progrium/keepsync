@@ -7,15 +7,17 @@
 //	KEEPSYNC_ZEROFS_BIN  zerofs (the pinned release, see internal/zerofs)
 //	KEEPSYNC_MINIO_BIN   minio
 //
-// ZeroFS is mounted with FUSE ("zerofs mount"), so /dev/fuse must be
-// usable. The whole run takes about five minutes, two of them waiting
-// out registry.DefaultKeeperTimeout for keeper reassignment.
+// The server reaches ZeroFS over 9P with no mount, so no FUSE is needed
+// unless KEEPSYNC_E2E_MOUNT=fuse. The whole run takes about five minutes,
+// two of them waiting out registry.DefaultKeeperTimeout for keeper
+// reassignment.
 //
 //	KEEPSYNC_ZEROFS_BIN=/opt/e2ebin/zerofs KEEPSYNC_MINIO_BIN=/opt/e2ebin/minio \
 //	  go test ./test/e2e -v -timeout 30m
 //
 // KEEPSYNC_E2E_MODE=cache runs the same suite with the server in cache
-// mode (no local blob store).
+// mode (no local blob store). KEEPSYNC_E2E_MOUNT picks how the server
+// reaches ZeroFS: 9p (the default, as for `server init`) or fuse.
 package e2e
 
 import (
@@ -380,6 +382,15 @@ func e2eMode() string {
 	return config.ModeStore
 }
 
+// e2eMount is how the server reaches ZeroFS, from KEEPSYNC_E2E_MOUNT
+// (default 9p).
+func e2eMount() zerofs.MountMode {
+	if m := os.Getenv("KEEPSYNC_E2E_MOUNT"); m != "" {
+		return zerofs.MountMode(m)
+	}
+	return zerofs.MountNineP
+}
+
 func (c *cluster) storage() config.Storage {
 	return config.Storage{
 		URL:             "s3://" + c.bucket + "/" + c.prefix,
@@ -402,7 +413,7 @@ func (c *cluster) startServer() {
 		Network:    c.net,
 		Storage:    c.storage(),
 		ZeroFS:     c.zfsBin,
-		Mount:      string(zerofs.MountFUSE),
+		Mount:      string(e2eMount()),
 		Mode:       e2eMode(),
 		NoDownload: true,
 		Logf:       lf,

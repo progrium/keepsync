@@ -86,7 +86,7 @@ func (e *env) recover(args []string) error {
 	passFile := fs.String("passphrase-file", "", "read the kit passphrase from a file (default $KEEPSYNC_KIT_PASSPHRASE, else prompt)")
 	accessKey := fs.String("access-key", "", "bucket write credentials, if the kit holds a read-only token")
 	secretKey := fs.String("secret-key", "", "bucket secret key for --access-key")
-	mount := fs.String("mount", "", "ZeroFS mount mode: fuse (default), v9fs or external")
+	mount := fs.String("mount", "", "how to reach ZeroFS: 9p, fuse, v9fs or external (default: the kit server's)")
 	mode := fs.String("mode", "", "server mode to recover into: store (copy every blob to local disk) or cache (rebuild only the index); default the kit's")
 	pos, err := parse(fs, args, 1, 1, "<kit> [--drill --bucket <copy> [--baseline <file>]]")
 	if err != nil {

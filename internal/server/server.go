@@ -33,7 +33,9 @@ type InitOptions struct {
 	ZeroFS string
 	// PasswordFile imports an existing ZeroFS password, to adopt a bucket.
 	PasswordFile string
-	// Mount and MountDir set the ZeroFS mount mode and mount point.
+	// Mount and MountDir set the ZeroFS mount mode and mount point. An
+	// empty Mount means 9p, written to server.toml as such: a server.toml
+	// without one (from before 9p) keeps zerofs's default, fuse.
 	Mount    string
 	MountDir string
 	// NoDownload fails instead of downloading the pinned zerofs.
@@ -69,6 +71,9 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	}
 	if o.Storage.URL == "" {
 		return nil, errors.New("server: a bucket URL is required (--bucket s3://bucket/prefix)")
+	}
+	if o.Mount == "" {
+		o.Mount = string(zerofs.MountNineP)
 	}
 	cfg := &config.Server{
 		Dir:     o.Dir,

@@ -93,8 +93,9 @@ type ZeroFS struct {
 	Binary string `toml:"binary,omitempty,omitzero"`
 	// Password is the ZeroFS encryption password.
 	Password string `toml:"password"`
-	// Mount is how keepsync reaches ZeroFS: "fuse" (default), "9p" (a
-	// 9P client in keepsync, no mount), "v9fs" or "external".
+	// Mount is how keepsync reaches ZeroFS: "9p" (a 9P client in
+	// keepsync, no mount; what `server init` writes by default), "fuse",
+	// "v9fs" or "external". Empty is fuse, for configs from before 9p.
 	Mount string `toml:"mount,omitempty,omitzero"`
 	// MountDir overrides the mount point (default <server dir>/zerofs/mnt).
 	MountDir      string  `toml:"mount_dir,omitempty,omitzero"`
