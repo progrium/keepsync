@@ -178,19 +178,33 @@ func (n *Node) hookNode(folder string) bool {
 }
 
 // conflictNode names the node whose change a conflict copy holds.
-func (n *Node) conflictNode(copyPath string) string {
-	short, ok := syncer.ConflictDevice(filepath.Base(copyPath))
-	if !ok {
+func (n *Node) conflictNode(folder, copyPath string) string {
+	// The node that lost creates the copy, so the copy's ModifiedBy is
+	// the device whose change it holds. The ID in the copy's name is the
+	// winner's and is no use here.
+	var dev api.DeviceID
+	n.cfgMu.Lock()
+	f, ok := n.cfg.Folder(folder)
+	n.cfgMu.Unlock()
+	if ok && n.sy != nil {
+		if rel, err := filepath.Rel(f.Path, copyPath); err == nil {
+			dev, _ = n.sy.ModifiedBy(f.ID, filepath.ToSlash(rel))
+		}
+	}
+	if dev == "" {
 		return ""
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, nd := range n.member.Nodes {
-		if strings.HasPrefix(string(nd.Device), short) && nd.Name != "" {
+		if nd.Device == dev && nd.Name != "" {
 			return nd.Name
 		}
 	}
-	return short
+	if len(dev) > 7 {
+		return string(dev[:7])
+	}
+	return string(dev)
 }
 
 func (n *Node) folderKeep(folder string) (*api.KeepPolicy, api.BlobRef) {
@@ -210,7 +224,7 @@ func (n *Node) folderKeep(folder string) (*api.KeepPolicy, api.BlobRef) {
 func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) ConflictInfo {
 	c := n.conf()
 	orig, _ := syncer.ConflictOriginal(abs)
-	info := ConflictInfo{Folder: folder, Path: abs, Original: orig, Node: n.conflictNode(abs)}
+	info := ConflictInfo{Folder: folder, Path: abs, Original: orig, Node: n.conflictNode(folder, abs)}
 	set := func(state, reason string, stamp fileStamp, ran bool) ConflictInfo {
 		c.mu.Lock()
 		st := c.states[abs]
@@ -342,7 +356,7 @@ func (n *Node) listConflicts() []ConflictInfo {
 	found := n.findConflicts()
 	for i := range found {
 		ci := &found[i]
-		ci.Node = n.conflictNode(ci.Path)
+		ci.Node = n.conflictNode(ci.Folder, ci.Path)
 		c.mu.Lock()
 		st := c.states[ci.Path]
 		if st != nil {

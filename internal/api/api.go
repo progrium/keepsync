@@ -230,6 +230,10 @@ type Syncer interface {
 	SetFolders(ctx context.Context, folders []FolderConfig) error
 	// Scan rescans one path now instead of waiting for the watcher.
 	Scan(ctx context.Context, folderID, subpath string) error
+	// ModifiedBy reports the device that last changed path in the global
+	// index. For a conflict copy that is the device whose losing version
+	// it holds (the copy's name carries the winner's ID instead).
+	ModifiedBy(folderID, path string) (DeviceID, bool)
 	Events() <-chan SyncEvent
 	Stop(ctx context.Context) error
 }

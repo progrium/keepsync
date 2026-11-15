@@ -558,6 +558,7 @@ type Syncer struct {
 	Folders []api.FolderConfig
 	Scans   []string // "folderID/subpath"
 	events  chan api.SyncEvent
+	modBy   map[string]api.DeviceID
 }
 
 func NewSyncer(id api.DeviceID) *Syncer {
@@ -591,6 +592,23 @@ func (s *Syncer) Scan(ctx context.Context, folderID, subpath string) error {
 }
 
 func (s *Syncer) Events() <-chan api.SyncEvent { return s.events }
+
+// SetModifiedBy sets what ModifiedBy reports for folderID/path.
+func (s *Syncer) SetModifiedBy(folderID, path string, d api.DeviceID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.modBy == nil {
+		s.modBy = map[string]api.DeviceID{}
+	}
+	s.modBy[folderID+"/"+path] = d
+}
+
+func (s *Syncer) ModifiedBy(folderID, path string) (api.DeviceID, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.modBy[folderID+"/"+path]
+	return d, ok
+}
 
 // Emit delivers an event to Events.
 func (s *Syncer) Emit(ev api.SyncEvent) { s.events <- ev }

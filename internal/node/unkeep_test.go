@@ -95,6 +95,8 @@ func newTestNodeOpts(t *testing.T, putter func(*fake.Perkeep) api.BlobPutter, ot
 	dir := filepath.Join(t.TempDir(), "docs")
 	os.MkdirAll(dir, 0o755)
 	cfg.SetFolder(config.Folder{Name: "docs", Path: dir, ID: f.ID})
+	// The conflict copy in the tests holds the other node's losing change.
+	n.sy.(*fake.Syncer).SetModifiedBy(f.ID, copyName, "OTHERDV-XXXXXXX")
 	n.up.Store(true)
 	t.Cleanup(n.shutdown)
 	return &testNode{Node: n, freg: reg, pk: pk, dir: dir, ctx: ctx, stop: cancel}

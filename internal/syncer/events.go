@@ -81,17 +81,25 @@ func (s *Syncer) translate(ev events.Event) []api.SyncEvent {
 }
 
 // conflictEvent returns a SyncConflict event if path is a conflict copy.
-// Device is the device whose losing version the copy holds, taken from the
-// short ID in the name.
+// Device is the device whose losing version the copy holds: the copy's
+// ModifiedBy in the global index, since the node that lost creates the
+// copy. The short ID in the copy's name is the winner's (Syncthing names
+// it after the incoming version's ModifiedBy), so it is not used.
 func (s *Syncer) conflictEvent(folder, path string, t time.Time) []api.SyncEvent {
-	short, ok := ConflictDevice(path)
-	if !ok {
+	if !IsConflict(path) {
 		return nil
 	}
 	return []api.SyncEvent{{
 		Type: api.SyncConflict, Folder: folder, Path: path,
-		Device: s.deviceForShort(short), Time: t,
+		Device: s.modifiedBy(folder, path), Time: t,
 	}}
+}
+
+// ModifiedBy reports the device that last changed path in the global
+// index (api.Syncer).
+func (s *Syncer) ModifiedBy(folderID, path string) (api.DeviceID, bool) {
+	d := s.modifiedBy(folderID, path)
+	return d, d != ""
 }
 
 var conflictRE = regexp.MustCompile(`\.sync-conflict-\d{8}-\d{6}-([A-Z0-9]{7})`)
@@ -103,7 +111,8 @@ func IsConflict(path string) bool {
 }
 
 // ConflictDevice returns the short device ID embedded in a conflict copy's
-// name ("a.sync-conflict-20260101-120000-ABCDEFG.txt" -> "ABCDEFG").
+// name ("a.sync-conflict-20260101-120000-ABCDEFG.txt" -> "ABCDEFG"). That
+// is the device whose version won, not the one the copy holds.
 func ConflictDevice(path string) (string, bool) {
 	m := conflictRE.FindStringSubmatch(filepath.Base(path))
 	if m == nil {

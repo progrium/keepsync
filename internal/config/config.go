@@ -196,7 +196,7 @@ type Node struct {
 	ConflictHook string `toml:"conflict_hook,omitempty,omitzero"`
 	// ConflictHookTimeout bounds one hook run. Default 5m.
 	ConflictHookTimeout Duration `toml:"conflict_hook_timeout,omitempty,omitzero"`
-	Folders      []Folder `toml:"folder"`
+	Folders             []Folder `toml:"folder"`
 }
 
 // Gateway configures a node's local, read-only Perkeep gateway.

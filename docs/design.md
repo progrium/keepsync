@@ -251,7 +251,7 @@ The script runs in the folder root and its output is logged. It gets:
 | `KEEPSYNC_FOLDER` | Folder name |
 | `KEEPSYNC_ORIGINAL` | Absolute path of the current file |
 | `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
-| `KEEPSYNC_CONFLICT_NODE` | Name of the node whose device is in the copy's name, else the short device ID |
+| `KEEPSYNC_CONFLICT_NODE` | Name of the node whose losing change the copy holds, else its short device ID. This is the copy's `ModifiedBy` in Syncthing's index. The ID in the copy's name is the winner's, so it isn't used. |
 | `KEEPSYNC_BASE` | The base in a temp file, for a three-way merge, or empty if there is none (always empty on an unkept folder). The file is deleted afterwards. |
 
 **Contract.** To resolve, the script writes the result to the original path, deletes the conflict copy and exits 0. Syncthing syncs that like any other edit. A non-zero exit, a timeout, or a copy still in place leaves the conflict for a human. A failed copy is not retried until its size or mtime changes.
