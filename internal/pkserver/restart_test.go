@@ -2,6 +2,9 @@ package pkserver
 
 import (
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -80,4 +83,60 @@ func TestFlushAfterZeroFSRestart(t *testing.T) {
 		t.Fatalf("flush after the restart: %v", err)
 	}
 	waitDurable(t, e, []api.BlobRef{ref})
+}
+
+// restartingNineP is ninePZeroFS reporting restarts.
+type restartingNineP struct {
+	*ninePZeroFS
+	restarts atomic.Uint64
+}
+
+func (z *restartingNineP) Restarts() uint64 { return z.restarts.Load() }
+
+// TestCacheModePutsBackLostSignedBlobs checks that in cache mode a
+// permanode the server signed, lost by a ZeroFS restart before a flush, is
+// put back by the next flush, and that the stash empties once flushed.
+func TestCacheModePutsBackLostSignedBlobs(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	dir := filepath.Join(root, "server")
+	if _, err := Init(dir); err != nil {
+		t.Fatal(err)
+	}
+	zdir := filepath.Join(root, "zerofs")
+	z := &restartingNineP{ninePZeroFS: newNinePZeroFS(t, zdir)}
+	srv := startWith(t, ModeCache, dir, z)
+	t.Cleanup(func() { srv.Close() })
+
+	pn, err := srv.NewPermanode(ctx, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stashed := filepath.Join(dir, stashDir, string(pn))
+	if _, err := os.Stat(stashed); err != nil {
+		t.Fatalf("permanode not stashed: %v", err)
+	}
+	// ZeroFS dies before a flush and loses the permanode.
+	var lost []string
+	filepath.WalkDir(zdir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.Contains(d.Name(), strings.TrimPrefix(string(pn), "sha224-")) {
+			lost = append(lost, p)
+		}
+		return nil
+	})
+	if len(lost) != 1 {
+		t.Fatalf("permanode files on zerofs: %v", lost)
+	}
+	os.Remove(lost[0])
+	z.restarts.Add(1)
+
+	if err := srv.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := fetchString(t, srv, pn); !strings.Contains(got, "permanode") {
+		t.Fatalf("permanode not put back: %q", got)
+	}
+	if _, err := os.Stat(stashed); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stash not emptied after a flush: %v", err)
+	}
 }

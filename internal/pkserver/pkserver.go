@@ -171,7 +171,10 @@ type Server struct {
 
 	flushMu  sync.Mutex // serializes Flush
 	restarts uint64     // ZeroFS restarts already handled; guarded by flushMu
-	wm       watermark
+	// stashChecked: the stash was checked against the blob store since
+	// the last ZeroFS restart; guarded by claimMu.
+	stashChecked bool
+	wm           watermark
 }
 
 var (

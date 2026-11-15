@@ -772,6 +772,9 @@ func (s *Server) signClaim(ctx context.Context, bb *schema.Builder, notBefore ti
 	if err != nil {
 		return blob.Ref{}, time.Time{}, fmt.Errorf("pkserver: storing claim: %w", err)
 	}
+	if err := s.stashSigned(pr.BlobRef, signed); err != nil {
+		return blob.Ref{}, time.Time{}, err
+	}
 	return pr.BlobRef, now, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -192,6 +193,15 @@ func (s *Server) Flush(ctx context.Context) error {
 			return err
 		}
 		s.restarts = restarts
+		s.claimMu.Lock()
+		s.stashChecked = false
+		s.claimMu.Unlock()
+	}
+	// The signed blobs stashed so far are in the blob store (put back
+	// above if a restart lost them), so this flush covers them.
+	stashed, err := s.checkStash(ctx)
+	if err != nil {
+		return err
 	}
 
 	w.mu.Lock()
@@ -240,6 +250,7 @@ func (s *Server) Flush(ctx context.Context) error {
 		w.done = start
 	}
 	w.mu.Unlock()
+	s.unstash(stashed)
 	return nil
 }
 
@@ -334,6 +345,8 @@ func (s *Server) afterRestart(ctx context.Context) error {
 	}
 	w.mu.Unlock()
 	if s.cacheMode() {
+		// Signed blobs are put back by checkStash; content comes back
+		// when a keeper puts its file again before expiring it.
 		s.logf("pkserver: zerofs restarted; %d blobs it had not flushed are no longer counted as stored", forgot)
 		return nil
 	}
@@ -388,4 +401,111 @@ func (s *Server) repairReplica(ctx context.Context) (int, error) {
 		err = check()
 	}
 	return copied, err
+}
+
+// In cache mode the blob store is on ZeroFS, so a claim or permanode the
+// server signed exists only there until a flush covers it, and a ZeroFS
+// that dies first loses it. Nodes can put content again, but only the
+// server can sign, and a fresh signature is a different blob from the one
+// the index and the tree already name. So every blob the server signs is
+// stashed in Dir/unflushed until a flush covers it, and put back from
+// there when ZeroFS restarted.
+const stashDir = "unflushed"
+
+// stashSigned keeps a copy of a signed blob just stored, in cache mode.
+// The caller holds claimMu.
+func (s *Server) stashSigned(ref blob.Ref, signed string) error {
+	if !s.cacheMode() {
+		return nil // the local primary holds it; repairReplica covers it
+	}
+	dir := filepath.Join(s.cfg.Dir, stashDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("pkserver: stash: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("pkserver: stash: %w", err)
+	}
+	_, err = tmp.WriteString(signed)
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), filepath.Join(dir, ref.String()))
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return fmt.Errorf("pkserver: stash: %w", err)
+	}
+	return nil
+}
+
+// checkStash lists the stashed blobs and returns them. Unless they were
+// checked since ZeroFS last restarted (and since this server started, in
+// case it stopped with blobs stashed), it first puts back any the blob
+// store lacks. It holds claimMu so that no blob is stored but not yet
+// stashed meanwhile.
+func (s *Server) checkStash(ctx context.Context) ([]blob.Ref, error) {
+	if !s.cacheMode() {
+		return nil, nil
+	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	dir := filepath.Join(s.cfg.Dir, stashDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("pkserver: stash: %w", err)
+	}
+	var refs []blob.Ref
+	for _, e := range ents {
+		if br, ok := blob.Parse(e.Name()); ok {
+			refs = append(refs, br)
+		}
+	}
+	if s.stashChecked || len(refs) == 0 {
+		s.stashChecked = true
+		return refs, nil
+	}
+	have := map[blob.Ref]bool{}
+	for start := 0; start < len(refs); start += 1000 {
+		err := s.bs.StatBlobs(ctx, refs[start:min(start+1000, len(refs))], func(sb blob.SizedRef) error {
+			have[sb.Ref] = true
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("pkserver: stash: %w", err)
+		}
+	}
+	put := 0
+	for _, br := range refs {
+		if have[br] {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, br.String()))
+		if err != nil {
+			return nil, fmt.Errorf("pkserver: stash: %w", err)
+		}
+		if _, err := s.bs.ReceiveBlob(ctx, br, bytes.NewReader(data)); err != nil {
+			return nil, fmt.Errorf("pkserver: putting back signed blob %s: %w", br, err)
+		}
+		put++
+	}
+	if put > 0 {
+		s.logf("pkserver: put back %d signed blobs zerofs lost", put)
+	}
+	s.stashChecked = true
+	return refs, nil
+}
+
+// unstash drops stashed blobs that a successful flush covered.
+func (s *Server) unstash(refs []blob.Ref) {
+	dir := filepath.Join(s.cfg.Dir, stashDir)
+	for _, br := range refs {
+		if err := os.Remove(filepath.Join(dir, br.String())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logf("pkserver: stash: %v", err)
+		}
+	}
 }
