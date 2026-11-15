@@ -33,6 +33,9 @@ type RestoreParams struct {
 	To string `json:"to,omitempty"`
 	// Force overwrites local files that differ from the kept version.
 	Force bool `json:"force,omitempty"`
+	// At, if set, restores the tree as the server had kept it at that
+	// time (when each version's claim was signed, not the file mtime).
+	At time.Time `json:"at,omitzero"`
 }
 
 // RestoreResult is the result of MethodRestore.
@@ -66,7 +69,8 @@ func (n *Node) fetcher() (*client.Client, error) {
 }
 
 // restore pulls kept files of a folder back out of Perkeep, including
-// files that have expired from sync. It reads the folder's current tree.
+// files that have expired from sync. It reads the folder's current tree,
+// or the tree as of p.At.
 func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, error) {
 	var res RestoreResult
 	lf, err := n.localFolder(p.Folder)
@@ -86,7 +90,12 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 	}
 	res.Dir = dest
 
-	tree, err := n.reg.Paths(ctx, m.Permanode)
+	var tree map[string]api.PathEntry
+	if p.At.IsZero() {
+		tree, err = n.reg.Paths(ctx, m.Permanode)
+	} else {
+		tree, err = n.reg.PathsAt(ctx, m.Permanode, p.At)
+	}
 	if err != nil {
 		return res, err
 	}
@@ -97,6 +106,9 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 		}
 	}
 	if len(names) == 0 {
+		if !p.At.IsZero() {
+			return res, fmt.Errorf("nothing kept under %q in %s as of %s", p.Path, p.Folder, p.At.Format(time.RFC3339))
+		}
 		return res, fmt.Errorf("nothing kept under %q in %s", p.Path, p.Folder)
 	}
 	sort.Strings(names)

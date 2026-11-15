@@ -41,3 +41,19 @@ func TestNotRunning(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestParseAt(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	if got, err := parseAt("3d", now); err != nil || !got.Equal(now.Add(-72*time.Hour)) {
+		t.Fatalf("3d: %v %v", got, err)
+	}
+	if got, err := parseAt("2026-11-01T10:00:00Z", now); err != nil || !got.Equal(time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf("rfc3339: %v %v", got, err)
+	}
+	if got, err := parseAt("2026-11-01", now); err != nil || got.Day() != 1 || got.Location() != time.Local {
+		t.Fatalf("date: %v %v", got, err)
+	}
+	if _, err := parseAt("yesterday", now); err == nil {
+		t.Fatal("want error")
+	}
+}
