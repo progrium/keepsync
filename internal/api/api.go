@@ -113,6 +113,9 @@ const (
 type PathEntry struct {
 	File    BlobRef
 	ModTime time.Time
+	// Claim is the signed claim blob that set this value. A path is only
+	// recoverable by name once both File and Claim are durable.
+	Claim BlobRef
 }
 
 // RegistryClient is what a node uses to talk to the server's registry.

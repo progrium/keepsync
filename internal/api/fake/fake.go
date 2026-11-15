@@ -189,8 +189,10 @@ func (p *Perkeep) ClaimPath(ctx context.Context, c api.PathClaim) (api.ClaimResu
 			return api.ClaimRejectedOlder, nil
 		}
 	}
-	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime}
 	p.Claims++
+	claim := api.BlobRef(fmt.Sprintf("sha224-claim%04d", p.Claims))
+	p.blobs[claim] = false
+	tree[c.Path] = api.PathEntry{File: c.File, ModTime: c.ModTime, Claim: claim}
 	return api.ClaimWritten, nil
 }
 
