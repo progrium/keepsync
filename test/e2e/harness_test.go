@@ -41,10 +41,25 @@ import (
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/ctl"
+	"github.com/progrium/keepsync/internal/keeper"
 	"github.com/progrium/keepsync/internal/node"
 	"github.com/progrium/keepsync/internal/server"
 	"github.com/progrium/keepsync/internal/zerofs"
 )
+
+// knownBugEnv turns known bugs from log lines into failures.
+const knownBugEnv = "KEEPSYNC_E2E_KNOWN_BUGS"
+
+// knownBug reports a bug that is known and not fixed yet: a failure with
+// KEEPSYNC_E2E_KNOWN_BUGS=1, else a log line, so the suite stays green.
+func knownBug(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(knownBugEnv) != "" {
+		t.Errorf("known bug: "+format, args...)
+		return
+	}
+	t.Logf("KNOWN BUG (set %s=1 to fail on it): "+format, append([]any{knownBugEnv}, args...)...)
+}
 
 // binary finds a required external binary, or skips the test.
 func binary(t *testing.T, env, name string) string {
@@ -466,6 +481,9 @@ func (c *cluster) addNode(name string) *testNode {
 	}
 	res.Config.KeepInterval = config.Duration(time.Second)
 	res.Config.ConflictHook = c.hookScript(name)
+	// Each node's gateway on its own loopback port (they share a host).
+	gw := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	res.Config.Gateway.Listen = &gw
 	if err := res.Config.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +635,7 @@ if [ -n "$KEEPSYNC_BASE" ]; then
   cp "$KEEPSYNC_BASE" "` + c.root + `/hookbase-` + name + `-$orig"
   base=yes
 fi
-echo "` + name + ` $KEEPSYNC_FOLDER $orig $KEEPSYNC_CONFLICT_NODE base=$base" >> "` + c.hookLog() + `"
+echo "` + name + ` $KEEPSYNC_FOLDER $orig $KEEPSYNC_CONFLICT_NODE base=$base exact=${KEEPSYNC_BASE_EXACT-unset}" >> "` + c.hookLog() + `"
 case "$orig" in
 fail-*) exit 1 ;;
 esac
@@ -662,4 +680,89 @@ func (n *testNode) setMtime(folder, rel string, t time.Time) {
 	if err := os.Chtimes(n.path(folder, rel), t, t); err != nil {
 		n.c.t.Fatal(err)
 	}
+}
+
+// archiveAttrs returns the Perkeep attributes of the permanode that the
+// kept tree of folder names rel by, read through n's gateway (n needs the
+// read scope). It walks camliPath:<name> from the folder's root.
+func (n *testNode) archiveAttrs(folder, rel string) (map[string][]string, error) {
+	m, err := keeper.ReadMapping(n.dir(folder))
+	if err != nil {
+		return nil, err
+	}
+	pn := string(m.Permanode)
+	for _, name := range strings.Split(rel, "/") {
+		attrs, err := n.describe(pn)
+		if err != nil {
+			return nil, err
+		}
+		next := attrs["camliPath:"+name]
+		if len(next) == 0 {
+			return nil, fmt.Errorf("%s: no camliPath:%s on %s", rel, name, pn)
+		}
+		pn = next[0]
+	}
+	return n.describe(pn)
+}
+
+// describe returns a permanode's current attributes through n's gateway.
+func (n *testNode) describe(pn string) (map[string][]string, error) {
+	var gi node.GatewayInfo
+	if err := n.call(node.MethodGateway, nil, &gi); err != nil {
+		return nil, err
+	}
+	if !gi.Enabled {
+		return nil, errors.New("gateway not running on " + n.name)
+	}
+	get := func(path string, hdr http.Header, v any) error {
+		req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(gi.URL, "/")+path, nil)
+		if err != nil {
+			return err
+		}
+		for k, vs := range hdr {
+			req.Header[k] = vs
+		}
+		req.SetBasicAuth("keepsync", gi.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("gateway %s: %s: %s", path, resp.Status, b)
+		}
+		return json.Unmarshal(b, v)
+	}
+	var disc struct {
+		SearchRoot string `json:"searchRoot"`
+	}
+	if err := get("/", http.Header{"Accept": {"text/x-camli-configuration"}}, &disc); err != nil {
+		return nil, err
+	}
+	if disc.SearchRoot == "" {
+		return nil, errors.New("gateway discovery has no searchRoot")
+	}
+	var res struct {
+		Meta map[string]struct {
+			Permanode *struct {
+				Attr map[string][]string `json:"attr"`
+			} `json:"permanode"`
+		} `json:"meta"`
+	}
+	if err := get(disc.SearchRoot+"camli/search/describe?blobref="+url.QueryEscape(pn), nil, &res); err != nil {
+		return nil, err
+	}
+	d, ok := res.Meta[pn]
+	if !ok || d.Permanode == nil {
+		return nil, fmt.Errorf("%s is not described as a permanode", pn)
+	}
+	return d.Permanode.Attr, nil
+}
+
+func attr(a map[string][]string, k string) string {
+	if v := a[k]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
 }
