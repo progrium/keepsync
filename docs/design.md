@@ -347,6 +347,21 @@ When the server is unreachable, sync keeps working, and only keeping, expiry and
 | Conflict hook fails or makes a bad merge | A failure leaves the copy for a human, shown in `conflicts`. Both versions were kept before the hook ran, so a bad merge can be undone with `restore`. |
 | Server lost | `keepsync recover <kit>` from the bucket. The tailcat key is the same, so nodes reconnect on their own. |
 
+## Edge cases
+
+**A file recreated at an expired path.** The kept tree only grows, so the expired file's permanode still holds the path.
+
+- **Normal case.** The new file is the path's next version. After grace it gets one new content claim on the same file permanode, and the old content stays in its history.
+  - `PathsAt`, `restore --at` and `pk-mount`'s `at/` show the old file for times before the new one was kept, and the new file after that.
+  - A plain `restore` brings back the new file. `restore --at <earlier> --to <dir>` gets the old one.
+  - Restoring the old one into the folder skips it, because a different file is there. `--force` would overwrite the new file with the old one.
+  - Grace and expiry are measured from the new file's mtime, so they start fresh.
+- **New file with an older mtime than the expired version.** This happens when the file comes from `cp -p`, an unzip or `rsync -a`. The server rejects the claim as older, because that rule stops a lagging node rolling a file back.
+  - The keeper reports the file as lagging in `keep status`, and never keeps or expires it, so it just stays in sync.
+  - Workaround: `touch` the file, so its mtime is newer.
+  - A possible fix, not built: accept an older mtime when the path's current version has already expired from sync.
+- **New file with exactly the expired version's mtime but different content.** The keeper decides "already kept" by mtime alone, so the new file is never put. Expiry checks the content ref, so it does not remove the file either, and it stays in sync unarchived. `touch` fixes this too.
+
 ## Testing
 
 Every package has unit tests against the fakes in `internal/api/fake`.
