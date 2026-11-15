@@ -553,7 +553,10 @@ func (k *Keeper) markGone(ctx context.Context, rel string, ref api.BlobRef, why 
 // markDeleted marks kept paths that have left sync. A path counts only when
 // it is missing on disk and Syncthing's current version is a delete, so a
 // node that is behind, or has no Syncer, marks nothing. A path whose kept
-// version is past the expire window was expired by another keeper.
+// version is past the expire window and durable may have been expired by
+// another keeper, so it is marked expired; any other is marked deleted,
+// since expiry never removes a file that is not durable. If durability
+// cannot be checked, past-window paths wait for the next pass.
 func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry, seen map[string]bool, now time.Time, rep *Report) {
 	if k.cfg.Syncer == nil {
 		return
@@ -565,6 +568,7 @@ func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry,
 		}
 	}
 	sort.Strings(rels)
+	var pastWindow []string
 	for _, rel := range rels {
 		if ctx.Err() != nil {
 			return
@@ -578,11 +582,30 @@ func (k *Keeper) markDeleted(ctx context.Context, tree map[string]api.PathEntry,
 			continue
 		}
 		e := tree[rel]
-		why := api.GoneDeleted
 		if k.policy.Expire > 0 && now.Sub(e.ModTime) >= k.policy.Expire {
-			why = api.GoneExpired
+			pastWindow = append(pastWindow, rel)
+			continue
 		}
-		k.markGone(ctx, rel, e.File, why, rep)
+		k.markGone(ctx, rel, e.File, api.GoneDeleted, rep)
+	}
+	for start := 0; start < len(pastWindow); start += durableBatch {
+		batch := pastWindow[start:min(start+durableBatch, len(pastWindow))]
+		groups := make([][]api.BlobRef, len(batch))
+		for i, rel := range batch {
+			groups[i] = recoverRefs(tree[rel])
+		}
+		ok, err := k.allDurable(ctx, groups)
+		if err != nil {
+			k.logf("keeper %s: gone marks wait: %v", k.cfg.Folder, err)
+			return
+		}
+		for i, rel := range batch {
+			why := api.GoneDeleted
+			if ok[i] {
+				why = api.GoneExpired
+			}
+			k.markGone(ctx, rel, tree[rel].File, why, rep)
+		}
 	}
 }
 

@@ -165,10 +165,24 @@ func TestDeleteAfterExpireWindowCountsExpired(t *testing.T) {
 	e := newEnv(t)
 	e.write("a.txt", "a", 40*day)
 	e.pass() // kept; not durable yet, so this node does not expire it
-	// Another keeper expired it, and the delete synced here.
+	// Another keeper flushed and expired it, and the delete synced here.
+	e.pk.MarkDurable()
 	e.remove("a.txt")
 	e.state("a.txt", deleted())
 	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneExpired {
+		t.Fatalf("rep %+v", rep)
+	}
+}
+
+// A past-window file deleted before its kept version was durable was not
+// expired by any keeper (expiry needs durability), so it was deleted.
+func TestDeleteAfterExpireWindowNotDurableCountsDeleted(t *testing.T) {
+	e := newEnv(t)
+	e.write("a.txt", "a", 40*day)
+	e.pass()
+	e.remove("a.txt")
+	e.state("a.txt", deleted())
+	if rep := e.pass(); rep.Gone["a.txt"] != api.GoneDeleted {
 		t.Fatalf("rep %+v", rep)
 	}
 }
