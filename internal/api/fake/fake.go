@@ -128,7 +128,7 @@ func (t *Transport) Close() error {
 	return nil
 }
 
-// Perkeep is an in-memory Signer, Durability and BlobPutter sharing one
+// Perkeep is an in-memory Signer, Durability, and BlobPutter sharing one
 // store. Blobs become durable only when MarkDurable is called, standing in
 // for a ZeroFS flush.
 type Perkeep struct {

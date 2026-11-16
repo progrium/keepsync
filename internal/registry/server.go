@@ -43,12 +43,12 @@ type Config struct {
 }
 
 // ServerSummary is the short view of the server that any member node may
-// fetch for its own status. Keys, scopes and the node list stay in the
+// fetch for its own status. Keys, scopes, and the node list stay in the
 // server's own status.
 type ServerSummary struct {
 	Mode      string    `json:"mode"`
 	LastFlush time.Time `json:"lastFlush,omitzero"`
-	// ZeroFS is the supervisor's state ("up", "reconnecting" or "down"),
+	// ZeroFS is the supervisor's state ("up", "reconnecting", or "down"),
 	// since when, and, when not up, what is wrong.
 	ZeroFS      string    `json:"zerofs,omitempty"`
 	ZeroFSSince time.Time `json:"zerofsSince,omitzero"`
@@ -69,7 +69,7 @@ type ServerSummary struct {
 	BucketErr   string    `json:"bucketErr,omitempty"`
 }
 
-// Server is the registry: the membership list, folders, keep policies and
+// Server is the registry: the membership list, folders, keep policies, and
 // keeper assignments, plus the gateway through which nodes reach the
 // server's Signer and Durability.
 type Server struct {
@@ -264,7 +264,7 @@ const (
 	// ScopeBlobs allows uploading and fetching blobs, which is what the
 	// keeper needs. Every node has it by default.
 	ScopeBlobs = "blobs"
-	// ScopeRead adds search, the web UI, pk-get and pk-mount: everything
+	// ScopeRead adds search, the web UI, pk-get, and pk-mount: everything
 	// that reads the archive. It still cannot sign or delete.
 	ScopeRead = "read"
 )
@@ -349,7 +349,7 @@ func (s *Server) Reconcile(ctx context.Context) error {
 var errNoChange = errors.New("no change")
 
 // mutate applies fn to a copy of the state and, if fn changed it, saves the
-// copy, swaps it in and publishes it. fn runs with s.mu held.
+// copy, swaps it in, and publishes it. fn runs with s.mu held.
 func (s *Server) mutate(ctx context.Context, fn func(*State) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -762,7 +762,7 @@ func (s *Server) joinFolder(ctx context.Context, peer api.NodeKey, name string) 
 	return out, err
 }
 
-// leaveFolder removes peer from a folder's members, receive-only list and
+// leaveFolder removes peer from a folder's members, receive-only list, and
 // keepers, and refills the keepers from the remaining connected members.
 // Leaving a folder the node is not in is a no-op. The folder itself, and
 // its kept archive, stay even if its last member leaves.

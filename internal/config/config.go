@@ -3,7 +3,7 @@
 // and run reads.
 //
 // Every role has a directory. The server's holds its tailcat key, the
-// Perkeep identity and blobs, ZeroFS's state and the registry; the node's
+// Perkeep identity and blobs, ZeroFS's state, and the registry; the node's
 // holds its tailcat key, the Syncthing certificate and index, and the local
 // folder paths. Both hold a control socket that the other CLI commands use
 // to talk to the running process (package ctl).
@@ -95,7 +95,7 @@ type ZeroFS struct {
 	Password string `toml:"password"`
 	// Mount is how keepsync reaches ZeroFS: "9p" (a 9P client in
 	// keepsync, no mount; what `server init` writes by default), "fuse",
-	// "v9fs" or "external". Empty is fuse, for configs from before 9p.
+	// "v9fs", or "external". Empty is fuse, for configs from before 9p.
 	Mount string `toml:"mount,omitempty,omitzero"`
 	// MountDir overrides the mount point (default <server dir>/zerofs/mnt).
 	MountDir      string  `toml:"mount_dir,omitempty,omitzero"`
@@ -247,7 +247,7 @@ const DefaultFlushInterval = time.Minute
 // KeyPath is the server's tailcat identity.
 func (c *Server) KeyPath() string { return filepath.Join(c.Dir, KeyFile) }
 
-// PerkeepDir holds the Perkeep identity, local blobs and index.
+// PerkeepDir holds the Perkeep identity, local blobs, and index.
 func (c *Server) PerkeepDir() string { return filepath.Join(c.Dir, "perkeep") }
 
 // ZeroFSDir is the ZeroFS supervisor's data dir (config, cache, sockets,
@@ -353,7 +353,7 @@ func (c *Node) HookFor(folder string) string {
 // KeyPath is the node's tailcat identity.
 func (c *Node) KeyPath() string { return filepath.Join(c.Dir, KeyFile) }
 
-// SyncthingDir holds the Syncthing certificate, index and generated config.
+// SyncthingDir holds the Syncthing certificate, index, and generated config.
 func (c *Node) SyncthingDir() string { return filepath.Join(c.Dir, "syncthing") }
 
 // MembershipPath caches the last membership seen, so the node keeps syncing

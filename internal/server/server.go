@@ -58,7 +58,7 @@ type InitResult struct {
 }
 
 // Init creates a server directory: the tailcat key (and so the address),
-// the Perkeep identity, the ZeroFS password and the server.toml. It fetches
+// the Perkeep identity, the ZeroFS password, and the server.toml. It fetches
 // the pinned zerofs if none is found. Init connects to DERP once, to learn
 // the address it prints.
 func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
@@ -199,7 +199,7 @@ func Run(ctx context.Context, cfg *config.Server, o Options) (err error) {
 	t := time.NewTicker(cfg.Flush())
 	defer t.Stop()
 	// The supervisor restarts and reconnects zerofs on its own. If it gives
-	// up, the server stays up (sync, the registry and status still work)
+	// up, the server stays up (sync, the registry, and status still work)
 	// and reports zerofs down until it is restarted.
 	gaveUp := s.zfs.Done()
 	for {

@@ -1,7 +1,7 @@
 // Package node wires a keepsync node together: the tailcat transport, the
 // embedded Syncthing, the registry client that drives peers and folders,
 // the keepers for kept folders, and the control socket that `keepsync
-// status`, `folder …` and `keep …` talk to.
+// status`, `folder …`, and `keep …` talk to.
 package node
 
 import (
@@ -47,7 +47,7 @@ type InitResult struct {
 	Device api.DeviceID
 }
 
-// Init writes the node's config, its tailcat key and its Syncthing device
+// Init writes the node's config, its tailcat key, and its Syncthing device
 // certificate. It works offline, except for resolving a DNS server name.
 func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	if _, err := config.LoadNode(o.Dir); err == nil {
@@ -221,7 +221,7 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 }
 
 // newNode returns a Node with nothing started; Run (or a test) fills in
-// the transport, registry client, putter and syncer.
+// the transport, registry client, putter, and syncer.
 func newNode(cfg *config.Node, logf func(string, ...any)) *Node {
 	if logf == nil {
 		logf = log.Printf

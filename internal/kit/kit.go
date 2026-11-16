@@ -359,7 +359,7 @@ func NewPassphrase() (string, error) {
 	return strings.Join(groups, "-"), nil
 }
 
-// Kit is an opened, decrypted and verified kit.
+// Kit is an opened, decrypted, and verified kit.
 type Kit struct {
 	Manifest Manifest
 	tmp      string

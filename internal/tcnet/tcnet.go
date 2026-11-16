@@ -128,7 +128,7 @@ var (
 var ErrClosed = errors.New("tcnet: transport closed")
 
 // New starts a Transport: it loads or creates the key, connects to the
-// DERP relay and begins accepting allowed clients.
+// DERP relay, and begins accepting allowed clients.
 func New(ctx context.Context, o Options) (*Transport, error) {
 	logf := o.Logf
 	if logf == nil {
@@ -297,7 +297,7 @@ func (t *Transport) onTCP(port uint16) func(net.Conn) {
 
 // Dial opens a TCP connection to a virtual port on the process at to. The
 // remote must have allowed this transport's Key. A remote that does not
-// answer (because it does not allow us, is down or does not exist) makes
+// answer (because it does not allow us, is down, or does not exist) makes
 // Dial wait for ctx, or DialTimeout if ctx has no deadline.
 func (t *Transport) Dial(ctx context.Context, to api.Addr, port uint16) (net.Conn, error) {
 	if _, ok := ctx.Deadline(); !ok {

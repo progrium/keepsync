@@ -23,8 +23,8 @@ const (
 )
 
 // nodeGrant is what every node may do over tailcat (the blobs scope):
-// upload, stat and fetch blobs, plus discovery, which upload needs. Not
-// sign, enumerate, search or remove.
+// upload, stat, and fetch blobs, plus discovery, which upload needs. Not
+// sign, enumerate, search, or remove.
 const nodeGrant = auth.OpVivify
 
 // peerKey is the context key of the node a tunnelled request came from.
@@ -77,10 +77,10 @@ var (
 
 // needsRead reports whether r is one of the read requests that the read
 // scope adds to the blobs scope: enumerating blobs, search, the web UI,
-// status and help, and the signing handler's discovery and public key.
+// status, help, and the signing handler's discovery and public key.
 // Requests it accepts are served to read nodes with every operation
 // granted, as the handlers behind them check for auth.OpAll, so it must
-// accept nothing that writes, signs or deletes. Fetching, statting and
+// accept nothing that writes, signs, or deletes. Fetching, statting, and
 // uploading blobs, and discovery, are the blobs scope's: it leaves those
 // to nodeGrant.
 func (rt roots) needsRead(r *http.Request) bool {

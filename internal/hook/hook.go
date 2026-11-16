@@ -2,7 +2,7 @@
 //
 // The script gets the conflict in its environment (see Job) and runs in the
 // folder root. To resolve, it writes the result to the original path,
-// deletes the conflict copy and exits 0. A non-zero exit, a timeout, or a
+// deletes the conflict copy, and exits 0. A non-zero exit, a timeout, or a
 // conflict copy still in place leaves the conflict for a human.
 package hook
 

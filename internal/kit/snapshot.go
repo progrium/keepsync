@@ -21,7 +21,7 @@ import (
 )
 
 // Baseline is what a drill compares the restored server against: the live
-// server's blobs, kept trees and file contents. The live server makes it
+// server's blobs, kept trees, and file contents. The live server makes it
 // with Snapshot (perkeepd runs once per process, so the drill cannot open
 // the live server itself) and the CLI hands it to Drill.
 type Baseline struct {
@@ -77,7 +77,7 @@ func Snapshot(ctx context.Context, srv *pkserver.Server) (*Baseline, error) {
 }
 
 // scanServer reads every blob of the server behind c, verifying each hash,
-// finds the permanodes, reads their trees with srv.Paths and hashes every
+// finds the permanodes, reads their trees with srv.Paths, and hashes every
 // kept file.
 func scanServer(ctx context.Context, srv *pkserver.Server, c *client.Client, workers int) (*scan, error) {
 	s := &scan{Baseline: Baseline{Taken: time.Now().UTC(), Files: map[string]FileSum{}}}

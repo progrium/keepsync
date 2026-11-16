@@ -12,7 +12,7 @@ Syncthing config file at startup.
   restarts and known as soon as `New` returns.
 - **Config.** Built fresh on every `Start` from `config.New` plus fixed
   options: global and local discovery, relays, NAT, usage reporting, crash
-  reporting, upgrades and the GUI are off; the only listen address is
+  reporting, upgrades, and the GUI are off; the only listen address is
   `tcp://127.0.0.1:<free port>`. Every `SetPeers`/`SetFolders` rebuilds the
   device and folder lists and applies them with `config.Wrapper.Modify`,
   waiting until Syncthing has taken the change, then saves `config.xml` in
@@ -29,7 +29,7 @@ Syncthing config file at startup.
 - **Database.** `syncthing.OpenDatabase(Dir/index-v2)`, SQLite. With cgo it
   uses mattn/go-sqlite3, without cgo modernc.org/sqlite; both pass the tests.
 - **Transport bridge.** Inbound: the `api.PortSyncthing` handler checks the
-  caller is a current peer's key, dials Syncthing's loopback listener and
+  caller is a current peer's key, dials Syncthing's loopback listener, and
   splices. Outbound: each peer gets its own loopback listener, which is that
   device's only address in Syncthing's config; an accepted connection is
   `Transport.Dial`ed to the peer's tailcat address. BEP's TLS runs end to end
@@ -38,7 +38,7 @@ Syncthing config file at startup.
   `Disallow` for keys it allowed earlier and that are no longer peers. It
   never touches keys it did not add (such as the server's).
 - **Events.** One subscription to `ItemFinished`, `LocalChangeDetected`,
-  `DeviceConnected` and `DeviceDisconnected`, translated to `api.SyncEvent`.
+  `DeviceConnected`, and `DeviceDisconnected`, translated to `api.SyncEvent`.
   Only files produce item events (not directories or symlinks); deletes are
   included, so consumers should stat. A path that is a conflict copy also
   produces a `SyncConflict` event, whose `Device` is the device named in
@@ -51,7 +51,7 @@ Syncthing config file at startup.
   Events are hints: Syncthing drops events for slow subscribers.
 - **Scan.** `Internals.ScanFolderSubdirs`, which returns when the scan is done.
 - **FileState.** Reads the global entry (`Internals.GlobalFileInfo`) for
-  `Known`, `Version`, `Deleted` and `Dir`; the version vector's counters
+  `Known`, `Version`, `Deleted`, and `Dir`; the version vector's counters
   become `api.Version` pairs keyed by `ShortID.String()`. `Current` compares
   this device's own entry (`Internals.LocalFileInfo`, a vendored patch) with
   the global one: true when the versions are equal and the local entry is

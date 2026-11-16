@@ -2,7 +2,7 @@
 // See docs/design.md, "Keeping and expiry".
 //
 // A Keeper owns one kept folder on one node. Each Pass walks the folder
-// (skipping Syncthing's files, .keepsync, the ignore files and anything
+// (skipping Syncthing's files, .keepsync, the ignore files, and anything
 // matched by .stignore or .keepignore), puts every file that has been
 // unmodified for the grace period through api.BlobPutter, and asks the
 // registry to set camliPath:<path> to the resulting fileref. A file that

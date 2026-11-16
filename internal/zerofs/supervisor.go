@@ -26,7 +26,7 @@ import (
 type Config struct {
 	// Binary is the zerofs executable (see FindBinary).
 	Binary string
-	// DataDir holds zerofs.toml, the cache, the sockets and the default
+	// DataDir holds zerofs.toml, the cache, the sockets, and the default
 	// mount point. It is created with owner-only permissions.
 	DataDir string
 	Storage Storage
@@ -390,7 +390,7 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 	return nil
 }
 
-// launchLocked starts the zerofs process, waits for its sockets and mounts
+// launchLocked starts the zerofs process, waits for its sockets, and mounts
 // (or connects). On failure the process is killed.
 func (s *Supervisor) launchLocked(ctx context.Context) (err error) {
 	// Stale sockets from a crash would make the readiness check pass early.
@@ -588,7 +588,7 @@ func (s *Supervisor) flushLocked(ctx context.Context) error {
 	return nil
 }
 
-// Stop flushes, unmounts and stops zerofs. A nil return means everything
+// Stop flushes, unmounts, and stops zerofs. A nil return means everything
 // written to Dir is in the bucket. zerofs gets SIGTERM, which makes it drain
 // and flush on its own as well; it is killed only if it outlives ctx (or
 // StopTimeout).

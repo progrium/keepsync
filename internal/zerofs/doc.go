@@ -12,7 +12,7 @@
 // to the file), starts "zerofs run", waits for both sockets, and mounts the
 // filesystem over 9P at Dir. Flush syncs the mount and runs "zerofs flush",
 // so a nil return means everything written so far is in the bucket. Stop
-// flushes, unmounts and sends zerofs SIGTERM.
+// flushes, unmounts, and sends zerofs SIGTERM.
 //
 // See docs/design.md, "ZeroFS, two modes".
 package zerofs

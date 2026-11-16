@@ -113,7 +113,7 @@ func (e *env) status(args []string) error {
 	return nil
 }
 
-// peerPath is how a peer is reached: "offline", "direct <ip>" or
+// peerPath is how a peer is reached: "offline", "direct <ip>", or
 // "relay <region>", with a tunnel each way both as "in …, out …". long
 // keeps the port and adds each busy tunnel's rates, for folder status.
 func peerPath(p node.PeerInfo, long bool) string {
@@ -273,7 +273,7 @@ func peerBehind(fs *api.FolderSync) bool {
 }
 
 // printFolderSummary is the folder table of status: one short line per
-// folder. folder ls and folder status have the paths, members and detail.
+// folder. folder ls and folder status have the paths, members, and detail.
 func printFolderSummary(e *env, folders []node.FolderInfo) {
 	if len(folders) == 0 {
 		fmt.Fprintln(e.stdout, "folders: none (keepsync folder add <name> <path>)")

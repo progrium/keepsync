@@ -192,7 +192,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // readPosts are the POST endpoints that only read: search queries and
-// describes, blob stats, signature checks and multi-file downloads.
+// describes, blob stats, signature checks, and multi-file downloads.
 var readPosts = []string{
 	"/camli/search/query", "/camli/search/describe", "/camli/stat",
 	"/camli/sig/verify",

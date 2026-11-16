@@ -41,7 +41,7 @@ type Config struct {
 	Syncer api.Syncer
 
 	// Exclude, if set, replaces the .stignore/.keepignore matcher. The
-	// built-in exclusions (Syncthing temp and state files, .keepsync and the
+	// built-in exclusions (Syncthing temp and state files, .keepsync, and the
 	// ignore files) always apply.
 	Exclude Excluder
 

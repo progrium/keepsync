@@ -192,7 +192,7 @@ func notYet(cmd string, milestone int) error {
 	return fmt.Errorf("%s is not implemented yet (milestone %d)", cmd, milestone)
 }
 
-// parse parses flags that may appear before, after or between positional
+// parse parses flags that may appear before, after, or between positional
 // arguments, and checks the number of positionals.
 func parse(fs *flag.FlagSet, args []string, min, max int, argUsage string) ([]string, error) {
 	var pos []string

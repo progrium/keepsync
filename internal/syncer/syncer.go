@@ -27,7 +27,7 @@ import (
 // Config configures an embedded Syncthing instance.
 type Config struct {
 	// Dir holds the device certificate (cert.pem, key.pem), the index
-	// database and Syncthing's generated config.xml. It is created if
+	// database, and Syncthing's generated config.xml. It is created if
 	// missing. The certificate, and so the device ID, survives restarts.
 	Dir string
 	// Name is this device's name as peers see it.
@@ -147,7 +147,7 @@ func (s *Syncer) DeviceID() api.DeviceID { return api.DeviceID(s.id.String()) }
 func (s *Syncer) Events() <-chan api.SyncEvent { return s.events }
 
 // Start runs Syncthing with discovery, relays, NAT, usage reporting,
-// crash reporting, upgrades and the GUI off, listening for BEP on a loopback
+// crash reporting, upgrades, and the GUI off, listening for BEP on a loopback
 // port that the Transport bridges to. Peers and folders set before Start are
 // applied now.
 func (s *Syncer) Start(ctx context.Context) error {
@@ -471,7 +471,7 @@ func (s *Syncer) Scan(ctx context.Context, folderID, subpath string) error {
 	}
 }
 
-// Stop shuts Syncthing down, closes the bridges and closes Events.
+// Stop shuts Syncthing down, closes the bridges, and closes Events.
 func (s *Syncer) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.stopped {

@@ -77,7 +77,7 @@ type RestoreStats struct {
 	// Total is the whole restore, ZeroFS start to index caught up.
 	Total time.Duration
 	// Registry is where Recover took the registry state from: "bucket",
-	// "kit" or "" for nowhere.
+	// "kit", or "" for nowhere.
 	Registry string
 }
 

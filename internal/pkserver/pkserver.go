@@ -49,7 +49,7 @@ const (
 	ModeStore = "store"
 	// ModeCache has no local blob storage: perkeepd's primary storage is
 	// the diskpacked store on ZeroFS, so local disk holds only ZeroFS's
-	// cache. The index, the identity and perkeepd's small queues and
+	// cache. The index, the identity, and perkeepd's small queues and
 	// caches stay in Dir. The bucket holds the same diskpacked layout in
 	// both modes.
 	ModeCache = "cache"
@@ -59,7 +59,7 @@ const (
 type Config struct {
 	// Mode is ModeStore (the default, also for "") or ModeCache.
 	Mode string
-	// Dir holds the identity, the local blob storage and the index. It must
+	// Dir holds the identity, the local blob storage, and the index. It must
 	// not be on ZeroFS.
 	Dir string
 	// ZeroFS backs the diskpacked replica. Its Dir must already exist when
@@ -72,9 +72,9 @@ type Config struct {
 	// Scope, if set, returns a node's scope, ScopeBlobs or ScopeRead, and
 	// anything else for a node that may do nothing (registry.Server.Scope
 	// fits). It is asked on every request, so a grant applies at once.
-	// With the blobs scope a node may upload, stat and fetch blobs; read
-	// adds search, enumeration, the web UI, status and help. No scope may
-	// sign, remove blobs or reach the debug handlers. Nil gives every
+	// With the blobs scope a node may upload, stat, and fetch blobs; read
+	// adds search, enumeration, the web UI, status, and help. No scope may
+	// sign, remove blobs, or reach the debug handlers. Nil gives every
 	// node the blobs scope.
 	Scope func(peer api.NodeKey) string
 	// Logf, if set, receives log lines. Defaults to log.Printf.
@@ -432,7 +432,7 @@ func (w logWriter) Write(p []byte) (int, error) {
 }
 
 // hermetic points perkeep's host directories into dir, so the embedded
-// perkeepd never reads or writes a user's own Perkeep config, cache or
+// perkeepd never reads or writes a user's own Perkeep config, cache, or
 // state. They are process-wide, so a variable already set is left alone.
 func hermetic(dir string) {
 	for k, sub := range map[string]string{

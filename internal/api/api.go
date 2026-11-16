@@ -372,7 +372,7 @@ type NeedFile struct {
 	Size    int64  `json:"size"`
 	Deleted bool   `json:"deleted,omitempty"`
 	Dir     bool   `json:"dir,omitempty"`
-	// Stage is "pulling" (in progress), "queued" or "waiting".
+	// Stage is "pulling" (in progress), "queued", or "waiting".
 	Stage string `json:"stage"`
 }
 

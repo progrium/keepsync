@@ -103,7 +103,7 @@ func (s *Server) handlers() {
 	})
 }
 
-// MethodBaseline drains, flushes and writes a drill baseline (kit.Snapshot)
+// MethodBaseline drains, flushes, and writes a drill baseline (kit.Snapshot)
 // of the live server to a file.
 const MethodBaseline = "server.baseline"
 

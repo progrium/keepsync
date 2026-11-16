@@ -50,7 +50,7 @@ type treeNode struct {
 	content  blob.Ref
 	mtime    time.Time
 	version  api.Version
-	// contentClaim is the claim that set content, mtime and version, and
+	// contentClaim is the claim that set content, mtime, and version, and
 	// keptAt its date.
 	contentClaim blob.Ref
 	keptAt       time.Time
@@ -348,7 +348,7 @@ func (s *Server) unmarkGone(ctx context.Context, n *treeNode, c api.PathClaim) (
 }
 
 // setMode records a permission change with the same content (a chmod):
-// one claim sets the mode, mtime and version. The content claim, and so
+// one claim sets the mode, mtime, and version. The content claim, and so
 // KeptAt and History, stay as they were. The caller holds claimMu.
 func (s *Server) setMode(ctx context.Context, n *treeNode, c api.PathClaim) (api.ClaimResult, error) {
 	ops := []*schema.Builder{

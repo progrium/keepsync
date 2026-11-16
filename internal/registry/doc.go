@@ -1,6 +1,6 @@
 // Package registry implements the registry server and api.RegistryClient.
 //
-// Server holds the approved nodes (the allow list), folders, keep policies
+// Server holds the approved nodes (the allow list), folders, keep policies,
 // and keeper assignments, persisted through a Store before every change is
 // published. It serves nodes on api.PortRegistry and forwards path claims
 // and durability questions to the api.Signer and api.Durability it is given.

@@ -34,7 +34,7 @@ const (
 	// mount point, so data is never written to a plain local directory.
 	MountExternal MountMode = "external"
 	// MountNineP mounts nothing: keepsync is itself the 9P client (see
-	// NineP and Supervisor.FS), so it needs no FUSE, root or kernel
+	// NineP and Supervisor.FS), so it needs no FUSE, root, or kernel
 	// module, and nothing else on the machine sees the filesystem.
 	MountNineP MountMode = "9p"
 )

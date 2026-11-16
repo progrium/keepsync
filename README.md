@@ -1,6 +1,6 @@
 # keepsync
 
-keepsync keeps a set of folders synced across your machines and archives them permanently. It is one Go binary that embeds Syncthing for sync and Perkeep for the archive, stores the archive in any S3-compatible bucket through ZeroFS, and connects everything over tailcat, so nothing needs a public IP, open ports or DNS.
+keepsync keeps a set of folders synced across your machines and archives them permanently. It is one Go binary that embeds Syncthing for sync and Perkeep for the archive, stores the archive in any S3-compatible bucket through ZeroFS, and connects everything over tailcat, so nothing needs a public IP, open ports, or DNS.
 
 A synced folder can hold just recent files (say the last 30 days) while the archive keeps every version forever. Files only leave sync once they are safely in the bucket, and you can restore any of them, as they are now or as they were at an earlier time.
 
@@ -10,16 +10,16 @@ For an overview of the pieces and why they were chosen, see the [architecture](d
 
 ### How it fits together
 
-You run one **server** and any number of **nodes**. Every machine that syncs folders is a node. The server holds the Perkeep archive, ZeroFS and the list of approved nodes, and it is the only machine that talks to the bucket. One machine can be both a server and a node.
+You run one **server** and any number of **nodes**. Every machine that syncs folders is a node. The server holds the Perkeep archive, ZeroFS, and the list of approved nodes, and it is the only machine that talks to the bucket. One machine can be both a server and a node.
 
-Nodes sync directly with each other, so sync keeps working while the server is down. Only archiving, expiry and membership changes wait for it.
+Nodes sync directly with each other, so sync keeps working while the server is down. Only archiving, expiry, and membership changes wait for it.
 
 ### Prerequisites
 
 - **Go 1.27.2** or newer, to build keepsync.
 - **tailcat.** Nothing to install. keepsync embeds tailcat as a library, and `go.mod` pins a version from tailcat's `main` branch, which `go build` fetches. By default traffic is relayed through tailcat's public DERP relays when a direct connection can't be made. Those are rate-limited, so for real sync volumes run your own `derper` and pass `--derp-map` and `--derp-region` to `server init` and `node init`.
-- **An S3-compatible bucket** for the archive, such as Cloudflare R2, AWS S3 or MinIO, with an access key that can read and write it.
-- **ZeroFS v2.3.7** on the server. You don't need to install it: `server init` downloads the pinned release and checks its SHA-256 if it isn't on your `PATH`. Builds exist for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and freebsd/amd64.
+- **An S3-compatible bucket** for the archive, such as Cloudflare R2, AWS S3, or MinIO, with an access key that can read and write it.
+- **ZeroFS v2.3.7** on the server. You don't need to install it: `server init` downloads the pinned release and checks its SHA-256 if it isn't on your `PATH`. Builds exist for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, and freebsd/amd64.
 
 ### Build
 
@@ -53,20 +53,20 @@ For AWS S3, drop `--endpoint` and pass your `--region`. For a local MinIO over p
 
 `server init` takes `--mode store` (the default) or `--mode cache`. A **store** server keeps every archived blob on its own disk and copies it to the bucket; reads are local. A **cache** server keeps no blob store on disk: Perkeep writes straight to the bucket through ZeroFS, and local disk holds only the index and ZeroFS's cache, which you size with `--cache-size <GB>` (default 10, minimum 2). Use cache mode when the archive is bigger than the server's disk; reading old files then fetches them from the bucket. The mode can't change after init, but a recovery can pick either (see [Recover a lost server](#recover-a-lost-server)).
 
-`server init` creates the server's tailcat key, its Perkeep identity and the ZeroFS config, finds or downloads ZeroFS, and writes the **recovery kit** to `./keepsync-recovery.zip.age` (or `--kit <path>`). It prints:
+`server init` creates the server's tailcat key, its Perkeep identity, and the ZeroFS config, finds or downloads ZeroFS, and writes the **recovery kit** to `./keepsync-recovery.zip.age` (or `--kit <path>`). It prints:
 
 - the server's address (`tc…`), which nodes need to join;
 - the kit's passphrase, **shown only this once**.
 
 Store the kit and the passphrase separately and offline, and never in the bucket. Together they can read all your data and impersonate the server. See [Recovery kit](#recovery-kit).
 
-Then start the server and leave it running (under systemd, launchd or similar):
+Then start the server and leave it running (under systemd, launchd, or similar):
 
 ```sh
 keepsync server run
 ```
 
-It starts ZeroFS, starts Perkeep and the registry, and flushes to the bucket every minute. Stopping it with Ctrl-C, SIGTERM or SIGHUP drains and flushes everything to the bucket first; a second Ctrl-C quits at once. ZeroFS never outlives the server: on Linux it stops when keepsync dies for any reason, and on any platform `server run` stops a ZeroFS left running by an earlier run before starting its own.
+It starts ZeroFS, starts Perkeep and the registry, and flushes to the bucket every minute. Stopping it with Ctrl-C, SIGTERM, or SIGHUP drains and flushes everything to the bucket first; a second Ctrl-C quits at once. ZeroFS never outlives the server: on Linux it stops when keepsync dies for any reason, and on any platform `server run` stops a ZeroFS left running by an earlier run before starting its own.
 
 Check on it with:
 
@@ -133,7 +133,7 @@ keepsync folder join docs ~/Documents
 keepsync folder join docs ~/Documents --merge
 ```
 
-`keepsync folder ls` lists folders, their members and their sync state. `keepsync folder status docs` shows one folder in detail: its state, what this node still needs, and each peer's completion, path and traffic. Add `-v` to list the files still needed, the ones being pulled first. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk. If the server can't be reached, the node stops syncing anyway and tells the server later.
+`keepsync folder ls` lists folders, their members, and their sync state. `keepsync folder status docs` shows one folder in detail: its state, what this node still needs, and each peer's completion, path, and traffic. Add `-v` to list the files still needed, the ones being pulled first. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk. If the server can't be reached, the node stops syncing anyway and tells the server later.
 
 At this point the folder syncs between nodes but isn't archived yet.
 
@@ -159,7 +159,7 @@ Each kept version records Syncthing's version of the file, so the archive knows 
 
 Expiry only removes a file after the server confirms the file, and everything needed to find it by name, is durable in the bucket. If the server can't answer, expiry waits and the folder simply grows.
 
-To leave files out of the archive, list them in `.stignore` (which also stops them syncing) or in `.keepignore` (which only stops keeping them). Syncthing's temp files, `.stfolder`, `.stversions` and `.keepsync` are always left out.
+To leave files out of the archive, list them in `.stignore` (which also stops them syncing) or in `.keepignore` (which only stops keeping them). Syncthing's temp files, `.stfolder`, `.stversions`, and `.keepsync` are always left out.
 
 See where each file stands:
 
@@ -219,7 +219,7 @@ keepsync gateway config
 
 This writes a server named `keepsync`, with the gateway's local token, into Perkeep's own `client-config.json` (or the file given with `--path`). If another server is already your default there, pass `-server=keepsync` to Perkeep tools.
 
-By default a node can only fetch blobs by ref. To allow search, the web UI, `pk-get` and `pk-mount`, grant it `read` on the server:
+By default a node can only fetch blobs by ref. To allow search, the web UI, `pk-get`, and `pk-mount`, grant it `read` on the server:
 
 ```sh
 keepsync server grant laptop read    # and `blobs` to take it back
@@ -258,7 +258,7 @@ The script runs in the folder root with:
 | `KEEPSYNC_BASE` | A temp file with the common ancestor of both versions, for a three-way merge, or empty if there is none |
 | `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor; `0` if it is only the last kept version, a guess |
 
-To resolve, write the result to `$KEEPSYNC_ORIGINAL`, delete `$KEEPSYNC_CONFLICT` and exit 0. A non-zero exit, a timeout, or a copy left in place leaves the conflict for you.
+To resolve, write the result to `$KEEPSYNC_ORIGINAL`, delete `$KEEPSYNC_CONFLICT`, and exit 0. A non-zero exit, a timeout, or a copy left in place leaves the conflict for you.
 
 A minimal hook that uses `git merge-file`:
 
@@ -297,7 +297,7 @@ keepsync recover keepsync-recovery.zip.age
 keepsync server run
 ```
 
-`recover` starts ZeroFS on the bucket and rebuilds the Perkeep index from it, then installs the key, config and registry. A store-mode server also gets every archived blob copied back to local disk; a cache-mode one reads them from the bucket as needed. `--mode store|cache` recovers into a different mode from the one the kit was made with. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE` or a prompt. Nodes reconnect on their own, because the address is the same.
+`recover` starts ZeroFS on the bucket and rebuilds the Perkeep index from it, then installs the key, config, and registry. A store-mode server also gets every archived blob copied back to local disk; a cache-mode one reads them from the bucket as needed. `--mode store|cache` recovers into a different mode from the one the kit was made with. The passphrase comes from `--passphrase-file`, `$KEEPSYNC_KIT_PASSPHRASE`, or a prompt. Nodes reconnect on their own, because the address is the same.
 
 ZeroFS allows only one writer, so **never recover while the old server could still be running against the bucket.**
 

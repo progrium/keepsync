@@ -34,7 +34,7 @@ const (
 	MethodResolve    = "conflicts.resolve"
 )
 
-// FolderParams is the body of MethodFolderAdd, MethodFolderJoin and
+// FolderParams is the body of MethodFolderAdd, MethodFolderJoin, and
 // MethodFolderRm (which ignores Path).
 type FolderParams struct {
 	Name string `json:"name"`
