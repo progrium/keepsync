@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"flag"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -111,5 +113,29 @@ func TestSyncSummary(t *testing.T) {
 	}
 	if got := traffic(nil); got != "-" {
 		t.Errorf("traffic(nil) = %q", got)
+	}
+}
+
+func TestCLIPath(t *testing.T) {
+	wd, _ := os.Getwd()
+	home, _ := os.UserHomeDir()
+	for in, want := range map[string]string{
+		"./Demo":    filepath.Join(wd, "Demo"),
+		"Demo":      filepath.Join(wd, "Demo"),
+		"/abs/x":    "/abs/x",
+		"~/Sync/x":  filepath.Join(home, "Sync/x"),
+		"~":         home,
+		"../a/../b": filepath.Join(filepath.Dir(wd), "b"),
+	} {
+		if got, err := cliPath(in); err != nil || got != want {
+			t.Errorf("cliPath(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	long := &api.FolderSync{State: "error", Error: "folder marker missing (this indicates potential data loss, search docs/forum to get information about how to proceed)"}
+	if got := syncSummary(long); got != "error: folder marker missing (this indicates… (folder status for more)" {
+		t.Errorf("syncSummary(long error) = %q", got)
+	}
+	if got := syncText(long, true); got != "error: "+long.Error {
+		t.Errorf("syncText(full) = %q", got)
 	}
 }

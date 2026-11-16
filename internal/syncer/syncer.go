@@ -309,7 +309,10 @@ func (s *Syncer) buildLocked(c *config.Configuration) {
 		}
 		devices = append(devices, d)
 	}
-	c.SetDevices(devices)
+	// Assign rather than call c.SetDevices / c.SetFolders: those only add
+	// and replace entries, so a removed peer or folder would stay
+	// configured, and a folder removed by folder rm would keep syncing.
+	c.Devices = devices
 
 	folders := make([]config.FolderConfiguration, 0, len(s.folders))
 	for _, f := range s.folders {
@@ -343,7 +346,7 @@ func (s *Syncer) buildLocked(c *config.Configuration) {
 		}
 		folders = append(folders, fc)
 	}
-	c.SetFolders(folders)
+	c.Folders = folders
 }
 
 // applyLocked pushes the current peers and folders into the running

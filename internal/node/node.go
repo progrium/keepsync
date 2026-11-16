@@ -642,6 +642,11 @@ func absDir(p string) (string, error) {
 		}
 		p = filepath.Join(home, p[2:])
 	}
+	if !filepath.IsAbs(p) {
+		// It would resolve against the node's working directory, not the
+		// caller's. The CLI sends absolute paths.
+		return "", fmt.Errorf("path %q is relative: give an absolute path", p)
+	}
 	p, err := filepath.Abs(p)
 	if err != nil {
 		return "", err

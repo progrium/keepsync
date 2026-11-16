@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -179,7 +180,24 @@ func humanRate(r float64) string { return humanBytes(int64(r)) + "/s" }
 
 // syncSummary is a folder's SYNC column: its state here, then any connected
 // peer that is behind.
-func syncSummary(fs *api.FolderSync) string {
+func syncSummary(fs *api.FolderSync) string { return syncText(fs, false) }
+
+// truncate shortens s to at most n runes, at a word boundary where there
+// is one, ending in "…" if cut.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	cut := string(r[:n-1])
+	if i := strings.LastIndexByte(cut, ' '); i > n/2 {
+		cut = cut[:i]
+	}
+	return strings.TrimRight(cut, " ,;:(") + "…"
+}
+
+// syncText is syncSummary, with a folder error in full if full is set.
+func syncText(fs *api.FolderSync, full bool) string {
 	if fs == nil {
 		return "-"
 	}
@@ -188,6 +206,9 @@ func syncSummary(fs *api.FolderSync) string {
 	switch {
 	case fs.State == "error":
 		s = "error: " + fs.Error
+		if t := truncate(s, 48); !full && t != s {
+			s = t + " (folder status for more)"
+		}
 	case !l.UpToDate():
 		verb := "behind"
 		if strings.HasPrefix(fs.State, "sync") {
@@ -282,8 +303,14 @@ func (e *env) folderAttach(args []string, name string, add bool) error {
 	if add {
 		method = node.MethodFolderAdd
 	}
+	// The node runs in its own working directory, so a relative path is
+	// resolved here, against the caller's.
+	dir, err := cliPath(pos[1])
+	if err != nil {
+		return err
+	}
 	var fi node.FolderInfo
-	if err := e.nodeCall(method, node.FolderParams{Name: pos[0], Path: pos[1], Merge: merge != nil && *merge}, &fi); err != nil {
+	if err := e.nodeCall(method, node.FolderParams{Name: pos[0], Path: dir, Merge: merge != nil && *merge}, &fi); err != nil {
 		return err
 	}
 	verb := "joined"
@@ -295,6 +322,22 @@ func (e *env) folderAttach(args []string, name string, add bool) error {
 		fmt.Fprintf(e.stdout, "on other nodes: keepsync folder join %s <path>\n", fi.Name)
 	}
 	return nil
+}
+
+// cliPath makes p absolute against the CLI's working directory, expanding
+// a leading ~/.
+func cliPath(p string) (string, error) {
+	if p == "" {
+		return "", errors.New("a path is required")
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		p = filepath.Join(home, strings.TrimPrefix(p[1:], "/"))
+	}
+	return filepath.Abs(p)
 }
 
 func (e *env) folderLs(args []string) error {
@@ -327,7 +370,7 @@ func (e *env) folderStatus(args []string) error {
 		return err
 	}
 	f, s := st.Folder, st.Folder.Sync
-	fmt.Fprintf(e.stdout, "%s at %s: %s\n", f.Name, f.Path, syncSummary(s))
+	fmt.Fprintf(e.stdout, "%s at %s: %s\n", f.Name, f.Path, syncText(s, true))
 	since := ""
 	if !s.StateSince.IsZero() {
 		since = " since " + ago(s.StateSince)
@@ -496,6 +539,11 @@ func (e *env) restore(args []string) error {
 	}
 	if *at != "" {
 		if p.At, err = parseAt(*at, time.Now()); err != nil {
+			return err
+		}
+	}
+	if p.To != "" {
+		if p.To, err = cliPath(p.To); err != nil {
 			return err
 		}
 	}

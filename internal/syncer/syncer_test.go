@@ -479,3 +479,52 @@ func TestDialFallback(t *testing.T) {
 	a.scan("docs")
 	eventually(t, "file on b", fileIs(filepath.Join(b.dir, "y.txt"), "y"))
 }
+
+// TestFolderRemoveAndRejoin checks that SetFolders really removes a folder
+// (Syncthing's own SetFolders only adds and replaces, so folder rm used to
+// leave it syncing, and joining again at another path then restarted it
+// there on the old index: "folder marker missing"), and that adding it back,
+// at the same path or another, starts it cleanly with a fresh marker.
+func TestFolderRemoveAndRejoin(t *testing.T) {
+	a, b := pair(t)
+	a.write("keep.txt", "k")
+	a.scan("docs")
+	eventually(t, "file on b", fileIs(filepath.Join(b.dir, "keep.txt"), "k"))
+
+	ctx := context.Background()
+	devs := []api.DeviceID{a.s.DeviceID(), b.s.DeviceID()}
+	marker := func(dir string) bool {
+		_, err := os.Stat(filepath.Join(dir, ".stfolder"))
+		return err == nil
+	}
+	runsAt := func(dir string) {
+		t.Helper()
+		if err := b.s.SetFolders(ctx, []api.FolderConfig{{ID: "docs", Path: dir, Devices: devs}}); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, "docs running at "+dir, func() bool {
+			fs, err := b.s.FolderSync("docs")
+			return err == nil && fs.State != "error" && !strings.HasPrefix(fs.State, "scan") && marker(dir)
+		})
+		eventually(t, "keep.txt at "+dir, fileIs(filepath.Join(dir, "keep.txt"), "k"))
+	}
+	remove := func(dir string) {
+		t.Helper()
+		if err := b.s.SetFolders(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.s.FolderSync("docs"); err == nil {
+			t.Fatal("folder still configured after SetFolders(nil)")
+		}
+		eventually(t, "marker removed", func() bool { return !marker(dir) })
+	}
+
+	remove(b.dir)
+	runsAt(b.dir) // rejoin at the same path
+	remove(b.dir)
+	moved := filepath.Join(t.TempDir(), "moved")
+	runsAt(moved) // rejoin elsewhere: pulls the folder again
+	if !fileIs(filepath.Join(b.dir, "keep.txt"), "k")() {
+		t.Error("the old directory's files changed")
+	}
+}

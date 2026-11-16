@@ -203,3 +203,40 @@ func TestKeepStatusShowsFileErrors(t *testing.T) {
 		t.Fatalf("error logged %d times, want once", n)
 	}
 }
+
+// TestJoinAtAnotherPath checks that an attached folder is not moved by
+// joining it again elsewhere, which would leave Syncthing's index of the
+// old directory to read the new one as all deleted.
+func TestJoinAtAnotherPath(t *testing.T) {
+	tn := newTestNode(t, func(pk *fake.Perkeep) api.BlobPutter { return pk })
+	other := filepath.Join(t.TempDir(), "elsewhere")
+	_, err := tn.attach(tn.ctx, FolderParams{Name: "docs", Path: other, Merge: true}, tn.reg.JoinFolder)
+	if err == nil || !strings.Contains(err.Error(), "folder rm docs") {
+		t.Fatalf("join at another path: %v, want a folder rm hint", err)
+	}
+	if f, _ := tn.cfg.Folder("docs"); f.Path != tn.dir {
+		t.Errorf("folder moved to %s", f.Path)
+	}
+	// After folder rm it can be joined at the new path.
+	if _, err := tn.folderRm(tn.ctx, "docs"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tn.attach(tn.ctx, FolderParams{Name: "docs", Path: other, Merge: true}, tn.reg.JoinFolder); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := tn.cfg.Folder("docs"); f.Path != other {
+		t.Errorf("folder at %s, want %s", f.Path, other)
+	}
+}
+
+func TestRelativePathRefused(t *testing.T) {
+	tn := newTestNode(t, func(pk *fake.Perkeep) api.BlobPutter { return pk })
+	tn.folderRm(tn.ctx, "docs")
+	_, err := tn.attach(tn.ctx, FolderParams{Name: "docs", Path: "./Demo", Merge: true}, tn.reg.JoinFolder)
+	if err == nil || !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("join with ./Demo: %v, want a relative path error", err)
+	}
+	if _, err := os.Stat("Demo"); err == nil {
+		t.Error("created Demo in the node's working directory")
+	}
+}

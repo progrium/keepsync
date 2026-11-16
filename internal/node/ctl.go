@@ -619,6 +619,14 @@ func (n *Node) attach(ctx context.Context, p FolderParams, call func(context.Con
 			n.cfgMu.Unlock()
 			return nil, errors.New(dir + " is already attached as folder " + f.Name)
 		}
+		// Moving an attached folder would keep Syncthing's index of the
+		// old directory, which then reads the new one as everything
+		// deleted (Syncthing stops it with "folder marker missing").
+		// folder rm drops that index.
+		if f.Name == p.Name && f.Path != dir {
+			n.cfgMu.Unlock()
+			return nil, fmt.Errorf("folder %s is already attached here at %s: run keepsync folder rm %s first to move it", p.Name, f.Path, p.Name)
+		}
 	}
 	n.cfgMu.Unlock()
 	f, err := call(ctx, p.Name)
