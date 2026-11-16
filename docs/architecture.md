@@ -1,6 +1,6 @@
 # keepsync architecture
 
-This is an overview of how keepsync is put together and why. For the exact behaviour of every piece, see the [spec](design.md).
+This is an overview of how keepsync is put together and why. For the exact behaviour of every piece, see the [spec](spec.md).
 
 ## Overview
 
@@ -105,7 +105,7 @@ You talk to ZeroFS through a network filesystem protocol: it serves 9P, NFS and 
 
 **Durability.** keepsync makes data durable by running `zerofs flush` (after syncing the mount, when there is one). Once that returns, everything written before it is in the bucket. The server does this every minute and tracks which blobs were written before a successful flush (its "durability watermark"), and keepsync never expires a file from sync until the server says the file, and everything needed to find it by name, is durable in the bucket.
 
-**Single writer.** ZeroFS is a single-writer system: one process writes to a bucket at a time, and ZeroFS fences out others. It has its own leader/standby design for failover, but keepsync keeps this simple and doesn't use it. Instead, recovery onto a new machine is done from the [recovery kit](design.md#recovery-kit).
+**Single writer.** ZeroFS is a single-writer system: one process writes to a bucket at a time, and ZeroFS fences out others. It has its own leader/standby design for failover, but keepsync keeps this simple and doesn't use it. Instead, recovery onto a new machine is done from the [recovery kit](spec.md#recovery-kit).
 
 keepsync uses ZeroFS as the replication target (or primary store) for the Perkeep server running on the same machine. ZeroFS is a separate AGPL program: keepsync runs an unmodified, pinned release as a subprocess and never links it.
 
@@ -157,4 +157,4 @@ Syncthing leaves conflicts as `.sync-conflict-…` copies. keepsync lets you set
 ## Further reading
 
 - [README](../README.md): getting started and command reference.
-- [Spec](design.md): the exact behaviour of each piece, failure modes and edge cases.
+- [Spec](spec.md): the exact behaviour of each piece, failure modes and edge cases.
