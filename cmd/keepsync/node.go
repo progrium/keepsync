@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -101,60 +102,65 @@ func (e *env) status(args []string) error {
 		fmt.Fprintln(e.stdout, "peers: none")
 	} else {
 		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "PEER\tDEVICE\tSTATE\tTRAFFIC")
+		fmt.Fprintln(tw, "PEER\tDEVICE\tPATH\tTRAFFIC")
 		for _, p := range st.Peers {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.Name, short(string(p.Device)), peerState(p), traffic(p.Traffic))
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.Name, short(string(p.Device)), peerPath(p, false), traffic(p.Traffic))
 		}
 		tw.Flush()
 	}
 	fmt.Fprintln(e.stdout)
-	printFolders(e, st.Folders)
+	printFolderSummary(e, st.Folders)
 	return nil
 }
 
-// peerState is a peer's STATE column: connected or not, and when connected
-// whether traffic goes direct or through a DERP relay. With a tunnel each
-// way, both are shown, with the rate of any that is busy.
-func peerState(p node.PeerInfo) string {
+// peerPath is how a peer is reached: "offline", "direct <ip>" or
+// "relay <region>", with a tunnel each way both as "in …, out …". long
+// keeps the port and adds each busy tunnel's rates, for folder status.
+func peerPath(p node.PeerInfo, long bool) string {
 	if !p.Connected {
-		return "disconnected"
+		return "offline"
 	}
 	switch len(p.Tunnels) {
 	case 0:
 		if p.Path == nil {
 			return "connected"
 		}
-		return "connected (" + pathString(p.Path) + ")"
+		return pathString(p.Path, long)
 	case 1:
-		return "connected (" + tunnelString(p.Tunnels[0], false) + ")"
+		return tunnelString(p.Tunnels[0], long, false)
 	}
 	parts := make([]string, len(p.Tunnels))
 	for i, tn := range p.Tunnels {
-		dir := "in: "
+		dir := "in "
 		if tn.Out {
-			dir = "out: "
+			dir = "out "
 		}
-		parts[i] = dir + tunnelString(tn, true)
+		parts[i] = dir + tunnelString(tn, long, long)
 	}
-	return "connected (" + strings.Join(parts, ", ") + ")"
+	return strings.Join(parts, ", ")
 }
 
-func pathString(p *api.Path) string {
-	if p.Direct {
-		return "direct " + p.Endpoint
+// pathString is "direct <ip>[:port]" or "relay <region>".
+func pathString(p *api.Path, port bool) string {
+	if !p.Direct {
+		return "relay " + p.Relay
 	}
-	return "relay " + p.Relay
+	ep := p.Endpoint
+	if host, _, err := net.SplitHostPort(ep); err == nil && !port {
+		ep = host
+	}
+	return "direct " + ep
 }
 
-// tunnelString is one tunnel's path, "idle" if it is idle, and with rates
-// its traffic when busy.
-func tunnelString(tn api.Tunnel, rates bool) string {
+// tunnelString is one tunnel's path, "(idle)" if it is idle, and with
+// rates its traffic when busy.
+func tunnelString(tn api.Tunnel, port, rates bool) string {
 	var s string
 	switch {
 	case tn.Path != nil:
-		s = pathString(tn.Path)
+		s = pathString(tn.Path, port)
 		if tn.Idle {
-			s += ", idle"
+			s += " (idle)"
 		}
 	case tn.Idle:
 		s = "idle"
@@ -218,7 +224,7 @@ func syncText(fs *api.FolderSync, full bool) string {
 	case strings.HasPrefix(fs.State, "scan"):
 		s = "scanning"
 	default:
-		s = "up to date"
+		s = "up to date (" + folderSize(l) + ")"
 	}
 	for _, p := range fs.Peers {
 		if p.Connected && p.Known && !p.UpToDate() {
@@ -226,6 +232,80 @@ func syncText(fs *api.FolderSync, full bool) string {
 		}
 	}
 	return s
+}
+
+// syncShort is the SYNC column of status: this node's state only, with a
+// pointer to folder status for detail.
+func syncShort(fs *api.FolderSync) string {
+	if fs == nil {
+		return "-"
+	}
+	l := fs.Local
+	switch {
+	case fs.State == "error":
+		return "error (see folder status)"
+	case !l.UpToDate():
+		verb := "behind"
+		if strings.HasPrefix(fs.State, "sync") {
+			verb = "syncing"
+		}
+		left := humanBytes(l.NeedBytes)
+		if l.NeedBytes == 0 {
+			left = plural(l.NeedItems+l.NeedDeletes, "item")
+		}
+		return fmt.Sprintf("%s %s, %s left", verb, pct(l.Pct), left)
+	case strings.HasPrefix(fs.State, "scan"):
+		return "scanning"
+	}
+	if peerBehind(fs) {
+		return "up to date, peer behind"
+	}
+	return "up to date"
+}
+
+func peerBehind(fs *api.FolderSync) bool {
+	for _, p := range fs.Peers {
+		if p.Connected && p.Known && !p.UpToDate() {
+			return true
+		}
+	}
+	return false
+}
+
+// printFolderSummary is the folder table of status: one short line per
+// folder. folder ls and folder status have the paths, members and detail.
+func printFolderSummary(e *env, folders []node.FolderInfo) {
+	if len(folders) == 0 {
+		fmt.Fprintln(e.stdout, "folders: none (keepsync folder add <name> <path>)")
+		return
+	}
+	sort.Slice(folders, func(i, j int) bool { return folders[i].Name < folders[j].Name })
+	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "FOLDER\tSIZE\tFILES\tSYNC\tKEEP")
+	for _, f := range folders {
+		size, files := "-", "-"
+		if f.Sync != nil {
+			size, files = humanBytes(f.Sync.Local.GlobalBytes), thousands(f.Sync.Local.GlobalFiles)
+		}
+		sync := syncShort(f.Sync)
+		if !f.Attached {
+			sync = "not attached here"
+		}
+		keep := "-"
+		if f.Keep != nil {
+			keep = "kept"
+			if f.Keeper {
+				keep = "kept, keeper"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", f.Name, size, files, sync, keep)
+	}
+	tw.Flush()
+}
+
+// folderSize is a folder's total: "4.2 GB, 1,234 files".
+func folderSize(c api.SyncCompletion) string {
+	return humanBytes(c.GlobalBytes) + ", " + plural(c.GlobalFiles, "file")
 }
 
 // pct rounds down, so a folder with anything left never shows 100%.
@@ -250,7 +330,19 @@ func plural(n int, word string) string {
 	if n == 1 {
 		return "1 " + word
 	}
-	return fmt.Sprintf("%d %ss", n, word)
+	return thousands(n) + " " + word + "s"
+}
+
+// thousands formats n with comma separators: 1234567 is "1,234,567".
+func thousands(n int) string {
+	s := fmt.Sprint(n)
+	if n < 0 {
+		return "-" + thousands(-n)
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
 }
 
 func short(s string) string {
@@ -376,7 +468,8 @@ func (e *env) folderStatus(args []string) error {
 		since = " since " + ago(s.StateSince)
 	}
 	fmt.Fprintf(e.stdout, "state: %s%s\n", s.State, since)
-	fmt.Fprintf(e.stdout, "here: %s, %s; ", humanBytes(s.Local.GlobalBytes), plural(s.Local.GlobalItems, "item"))
+	fmt.Fprintf(e.stdout, "size: %s, %s in all\n", folderSize(s.Local), plural(s.Local.GlobalItems, "item"))
+	fmt.Fprint(e.stdout, "here: ")
 	if s.Local.UpToDate() {
 		fmt.Fprintln(e.stdout, "up to date")
 	} else {
@@ -389,7 +482,7 @@ func (e *env) folderStatus(args []string) error {
 			byDevice[p.Device] = p
 		}
 		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "PEER\tSTATE\tCOMPLETION\tTRAFFIC")
+		fmt.Fprintln(tw, "PEER\tPATH\tCOMPLETION\tTRAFFIC")
 		for _, p := range s.Peers {
 			pi := byDevice[p.Device]
 			pi.Connected = p.Connected
@@ -401,7 +494,7 @@ func (e *env) folderStatus(args []string) error {
 			default:
 				comp = pct(p.Pct) + ", " + needLeft(p.SyncCompletion)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.Name, peerState(pi), comp, traffic(pi.Traffic))
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.Name, peerPath(pi, true), comp, traffic(pi.Traffic))
 		}
 		tw.Flush()
 	}

@@ -96,7 +96,18 @@ Then start the node and leave it running:
 keepsync node run
 ```
 
-Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders. A connected peer shows whether its traffic goes direct (with the peer's address) or through a DERP relay (with the region), so you can tell when sync is stuck on a rate-limited relay (only one node of each pair dials, so a pair shares one tunnel, and keepsync keeps pinging a relayed tunnel so it can upgrade to direct), and how fast data is moving each way with it, averaged over the last 10 seconds. Each folder shows whether it is up to date here, or how far along it is (`syncing 63% (1.2 GB, 340 files left)`), and names any connected peer that is behind. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
+Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders:
+
+```
+PEER   DEVICE   PATH                  TRAFFIC
+h9dev  X3NOEHO  direct 54.149.165.58  ↓ 20 B/s  ↑ 3.3 MB/s
+
+FOLDER  SIZE      FILES   SYNC                      KEEP
+demo    4.2 GB    1,234   syncing 63%, 1.5 GB left  -
+photos  812.0 MB  20,511  up to date                kept, keeper
+```
+
+PATH says whether traffic to a peer goes direct or through a DERP relay, so you can tell when sync is stuck on a rate-limited relay (only one node of each pair dials, so a pair shares one tunnel, and keepsync keeps pinging a relayed tunnel so it can upgrade to direct). TRAFFIC is the rate each way, averaged over the last 10 seconds. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
 
 Repeat for every machine. The approved nodes find and connect to each other on their own.
 

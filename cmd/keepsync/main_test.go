@@ -63,37 +63,59 @@ func TestParseAt(t *testing.T) {
 	}
 }
 
-func TestPeerState(t *testing.T) {
+func TestPeerPath(t *testing.T) {
+	two := node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{
+		{Path: &api.Path{Direct: true, Endpoint: "71.116.60.17:54425"}, Traffic: api.Traffic{InRate: 20e6, OutRate: 1e3}},
+		{Out: true, Path: &api.Path{Relay: "nyc"}, Idle: true},
+	}}
 	for _, tc := range []struct {
 		p    node.PeerInfo
+		long bool
 		want string
 	}{
-		{node.PeerInfo{}, "disconnected"},
-		{node.PeerInfo{Connected: true}, "connected"},
-		{node.PeerInfo{Connected: true, Path: &api.Path{Direct: true, Endpoint: "203.0.113.5:41641"}}, "connected (direct 203.0.113.5:41641)"},
-		{node.PeerInfo{Connected: true, Path: &api.Path{Relay: "nyc"}}, "connected (relay nyc)"},
-		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{{Idle: true}}}, "connected (idle)"},
-		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{{Out: true, Path: &api.Path{Relay: "nyc"}}}}, "connected (relay nyc)"},
-		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{
-			{Path: &api.Path{Direct: true, Endpoint: "71.116.60.17:54425"}, Traffic: api.Traffic{InRate: 20e6, OutRate: 1e3}},
-			{Out: true, Path: &api.Path{Relay: "nyc"}, Idle: true},
-		}}, "connected (in: direct 71.116.60.17:54425 ↓ 20.0 MB/s  ↑ 1.0 kB/s, out: relay nyc, idle)"},
+		{node.PeerInfo{}, false, "offline"},
+		{node.PeerInfo{Connected: true}, false, "connected"},
+		{node.PeerInfo{Connected: true, Path: &api.Path{Direct: true, Endpoint: "203.0.113.5:41641"}}, false, "direct 203.0.113.5"},
+		{node.PeerInfo{Connected: true, Path: &api.Path{Direct: true, Endpoint: "203.0.113.5:41641"}}, true, "direct 203.0.113.5:41641"},
+		{node.PeerInfo{Connected: true, Path: &api.Path{Relay: "nyc"}}, false, "relay nyc"},
+		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{{Idle: true}}}, false, "idle"},
+		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{{Out: true, Path: &api.Path{Relay: "nyc"}}}}, false, "relay nyc"},
+		{two, false, "in direct 71.116.60.17, out relay nyc (idle)"},
+		{two, true, "in direct 71.116.60.17:54425 ↓ 20.0 MB/s  ↑ 1.0 kB/s, out relay nyc (idle)"},
 	} {
-		if got := peerState(tc.p); got != tc.want {
-			t.Errorf("peerState(%+v) = %q, want %q", tc.p, got, tc.want)
+		if got := peerPath(tc.p, tc.long); got != tc.want {
+			t.Errorf("peerPath(%+v, %v) = %q, want %q", tc.p, tc.long, got, tc.want)
+		}
+	}
+}
+
+func TestSyncShort(t *testing.T) {
+	for _, tc := range []struct {
+		fs   *api.FolderSync
+		want string
+	}{
+		{nil, "-"},
+		{&api.FolderSync{State: "idle"}, "up to date"},
+		{&api.FolderSync{State: "syncing", Local: api.SyncCompletion{Pct: 63.7, NeedBytes: 1.2e9, NeedItems: 340}}, "syncing 63%, 1.2 GB left"},
+		{&api.FolderSync{State: "idle", Local: api.SyncCompletion{Pct: 99, NeedDeletes: 2}}, "behind 99%, 2 items left"},
+		{&api.FolderSync{State: "error", Error: "folder marker missing (this indicates potential data loss)"}, "error (see folder status)"},
+		{&api.FolderSync{State: "idle", Peers: []api.PeerSync{{Connected: true, Known: true, SyncCompletion: api.SyncCompletion{NeedItems: 1}}}}, "up to date, peer behind"},
+	} {
+		if got := syncShort(tc.fs); got != tc.want {
+			t.Errorf("syncShort(%+v) = %q, want %q", tc.fs, got, tc.want)
 		}
 	}
 }
 
 func TestSyncSummary(t *testing.T) {
-	done := api.SyncCompletion{Pct: 100, GlobalBytes: 10, GlobalItems: 2}
+	done := api.SyncCompletion{Pct: 100, GlobalBytes: 4.2e9, GlobalItems: 1300, GlobalFiles: 1234}
 	behind := api.SyncCompletion{Pct: 63.7, GlobalBytes: 3e9, NeedBytes: 1.2e9, NeedItems: 340}
 	for _, tc := range []struct {
 		fs   *api.FolderSync
 		want string
 	}{
 		{nil, "-"},
-		{&api.FolderSync{State: "idle", Local: done}, "up to date"},
+		{&api.FolderSync{State: "idle", Local: done}, "up to date (4.2 GB, 1,234 files)"},
 		{&api.FolderSync{State: "scanning", Local: done}, "scanning"},
 		{&api.FolderSync{State: "syncing", Local: behind}, "syncing 63% (1.2 GB, 340 files left)"},
 		{&api.FolderSync{State: "idle", Local: api.SyncCompletion{Pct: 99.9, NeedItems: 1, NeedDeletes: 2}}, "behind 99% (1 file, 2 deletes left)"},
@@ -102,7 +124,7 @@ func TestSyncSummary(t *testing.T) {
 			{Name: "laptop", Connected: true, Known: true, SyncCompletion: api.SyncCompletion{Pct: 80, NeedItems: 3}},
 			{Name: "nas", Connected: false, Known: true, SyncCompletion: api.SyncCompletion{Pct: 10, NeedItems: 9}},
 			{Name: "phone", Connected: true, Known: true, SyncCompletion: done},
-		}}, "up to date; laptop at 80%"},
+		}}, "up to date (4.2 GB, 1,234 files); laptop at 80%"},
 	} {
 		if got := syncSummary(tc.fs); got != tc.want {
 			t.Errorf("syncSummary(%+v) = %q, want %q", tc.fs, got, tc.want)
@@ -137,5 +159,13 @@ func TestCLIPath(t *testing.T) {
 	}
 	if got := syncText(long, true); got != "error: "+long.Error {
 		t.Errorf("syncText(full) = %q", got)
+	}
+}
+
+func TestThousands(t *testing.T) {
+	for n, want := range map[int]string{0: "0", 999: "999", 1000: "1,000", 1234567: "1,234,567", -4500: "-4,500"} {
+		if got := thousands(n); got != want {
+			t.Errorf("thousands(%d) = %q, want %q", n, got, want)
+		}
 	}
 }

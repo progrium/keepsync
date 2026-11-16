@@ -36,6 +36,9 @@ func (s *Syncer) FolderSync(folderID string) (api.FolderSync, error) {
 		return out, fmt.Errorf("syncer: folder %q: %w", folderID, err)
 	}
 	out.Local = completion(local)
+	if g, err := in.GlobalSize(folderID); err == nil {
+		out.Local.GlobalFiles = g.Files
+	}
 	// Bytes of partly pulled files that are already fetched.
 	if done := in.FolderProgressBytesCompleted(folderID); done > 0 {
 		out.Local.NeedBytes = max(0, out.Local.NeedBytes-done)

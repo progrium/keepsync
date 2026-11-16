@@ -339,6 +339,9 @@ type SyncCompletion struct {
 	Pct         float64 `json:"pct"`
 	GlobalBytes int64   `json:"globalBytes"`
 	GlobalItems int     `json:"globalItems"`
+	// GlobalFiles is the files among GlobalItems (no directories or
+	// symlinks), set for Local only.
+	GlobalFiles int `json:"globalFiles,omitempty"`
 	// NeedBytes excludes bytes of partly pulled files already fetched.
 	NeedBytes   int64 `json:"needBytes"`
 	NeedItems   int   `json:"needItems"`
