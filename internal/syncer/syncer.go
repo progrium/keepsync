@@ -49,6 +49,9 @@ type Config struct {
 	ReconnectInterval time.Duration
 	// EventBuffer is the capacity of the Events channel. Zero means 1024.
 	EventBuffer int
+	// PeerConnections is how many connections to open to each peer.
+	// Zero means Syncthing's default (3).
+	PeerConnections int
 }
 
 // Syncer is an api.Syncer backed by Syncthing running in-process.
@@ -301,6 +304,7 @@ func (s *Syncer) buildLocked(c *config.Configuration) {
 		d.Name = p.Name
 		d.Introducer = false
 		d.AutoAcceptFolders = false
+		d.RawNumConnections = s.cfg.PeerConnections
 		if b := s.bridges[id]; b != nil {
 			d.Addresses = []string{"tcp://" + b.addr()}
 		} else {

@@ -297,7 +297,26 @@ type Node struct {
 	ConflictHook string `toml:"conflict_hook,omitempty,omitzero"`
 	// ConflictHookTimeout bounds one hook run. Default 5m.
 	ConflictHookTimeout Duration `toml:"conflict_hook_timeout,omitempty,omitzero"`
-	Folders             []Folder `toml:"folder"`
+	// PeerConnections is how many Syncthing connections to open to each
+	// peer, one for index updates and the rest for file data, each its own
+	// TCP stream through the tunnel. Zero means DefaultPeerConnections.
+	PeerConnections int      `toml:"peer_connections,omitempty,omitzero"`
+	Folders         []Folder `toml:"folder"`
+}
+
+// DefaultPeerConnections is Node.PeerConnections when unset. Syncthing's own
+// default is 3. One TCP stream through a userspace tailcat tunnel stalls on
+// loss over a long path (a laptop to an AWS server at 77 ms RTT: 10.6 Mbit/s
+// with 1 stream, 122 Mbit/s with 4), so keepsync spreads file data over
+// more streams. Syncthing uses the higher of the two sides' values.
+const DefaultPeerConnections = 8
+
+// Connections is PeerConnections, or the default when unset.
+func (c *Node) Connections() int {
+	if c.PeerConnections > 0 {
+		return c.PeerConnections
+	}
+	return DefaultPeerConnections
 }
 
 // Gateway configures a node's local, read-only Perkeep gateway.

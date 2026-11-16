@@ -84,7 +84,7 @@ The base directory is `--dir`, else `$KEEPSYNC_DIR`, else `$XDG_DATA_HOME/keepsy
 
 | Path | Holds |
 | --- | --- |
-| `node.toml` | `name`, `server` (tc address), `[network]`, `keep_interval` (default 5m), `[gateway] listen` (default `127.0.0.1:3179`, empty disables), `conflict_hook` and `conflict_hook_timeout` (default 5m), and `[[folder]]` entries (name, path, Syncthing folder ID, optional per-folder `conflict_hook`) |
+| `node.toml` | `name`, `server` (tc address), `[network]`, `keep_interval` (default 5m), `[gateway] listen` (default `127.0.0.1:3179`, empty disables), `conflict_hook` and `conflict_hook_timeout` (default 5m), `peer_connections` (default 8, see Connections per peer), and `[[folder]]` entries (name, path, Syncthing folder ID, optional per-folder `conflict_hook`) |
 | `tailcat.key.json` | The node's tailcat identity |
 | `syncthing/` | Device certificate, `config.xml`, the `index-v2` SQLite index |
 | `membership.json` | The last membership seen, so the node syncs with known peers when it starts while the server is unreachable |
@@ -111,6 +111,8 @@ Every keepsync process runs one tailcat server and dispatches incoming connectio
 **Relays.** Traffic goes direct when NAT traversal works and falls back to DERP otherwise. tailcat's public DERP relays are rate-limited, so for real sync volumes the user may run their own `derper` and pass `--derp-map` (URL or local JSON file) and `--derp-region` to `server init` and `node init`.
 
 **One tunnel per pair.** Left alone, both nodes of a pair dial each other, so they have two tailcat tunnels, one each way, which hole-punch separately: one can go direct while the other stays on a rate-limited DERP relay, and Syncthing (which opens three connections per peer by default) spreads its connections over both. A sync from a laptop to a server once ran at KB/s that way while the other tunnel was direct. So only the node with the lower node key dials its peers' Syncthing; the other refuses Syncthing's own dials and waits to be dialed. If it has had no inbound connection from the peer for 30 s, for example because the dialer cannot reach it, it dials too.
+
+**Connections per peer.** Syncthing keeps one connection per peer for index updates and sends block requests at random over the others; each is its own TCP stream through the tunnel. One TCP stream in tailcat's userspace stack stalls badly on loss over a long path: a laptop to an AWS server at 77 ms RTT measured 10.6 Mbit/s with one stream (12 MB in the first second, then seconds at zero) and 122 Mbit/s with four (`tailcat perf --parallel 4`). So keepsync asks for 8 connections per peer instead of Syncthing's 3 (`peer_connections` in node.toml), which spreads file data over 7 streams. Syncthing uses the higher of the two sides' values, so one updated node is enough. It adds one connection per dial loop (5 s, then backing off), so a new peer reaches 8 within a couple of minutes.
 
 **Nudging tunnels to direct.** tailcat has no control plane to hand out endpoints, so direct path discovery only runs when something pings. Every 15 s the transport sends a disco ping over each outbound tunnel with open connections that is not known to be direct. A tunnel that upgrades stops being pinged.
 

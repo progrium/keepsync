@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/protocol"
+
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/api/fake"
 )
@@ -21,7 +23,9 @@ type node struct {
 	s  *Syncer
 	tr *fake.Transport
 	// via, if set, is the Transport the Syncer uses in place of tr.
-	via    api.Transport
+	via api.Transport
+	// conns is Config.PeerConnections.
+	conns  int
 	dir    string // synced folder
 	stDir  string // Syncer.Config.Dir
 	name   string
@@ -56,6 +60,7 @@ func (n *node) start() {
 		DisableWatcher:    true,
 		RescanInterval:    time.Hour,
 		ReconnectInterval: time.Second,
+		PeerConnections:   n.conns,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -527,4 +532,28 @@ func TestFolderRemoveAndRejoin(t *testing.T) {
 	if !fileIs(filepath.Join(b.dir, "keep.txt"), "k")() {
 		t.Error("the old directory's files changed")
 	}
+}
+
+func TestPeerConnections(t *testing.T) {
+	nw := fake.NewNetwork()
+	a := &node{t: t, tr: nw.Transport("a"), dir: t.TempDir(), stDir: t.TempDir(), name: "a", conns: 6}
+	a.start()
+	b := newNode(t, nw, "b")
+	a, b = connect(t, a, b)
+	// Syncthing adds one connection per dial loop (5 s and up), so the
+	// count is checked in the device config rather than waited for.
+	for _, tc := range []struct {
+		n    *node
+		peer *node
+		want int
+	}{{a, b, 6}, {b, a, 3}} {
+		id, _ := protocol.DeviceIDFromString(string(tc.peer.s.DeviceID()))
+		d, ok := tc.n.s.wrapper.Device(id)
+		if !ok || d.NumConnections() != tc.want {
+			t.Errorf("%s: %s NumConnections = %d (%v), want %d", tc.n.name, tc.peer.name, d.NumConnections(), ok, tc.want)
+		}
+	}
+	// And they connect past one: Syncthing negotiates the higher value.
+	low, high := lowHigh(a, b)
+	eventually(t, "a second connection", func() bool { return high.inboundFrom(low) >= 2 })
 }

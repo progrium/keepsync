@@ -197,7 +197,7 @@ func Run(ctx context.Context, cfg *config.Node, o Options) (err error) {
 		return err
 	}
 	n.fetcher = n.perkeepFetcher
-	if n.sy, err = syncer.New(syncer.Config{Dir: cfg.SyncthingDir(), Name: cfg.Name, Transport: n.tr}); err != nil {
+	if n.sy, err = syncer.New(syncer.Config{Dir: cfg.SyncthingDir(), Name: cfg.Name, Transport: n.tr, PeerConnections: cfg.Connections()}); err != nil {
 		return err
 	}
 	if err := n.sy.Start(ctx); err != nil {
