@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -68,9 +71,26 @@ func (e *env) serverRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := signalContext()
+	// SIGHUP too: a closed terminal should stop the server cleanly, not
+	// kill it mid-write.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 	l := log.New(e.stderr, "", log.LstdFlags)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-done:
+			return
+		}
+		// The clean stop drains replication and flushes, which can take
+		// a while. A second signal ends keepsync at once; zerofs then
+		// gets SIGTERM from the kernel (Linux) and flushes on its own,
+		// or the next `server run` stops it.
+		cancel()
+		l.Printf("stopping: draining and flushing to the bucket (signal again to quit now)")
+	}()
 	return server.Run(ctx, cfg, server.Options{Logf: l.Printf})
 }
 
