@@ -4,7 +4,7 @@ keepsync keeps a set of folders synced across your machines and archives them pe
 
 A synced folder can hold just recent files (say the last 30 days) while the archive keeps every version forever. Files only leave sync once they are safely in the bucket, and you can restore any of them, as they are now or as they were at an earlier time.
 
-For an overview of the pieces and why they were chosen, see the [architecture](docs/architecture.md). For how it works in detail, see the [spec](docs/design.md).
+For an overview of the pieces and why they were chosen, see the [architecture](docs/architecture.md). For how it works in detail, see the [spec](docs/spec.md).
 
 ## Getting started
 
@@ -318,14 +318,14 @@ The server always talks to ZeroFS over 9P. By default it is the 9P client itself
 | `v9fs` | The Linux kernel's 9P client | Linux, root, the `9p` and `9pnet_fd` modules |
 | `external` | Nothing. You mount the 9P export at `--mount-dir` yourself | Any platform |
 
-With `9p`, blobs are stored one file per blob, which writes far faster than the `diskpacked` packs the mount modes use for a new bucket (see [Testing](docs/design.md#testing)). A bucket keeps the layout it was created with, and one written as `diskpacked` needs a mount mode. Servers set up before `9p` keep `fuse`.
+With `9p`, blobs are stored one file per blob, which writes far faster than the `diskpacked` packs the mount modes use for a new bucket (see [Testing](docs/spec.md#testing)). A bucket keeps the layout it was created with, and one written as `diskpacked` needs a mount mode. Servers set up before `9p` keep `fuse`.
 
 Stick with `9p` unless you want to look at the server's files with ordinary tools while it runs, or have a `diskpacked` bucket. To switch later, set `mount` under `[zerofs]` in `server.toml` and restart the server. If ZeroFS exits or stops answering, the server restarts and reconnects it on its own, retrying for 5 minutes; `server status` shows `zerofs: RECONNECTING` meanwhile. If it stays down past that, `server status` and every node's status show `zerofs: DOWN`, and you have to restart `keepsync server run`.
 
 ### Command reference
 
-Run `keepsync help` for the full list. The [spec](docs/design.md#cli-reference) has a table of every command and flag.
+Run `keepsync help` for the full list. The [spec](docs/spec.md#cli-reference) has a table of every command and flag.
 
 ## License
 
-MIT. ZeroFS, which keepsync runs as a separate program, is AGPL-3.0. See [Licensing](docs/design.md#licensing).
+MIT. ZeroFS, which keepsync runs as a separate program, is AGPL-3.0. See [Licensing](docs/spec.md#licensing).
