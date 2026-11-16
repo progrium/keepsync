@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/progrium/keepsync/internal/api"
+	"github.com/progrium/keepsync/internal/node"
 )
 
 func TestParseInterspersed(t *testing.T) {
@@ -55,5 +58,21 @@ func TestParseAt(t *testing.T) {
 	}
 	if _, err := parseAt("yesterday", now); err == nil {
 		t.Fatal("want error")
+	}
+}
+
+func TestPeerState(t *testing.T) {
+	for _, tc := range []struct {
+		p    node.PeerInfo
+		want string
+	}{
+		{node.PeerInfo{}, "disconnected"},
+		{node.PeerInfo{Connected: true}, "connected"},
+		{node.PeerInfo{Connected: true, Path: &api.Path{Direct: true, Endpoint: "203.0.113.5:41641"}}, "connected (direct 203.0.113.5:41641)"},
+		{node.PeerInfo{Connected: true, Path: &api.Path{Relay: "nyc"}}, "connected (relay nyc)"},
+	} {
+		if got := peerState(tc.p); got != tc.want {
+			t.Errorf("peerState(%+v) = %q, want %q", tc.p, got, tc.want)
+		}
 	}
 }

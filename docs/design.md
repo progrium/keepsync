@@ -110,6 +110,8 @@ Every keepsync process runs one tailcat server and dispatches incoming connectio
 
 **Relays.** Traffic goes direct when NAT traversal works and falls back to DERP otherwise. tailcat's public DERP relays are rate-limited, so for real sync volumes the user may run their own `derper` and pass `--derp-map` (URL or local JSON file) and `--derp-region` to `server init` and `node init`.
 
+**Path in status.** `keepsync status` shows each connected peer as `connected (direct <ip:port>)` or `connected (relay <region>)`, or plain `connected` when the path can't be told. Two nodes have two tunnels between them, one each way, and Syncthing's connection rides whichever dialed first. The transport counts open connections per tunnel. If the peer dialed in, it reads that peer's current endpoint or DERP region from tailcat's own status, which costs nothing. If only our dial is open, it sends a disco ping over it (2 s timeout) and reports whether the pong came back direct or by which relay; that ping also nudges the tunnel towards a direct path. Both tunnels join the same two hosts, so they normally agree.
+
 **Bootstrap.** A node needs only the server's `tc…` address. `node init --server` also accepts a DNS name whose TXT record holds the address, bare or as `keepsync=tc…`. It is resolved once at init and the address is saved. Publishing the address is safe because the server allow-lists node keys.
 
 **Join flow**
@@ -365,7 +367,7 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 | `server grant <name> <blobs\|read>` | Server | Sets a node's Perkeep scope. |
 | `node init --server <tc… or DNS name> [--name]` | Node | Writes config and keys, prints the node key, exits. The name defaults to the hostname. |
 | `node run` | Node | Runs tailcat, Syncthing, the keepers and the gateway. |
-| `status` | Node | Server connection (or how long it has been unreachable) with a short server summary (health, last flush, disk use, nodes online), peers, folders. |
+| `status` | Node | Server connection (or how long it has been unreachable) with a short server summary (health, last flush, disk use, nodes online), peers (with direct or relay path), folders. |
 | `folder add <name> <path>` | Node | Creates a synced folder in the registry and attaches it here. |
 | `folder join <name> <path> [--merge]` | Node | Attaches an existing folder here. A directory with files needs `--merge`. |
 | `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here. Files stay. |
