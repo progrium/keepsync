@@ -66,6 +66,7 @@ type Syncer struct {
 	peersSet, foldersSet bool
 	bridges              map[protocol.DeviceID]*outBridge
 	allowed              map[api.NodeKey]bool
+	inbound              map[api.NodeKey]*inbound
 
 	// set by Start
 	running    bool
@@ -127,6 +128,7 @@ func New(cfg Config) (*Syncer, error) {
 		peers:   map[protocol.DeviceID]api.Peer{},
 		bridges: map[protocol.DeviceID]*outBridge{},
 		allowed: map[api.NodeKey]bool{},
+		inbound: map[api.NodeKey]*inbound{},
 	}
 	shorts := map[string]api.DeviceID{sy.id.Short().String(): sy.DeviceID()}
 	sy.shorts.Store(&shorts)

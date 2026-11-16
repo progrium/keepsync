@@ -2,7 +2,9 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +17,11 @@ import (
 )
 
 type node struct {
-	t      *testing.T
-	s      *Syncer
-	tr     *fake.Transport
+	t  *testing.T
+	s  *Syncer
+	tr *fake.Transport
+	// via, if set, is the Transport the Syncer uses in place of tr.
+	via    api.Transport
 	dir    string // synced folder
 	stDir  string // Syncer.Config.Dir
 	name   string
@@ -27,7 +31,12 @@ type node struct {
 
 func newNode(t *testing.T, n *fake.Network, name string) *node {
 	t.Helper()
-	nd := &node{t: t, tr: n.Transport(name), dir: t.TempDir(), stDir: t.TempDir(), name: name}
+	return newNodeOn(t, n.Transport(name), nil, name)
+}
+
+func newNodeOn(t *testing.T, tr *fake.Transport, via api.Transport, name string) *node {
+	t.Helper()
+	nd := &node{t: t, tr: tr, via: via, dir: t.TempDir(), stDir: t.TempDir(), name: name}
 	nd.start()
 	return nd
 }
@@ -36,10 +45,14 @@ func newNode(t *testing.T, n *fake.Network, name string) *node {
 func (n *node) start() {
 	t := n.t
 	t.Helper()
+	var tr api.Transport = n.tr
+	if n.via != nil {
+		tr = n.via
+	}
 	s, err := New(Config{
 		Dir:               n.stDir,
 		Name:              n.name,
-		Transport:         n.tr,
+		Transport:         tr,
 		DisableWatcher:    true,
 		RescanInterval:    time.Hour,
 		ReconnectInterval: time.Second,
@@ -129,8 +142,13 @@ func fileIs(path, want string) func() bool {
 func pair(t *testing.T) (a, b *node) {
 	t.Helper()
 	net := fake.NewNetwork()
-	a = newNode(t, net, "a")
-	b = newNode(t, net, "b")
+	return connect(t, newNode(t, net, "a"), newNode(t, net, "b"))
+}
+
+// connect makes a and b peers sharing folder docs, and waits until they
+// are connected.
+func connect(t *testing.T, a, b *node) (*node, *node) {
+	t.Helper()
 	ctx := context.Background()
 	if err := a.s.SetPeers(ctx, []api.Peer{b.peer("b")}); err != nil {
 		t.Fatal(err)
@@ -394,4 +412,70 @@ func TestFolderSync(t *testing.T) {
 	if _, err := a.s.FolderSync("nope"); err == nil {
 		t.Error("FolderSync of an unknown folder succeeded")
 	}
+}
+
+// inboundFrom is how many Syncthing connections n has open from peer.
+func (n *node) inboundFrom(peer *node) int {
+	n.s.mu.Lock()
+	defer n.s.mu.Unlock()
+	if in := n.s.inbound[peer.tr.Key()]; in != nil {
+		return in.active
+	}
+	return 0
+}
+
+// lowHigh orders a and b by node key: low is the one that dials.
+func lowHigh(a, b *node) (low, high *node) {
+	if a.tr.Key() < b.tr.Key() {
+		return a, b
+	}
+	return b, a
+}
+
+func TestOneTunnelPerPair(t *testing.T) {
+	a, b := pair(t)
+	low, high := lowHigh(a, b)
+	eventually(t, "low dialed high", func() bool { return high.inboundFrom(low) > 0 })
+	// The high node never dials while low's connections are up.
+	for range 20 {
+		if n := low.inboundFrom(high); n != 0 {
+			t.Fatalf("high dialed low: %d inbound connections on low", n)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	a.write("x.txt", "x")
+	a.scan("docs")
+	eventually(t, "file on b", fileIs(filepath.Join(b.dir, "x.txt"), "x"))
+}
+
+// noDial is a Transport whose Dial always fails, like a node that cannot
+// reach its peer.
+type noDial struct{ api.Transport }
+
+func (noDial) Dial(context.Context, api.Addr, uint16) (net.Conn, error) {
+	return nil, errors.New("unreachable")
+}
+
+func TestDialFallback(t *testing.T) {
+	old := dialFallback
+	dialFallback = 2 * time.Second
+	t.Cleanup(func() { dialFallback = old })
+
+	nw := fake.NewNetwork()
+	ta, tb := nw.Transport("a"), nw.Transport("b")
+	// Whichever has the lower key is the dialer; make its dials fail.
+	var viaA, viaB api.Transport
+	if ta.Key() < tb.Key() {
+		viaA = noDial{ta}
+	} else {
+		viaB = noDial{tb}
+	}
+	a, b := connect(t, newNodeOn(t, ta, viaA, "a"), newNodeOn(t, tb, viaB, "b"))
+	low, high := lowHigh(a, b)
+	if n := low.inboundFrom(high); n == 0 {
+		t.Errorf("connected, but not by high dialing low")
+	}
+	a.write("y.txt", "y")
+	a.scan("docs")
+	eventually(t, "file on b", fileIs(filepath.Join(b.dir, "y.txt"), "y"))
 }

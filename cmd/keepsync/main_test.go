@@ -70,6 +70,12 @@ func TestPeerState(t *testing.T) {
 		{node.PeerInfo{Connected: true}, "connected"},
 		{node.PeerInfo{Connected: true, Path: &api.Path{Direct: true, Endpoint: "203.0.113.5:41641"}}, "connected (direct 203.0.113.5:41641)"},
 		{node.PeerInfo{Connected: true, Path: &api.Path{Relay: "nyc"}}, "connected (relay nyc)"},
+		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{{Idle: true}}}, "connected (idle)"},
+		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{{Out: true, Path: &api.Path{Relay: "nyc"}}}}, "connected (relay nyc)"},
+		{node.PeerInfo{Connected: true, Tunnels: []api.Tunnel{
+			{Path: &api.Path{Direct: true, Endpoint: "71.116.60.17:54425"}, Traffic: api.Traffic{InRate: 20e6, OutRate: 1e3}},
+			{Out: true, Path: &api.Path{Relay: "nyc"}, Idle: true},
+		}}, "connected (in: direct 71.116.60.17:54425 ↓ 20.0 MB/s  ↑ 1.0 kB/s, out: relay nyc, idle)"},
 	} {
 		if got := peerState(tc.p); got != tc.want {
 			t.Errorf("peerState(%+v) = %q, want %q", tc.p, got, tc.want)

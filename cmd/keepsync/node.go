@@ -112,18 +112,58 @@ func (e *env) status(args []string) error {
 }
 
 // peerState is a peer's STATE column: connected or not, and when connected
-// whether traffic goes direct or through a DERP relay.
+// whether traffic goes direct or through a DERP relay. With a tunnel each
+// way, both are shown, with the rate of any that is busy.
 func peerState(p node.PeerInfo) string {
-	switch {
-	case !p.Connected:
+	if !p.Connected {
 		return "disconnected"
-	case p.Path == nil:
-		return "connected"
-	case p.Path.Direct:
-		return "connected (direct " + p.Path.Endpoint + ")"
-	default:
-		return "connected (relay " + p.Path.Relay + ")"
 	}
+	switch len(p.Tunnels) {
+	case 0:
+		if p.Path == nil {
+			return "connected"
+		}
+		return "connected (" + pathString(p.Path) + ")"
+	case 1:
+		return "connected (" + tunnelString(p.Tunnels[0], false) + ")"
+	}
+	parts := make([]string, len(p.Tunnels))
+	for i, tn := range p.Tunnels {
+		dir := "in: "
+		if tn.Out {
+			dir = "out: "
+		}
+		parts[i] = dir + tunnelString(tn, true)
+	}
+	return "connected (" + strings.Join(parts, ", ") + ")"
+}
+
+func pathString(p *api.Path) string {
+	if p.Direct {
+		return "direct " + p.Endpoint
+	}
+	return "relay " + p.Relay
+}
+
+// tunnelString is one tunnel's path, "idle" if it is idle, and with rates
+// its traffic when busy.
+func tunnelString(tn api.Tunnel, rates bool) string {
+	var s string
+	switch {
+	case tn.Path != nil:
+		s = pathString(tn.Path)
+		if tn.Idle {
+			s += ", idle"
+		}
+	case tn.Idle:
+		s = "idle"
+	default:
+		s = "path unknown"
+	}
+	if rates && !tn.Idle {
+		s += " " + traffic(&tn.Traffic)
+	}
+	return s
 }
 
 // traffic is a peer's TRAFFIC column: receive and send rates over the

@@ -66,12 +66,24 @@ type Path struct {
 	Relay string `json:"relay,omitempty"`
 }
 
-// PathReporter is an optional Transport method. Path reports how traffic to
-// the peer with identity key and address addr travels, using whichever
-// tunnel currently carries a connection to it. ok is false when no
-// connection is open to the peer or the path cannot be told.
+// Tunnel is one direction's tunnel to a peer. Two nodes can have two: the
+// one the peer dialed into us and the one we dialed into the peer.
+type Tunnel struct {
+	// Out is true for the tunnel we dialed, false for the one the peer did.
+	Out bool `json:"out"`
+	// Path is how its traffic travels, nil if that cannot be told (an idle
+	// tunnel without a current direct address).
+	Path *Path `json:"path,omitempty"`
+	// Idle is true when the tunnel moved nothing in the last few seconds.
+	Idle    bool    `json:"idle"`
+	Conns   int     `json:"conns"`
+	Traffic Traffic `json:"traffic"`
+}
+
+// PathReporter is an optional Transport method. Tunnels reports the open
+// tunnels to the peer with identity key and address addr.
 type PathReporter interface {
-	Path(ctx context.Context, key NodeKey, addr Addr) (p Path, ok bool)
+	Tunnels(ctx context.Context, key NodeKey, addr Addr) []Tunnel
 }
 
 // Node is one member of a keepsync network.

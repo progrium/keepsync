@@ -111,8 +111,10 @@ type PeerInfo struct {
 	Device    api.DeviceID `json:"device"`
 	Connected bool         `json:"connected"`
 	// Path is how traffic to the peer travels (direct or which DERP
-	// relay), nil if it could not be told.
+	// relay) on its busiest tunnel, nil if it could not be told.
 	Path *api.Path `json:"path,omitempty"`
+	// Tunnels are the open tunnels to the peer, each with its own path.
+	Tunnels []api.Tunnel `json:"tunnels,omitempty"`
 	// Traffic is the data moved with the peer, nil if none was.
 	Traffic *api.Traffic `json:"traffic,omitempty"`
 }
@@ -179,9 +181,8 @@ func (n *Node) addPeerPaths(ctx context.Context, st *Status) {
 			continue
 		}
 		wg.Go(func() {
-			if path, ok := pr.Path(ctx, nd.Key, nd.Addr); ok {
-				p.Path = &path
-			}
+			p.Tunnels = pr.Tunnels(ctx, nd.Key, nd.Addr)
+			p.Path = busiestPath(p.Tunnels)
 		})
 	}
 	wg.Wait()
@@ -288,6 +289,22 @@ func (n *Node) folderStatus(ctx context.Context, p FolderStatusParams) (FolderSt
 		out.Needed, out.NeedTotal = needed, total
 	}
 	return out, nil
+}
+
+// busiestPath is the path of the tunnel moving the most data, or of any
+// tunnel with a known path if all are idle.
+func busiestPath(tunnels []api.Tunnel) *api.Path {
+	var best *api.Path
+	bestRate := -1.0
+	for _, tn := range tunnels {
+		if tn.Path == nil {
+			continue
+		}
+		if r := tn.Traffic.InRate + tn.Traffic.OutRate; r > bestRate {
+			best, bestRate = tn.Path, r
+		}
+	}
+	return best
 }
 
 // KeepStatus is the result of MethodKeepStatus.

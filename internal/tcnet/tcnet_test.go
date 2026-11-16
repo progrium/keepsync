@@ -271,7 +271,7 @@ func (l *connListener) Accept() (net.Conn, error) {
 func (l *connListener) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
 func (l *connListener) Addr() net.Addr { return &net.TCPAddr{} }
 
-func TestPath(t *testing.T) {
+func TestTunnels(t *testing.T) {
 	t.Parallel()
 	dm := derp(t)
 	a, b := newT(t, dm, Options{}), newT(t, dm, Options{})
@@ -284,9 +284,9 @@ func TestPath(t *testing.T) {
 	a.Allow(b.Key())
 	b.Allow(a.Key())
 
-	// No connection yet: neither side can tell.
-	if p, ok := a.Path(context.Background(), b.Key(), b.Addr()); ok {
-		t.Errorf("a.Path before dial = %+v, want none", p)
+	// No connection yet: no tunnels.
+	if tn := a.Tunnels(context.Background(), b.Key(), b.Addr()); len(tn) != 0 {
+		t.Errorf("a.Tunnels before dial = %+v, want none", tn)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -298,43 +298,51 @@ func TestPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	valid := func(p api.Path) bool {
+	valid := func(p *api.Path) bool {
+		if p == nil {
+			return false
+		}
 		if p.Direct {
 			return p.Endpoint != "" && p.Relay == ""
 		}
 		return p.Relay != ""
 	}
-	check := func(name string, from, to *Transport) {
-		t.Helper()
-		var p api.Path
-		var ok bool
-		for range 20 {
-			if p, ok = from.Path(ctx, to.Key(), to.Addr()); ok {
-				break
-			}
-			time.Sleep(250 * time.Millisecond)
+	// a dialed: one outbound tunnel, whose path a disco ping tells even
+	// while it is idle.
+	var tn []api.Tunnel
+	for range 20 {
+		if tn = a.Tunnels(ctx, b.Key(), b.Addr()); len(tn) == 1 && valid(tn[0].Path) {
+			break
 		}
-		if !ok || !valid(p) {
-			t.Errorf("%s = %+v, %v; want a direct endpoint or a relay", name, p, ok)
-		} else {
-			t.Logf("%s = %+v", name, p)
-		}
+		time.Sleep(250 * time.Millisecond)
 	}
-	check("a.Path (outbound)", a, b)
-	check("b.Path (inbound)", b, a)
+	if len(tn) != 1 || !tn[0].Out || tn[0].Conns != 1 || !valid(tn[0].Path) {
+		t.Errorf("a.Tunnels = %+v, want one outbound tunnel with a path", tn)
+	} else {
+		t.Logf("a out: %+v", *tn[0].Path)
+	}
+	// b was dialed: one inbound tunnel. Its path comes from tailcat's
+	// status, which leaves it unknown once the idle tunnel's direct
+	// address is no longer trusted, so only check it when given.
+	tn = b.Tunnels(ctx, a.Key(), a.Addr())
+	if len(tn) != 1 || tn[0].Out || tn[0].Conns != 1 || tn[0].Traffic.OutTotal != 1 {
+		t.Errorf("b.Tunnels = %+v, want one inbound tunnel that sent 1 byte", tn)
+	} else if p := tn[0].Path; p != nil && !valid(p) {
+		t.Errorf("b in path = %+v", *p)
+	}
 
-	// Once the connection closes on both ends, the path is unknown again.
+	// Once the connection closes on both ends, the tunnels go away.
 	c.Close()
 	close(held)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		_, okA := a.Path(context.Background(), b.Key(), b.Addr())
-		_, okB := b.Path(context.Background(), a.Key(), a.Addr())
-		if !okA && !okB {
+		na := len(a.Tunnels(context.Background(), b.Key(), b.Addr()))
+		nb := len(b.Tunnels(context.Background(), a.Key(), a.Addr()))
+		if na == 0 && nb == 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("Path after close: a %v, b %v; want both unknown", okA, okB)
+			t.Fatalf("Tunnels after close: a %d, b %d; want none", na, nb)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

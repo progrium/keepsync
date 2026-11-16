@@ -95,14 +95,28 @@ type Transport struct {
 	clients  map[api.Addr]*tailcat.Client
 	closed   bool
 
-	// Open connections per tunnel, so Path knows which tunnel to ask.
-	inLive  map[key.NodePublic]int // by identity: they dialed our server
-	outLive map[api.Addr]int       // by address: we dialed their server
-
-	// Bytes moved per peer identity, both tunnels together, and the
-	// sampler that turns them into rates.
-	traffic map[key.NodePublic]*peerTraffic
+	// Each peer can have two tunnels: one it dialed into our server (in)
+	// and one we dialed into its server (out). tunnels tracks each one's
+	// open connections, bytes moved and, for out, the last disco ping.
+	tunnels map[tunnelKey]*tunnel
 	stop    chan struct{}
+}
+
+type tunnelKey struct {
+	id  key.NodePublic // the peer's identity
+	out bool
+}
+
+// tunnel is one direction's tunnel to a peer. Fields other than the
+// counters are guarded by Transport.mu.
+type tunnel struct {
+	peerTraffic
+	live int      // open connections
+	addr api.Addr // for out: the address we dialed
+	// For out: the last disco ping's answer, nil before the first.
+	path    *api.Path
+	pathAt  time.Time
+	pinging bool
 }
 
 var (
@@ -147,9 +161,7 @@ func New(ctx context.Context, o Options) (*Transport, error) {
 		allowed:     map[key.NodePublic]key.NodePublic{},
 		idents:      map[key.NodePublic]key.NodePublic{},
 		clients:     map[api.Addr]*tailcat.Client{},
-		inLive:      map[key.NodePublic]int{},
-		outLive:     map[api.Addr]int{},
-		traffic:     map[key.NodePublic]*peerTraffic{},
+		tunnels:     map[tunnelKey]*tunnel{},
 		stop:        make(chan struct{}),
 	}
 	if t.dialTimeout == 0 {
@@ -179,6 +191,7 @@ func New(ctx context.Context, o Options) (*Transport, error) {
 	t.srv = s
 	t.addr = api.Addr(s.TailcatAddr())
 	go t.sample()
+	go t.nudge()
 	if saveRegion && o.Region == nil && o.RegionID == 0 {
 		// Remember the region picked by latency so the address is
 		// stable. The address embeds the full region either way.
@@ -278,7 +291,7 @@ func (t *Transport) onTCP(port uint16) func(net.Conn) {
 			c.Close()
 			return
 		}
-		h(t.track(c, id, func(d int) { t.inLive[id] += d }), api.NodeKey(id.String()))
+		h(t.track(c, tunnelKey{id: id}, ""), api.NodeKey(id.String()))
 	}
 }
 
@@ -305,7 +318,7 @@ func (t *Transport) Dial(ctx context.Context, to api.Addr, port uint16) (net.Con
 	}
 	// client parsed to already, so this cannot fail.
 	ci, _ := tailcat.ParseAddr(tailcat.Addr(to))
-	return t.track(conn, ci.ServerPublic.NodePublic, func(d int) { t.outLive[to] += d }), nil
+	return t.track(conn, tunnelKey{id: ci.ServerPublic.NodePublic, out: true}, to), nil
 }
 
 func (t *Transport) client(to api.Addr) (*tailcat.Client, error) {
@@ -376,67 +389,157 @@ func (t *Transport) Close() error {
 	return t.srv.Close()
 }
 
-// pathPingTimeout bounds the disco ping Path sends on an outbound tunnel.
+// pathPingTimeout bounds a disco ping on an outbound tunnel.
 const pathPingTimeout = 2 * time.Second
 
-// Path reports how traffic to the peer travels. It prefers the tunnel the
-// peer dialed into our server, whose state tailcat already tracks; failing
-// that it disco pings the peer over the tunnel we dialed, which also nudges
-// that tunnel towards a direct path. Both tunnels run between the same two
-// hosts, so they normally agree.
-func (t *Transport) Path(ctx context.Context, peer api.NodeKey, to api.Addr) (api.Path, bool) {
-	id, err := ParseKey(peer)
+// Disco pings on outbound tunnels. A tunnel that is not known to be direct
+// is pinged every nudgeEvery, which is how a tunnel gets upgraded from DERP
+// to direct: tailcat has no control plane to hand out endpoints, so path
+// discovery only runs when something pings. Tunnels asks again when its
+// answer is older than pathFresh.
+const (
+	nudgeEvery = 15 * time.Second
+	pathFresh  = 20 * time.Second
+)
+
+// Tunnels reports each open tunnel to the peer with identity peerKey: how
+// its traffic travels, whether it is idle, and the bytes it moved.
+//
+// For the tunnel the peer dialed in, the path comes from tailcat's own
+// status. tailcat only reports a direct address while it trusts it, which
+// lapses about 6.5 s after the last pong, so an idle tunnel can look
+// relayed when it is not: for an idle tunnel without a current direct
+// address the path is left unknown. For the tunnel we dialed, the path is
+// the last disco ping's answer, refreshed if it is stale. A pong is a
+// live measurement, so it holds for idle tunnels too.
+func (t *Transport) Tunnels(ctx context.Context, peerKey api.NodeKey, _ api.Addr) []api.Tunnel {
+	id, err := ParseKey(peerKey)
 	if err != nil {
-		return api.Path{}, false
+		return nil
 	}
+	now := time.Now()
+	var out []api.Tunnel
 	t.mu.Lock()
+	in := t.tunnels[tunnelKey{id: id}]
 	dk, allowed := t.idents[id]
-	in := allowed && t.inLive[id] > 0
-	c := t.clients[to]
-	out := c != nil && t.outLive[to] > 0
+	var inT *api.Tunnel
+	if in != nil && in.live > 0 && allowed {
+		inT = &api.Tunnel{Conns: in.live, Traffic: in.report(now)}
+	}
+	o := t.tunnels[tunnelKey{id: id, out: true}]
+	var outT *api.Tunnel
+	stale := false
+	if o != nil && o.live > 0 {
+		outT = &api.Tunnel{Out: true, Conns: o.live, Traffic: o.report(now)}
+		stale = o.path == nil || now.Sub(o.pathAt) > pathFresh
+	}
 	t.mu.Unlock()
-	if in {
-		if ps, ok := t.srv.Status().Peer[dk]; ok && (ps.CurAddr != "" || ps.Relay != "") {
-			if ps.CurAddr != "" {
-				return api.Path{Direct: true, Endpoint: ps.CurAddr}, true
+
+	if inT != nil {
+		inT.Idle = inT.Traffic.InRate == 0 && inT.Traffic.OutRate == 0
+		if ps, ok := t.srv.Status().Peer[dk]; ok {
+			switch {
+			case ps.CurAddr != "":
+				inT.Path = &api.Path{Direct: true, Endpoint: ps.CurAddr}
+			case !inT.Idle && ps.Relay != "":
+				inT.Path = &api.Path{Relay: ps.Relay}
 			}
-			return api.Path{Relay: ps.Relay}, true
 		}
+		out = append(out, *inT)
 	}
-	if !out {
-		return api.Path{}, false
+	if outT != nil {
+		outT.Idle = outT.Traffic.InRate == 0 && outT.Traffic.OutRate == 0
+		if stale {
+			t.ping(ctx, o)
+		}
+		t.mu.Lock()
+		if o.path != nil {
+			p := *o.path
+			outT.Path = &p
+		}
+		t.mu.Unlock()
+		out = append(out, *outT)
 	}
+	return out
+}
+
+// ping disco pings the outbound tunnel tn and records the answer. Only one
+// ping per tunnel runs at a time; a caller that finds one running waits for
+// nothing and uses the previous answer.
+func (t *Transport) ping(ctx context.Context, tn *tunnel) {
+	t.mu.Lock()
+	c := t.clients[tn.addr]
+	if c == nil || tn.pinging {
+		t.mu.Unlock()
+		return
+	}
+	tn.pinging = true
+	t.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, pathPingTimeout)
 	defer cancel()
 	r, err := c.DiscoPing(ctx)
+	var p *api.Path
 	switch {
 	case err != nil:
-		return api.Path{}, false
 	case r.Endpoint != "":
-		return api.Path{Direct: true, Endpoint: r.Endpoint}, true
+		p = &api.Path{Direct: true, Endpoint: r.Endpoint}
 	case r.DERPRegionCode != "":
-		return api.Path{Relay: r.DERPRegionCode}, true
+		p = &api.Path{Relay: r.DERPRegionCode}
 	case r.DERPRegionID != 0:
-		return api.Path{Relay: fmt.Sprint(r.DERPRegionID)}, true
+		p = &api.Path{Relay: fmt.Sprint(r.DERPRegionID)}
 	}
-	return api.Path{}, false
-}
-
-// track counts c as open on a tunnel until it is closed, and counts the
-// bytes it moves towards peer's traffic. add runs under t.mu with +1 now
-// and -1 on the first Close.
-func (t *Transport) track(c net.Conn, peer key.NodePublic, add func(int)) net.Conn {
 	t.mu.Lock()
-	add(1)
-	tr := t.traffic[peer]
-	if tr == nil {
-		tr = &peerTraffic{}
-		t.traffic[peer] = tr
+	tn.pinging = false
+	if p != nil {
+		tn.path, tn.pathAt = p, time.Now()
 	}
 	t.mu.Unlock()
-	return &trackedConn{Conn: c, tr: tr, done: func() {
+}
+
+// nudge pings every open outbound tunnel that is not known to be direct,
+// every nudgeEvery, so tailcat keeps trying to upgrade it from DERP.
+func (t *Transport) nudge() {
+	tick := time.NewTicker(nudgeEvery)
+	defer tick.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for {
+		select {
+		case <-t.stop:
+			return
+		case <-tick.C:
+		}
+		var due []*tunnel
 		t.mu.Lock()
-		add(-1)
+		for k, tn := range t.tunnels {
+			if k.out && tn.live > 0 && (tn.path == nil || !tn.path.Direct) {
+				due = append(due, tn)
+			}
+		}
+		t.mu.Unlock()
+		for _, tn := range due {
+			go t.ping(ctx, tn)
+		}
+	}
+}
+
+// track counts c as open on tunnel k until it is closed, and counts the
+// bytes it moves. addr is the address dialed, for an outbound tunnel.
+func (t *Transport) track(c net.Conn, k tunnelKey, addr api.Addr) net.Conn {
+	t.mu.Lock()
+	tn := t.tunnels[k]
+	if tn == nil {
+		tn = &tunnel{}
+		t.tunnels[k] = tn
+	}
+	if addr != "" && tn.addr != addr {
+		tn.addr, tn.path = addr, nil
+	}
+	tn.live++
+	t.mu.Unlock()
+	return &trackedConn{Conn: c, tr: &tn.peerTraffic, done: func() {
+		t.mu.Lock()
+		tn.live--
 		t.mu.Unlock()
 	}}
 }
@@ -467,13 +570,13 @@ func (c *trackedConn) Close() error {
 }
 
 // Traffic rates are averaged over rateWindow, from a sample of every
-// peer's byte counters taken each rateTick.
+// tunnel's byte counters taken each rateTick.
 const (
 	rateTick   = time.Second
 	rateWindow = 10 * time.Second
 )
 
-// peerTraffic is the bytes moved with one peer. The counters are atomic;
+// peerTraffic is the bytes moved on one tunnel. The counters are atomic;
 // samples is guarded by Transport.mu.
 type peerTraffic struct {
 	in, out atomic.Int64
@@ -494,8 +597,8 @@ func (t *Transport) sample() {
 			return
 		case now := <-tick.C:
 			t.mu.Lock()
-			for _, tr := range t.traffic {
-				tr.record(now)
+			for _, tn := range t.tunnels {
+				tn.record(now)
 			}
 			t.mu.Unlock()
 		}
@@ -534,13 +637,22 @@ func (t *Transport) Traffic(peer api.NodeKey) (api.Traffic, bool) {
 	if err != nil {
 		return api.Traffic{}, false
 	}
+	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	tr := t.traffic[id]
-	if tr == nil {
-		return api.Traffic{}, false
+	var sum api.Traffic
+	found := false
+	for _, out := range []bool{false, true} {
+		if tn := t.tunnels[tunnelKey{id: id, out: out}]; tn != nil {
+			r := tn.report(now)
+			sum.InRate += r.InRate
+			sum.OutRate += r.OutRate
+			sum.InTotal += r.InTotal
+			sum.OutTotal += r.OutTotal
+			found = true
+		}
 	}
-	return tr.report(time.Now()), true
+	return sum, found
 }
 
 // ParseKey parses a "nodekey:<hex>" api.NodeKey.

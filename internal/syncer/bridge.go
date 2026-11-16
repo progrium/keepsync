@@ -22,6 +22,44 @@ import (
 //
 // BEP runs TLS end to end over the splice, so Syncthing still verifies the
 // device ID; the Transport separately authenticates the node key.
+//
+// One tunnel per pair. Left alone, both nodes dial each other, so a pair
+// has two tunnels that hole-punch separately: one can be direct while the
+// other crawls over a rate-limited DERP relay, and Syncthing spreads its
+// connections over both. So only the node with the lower key dials. The
+// other refuses Syncthing's dials and waits to be dialed, unless it has had
+// no inbound connection from the peer for dialFallback, in case the
+// dialer cannot reach it.
+
+// dialFallback is how long the node that does not dial waits without an
+// inbound connection before dialing the peer itself.
+var dialFallback = 30 * time.Second // a var for tests
+
+// inbound is the inbound connections from one peer.
+type inbound struct {
+	active    int
+	idleSince time.Time // when active last dropped to 0, or first asked
+}
+
+// shouldDial reports whether this node may dial peer now.
+func (s *Syncer) shouldDial(peer api.NodeKey) bool {
+	if s.cfg.Transport.Key() < peer {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	in := s.inboundLocked(peer)
+	return in.active == 0 && time.Since(in.idleSince) >= dialFallback
+}
+
+func (s *Syncer) inboundLocked(peer api.NodeKey) *inbound {
+	in := s.inbound[peer]
+	if in == nil {
+		in = &inbound{idleSince: time.Now()}
+		s.inbound[peer] = in
+	}
+	return in
+}
 
 func (s *Syncer) handleInbound(conn net.Conn, peer api.NodeKey) {
 	s.mu.Lock()
@@ -33,6 +71,17 @@ func (s *Syncer) handleInbound(conn net.Conn, peer api.NodeKey) {
 		conn.Close()
 		return
 	}
+	s.mu.Lock()
+	s.inboundLocked(peer).active++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		in := s.inboundLocked(peer)
+		if in.active--; in.active == 0 {
+			in.idleSince = time.Now()
+		}
+		s.mu.Unlock()
+	}()
 	var d net.Dialer
 	local, err := d.DialContext(s.ctx, "tcp", addr)
 	if err != nil {
@@ -46,30 +95,31 @@ func (s *Syncer) handleInbound(conn net.Conn, peer api.NodeKey) {
 // outBridge is the loopback listener standing in for one peer.
 type outBridge struct {
 	ln net.Listener
-	tr api.Transport
+	s  *Syncer
 
 	mu     sync.Mutex
 	target api.Addr
+	key    api.NodeKey
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-func newOutBridge(tr api.Transport, target api.Addr) (*outBridge, error) {
+func newOutBridge(s *Syncer, target api.Addr, key api.NodeKey) (*outBridge, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &outBridge{ln: ln, tr: tr, target: target, ctx: ctx, cancel: cancel}
+	b := &outBridge{ln: ln, s: s, target: target, key: key, ctx: ctx, cancel: cancel}
 	go b.serve()
 	return b, nil
 }
 
 func (b *outBridge) addr() string { return b.ln.Addr().String() }
 
-func (b *outBridge) setTarget(a api.Addr) {
+func (b *outBridge) setTarget(a api.Addr, key api.NodeKey) {
 	b.mu.Lock()
-	b.target = a
+	b.target, b.key = a, key
 	b.mu.Unlock()
 }
 
@@ -85,10 +135,15 @@ func (b *outBridge) serve() {
 
 func (b *outBridge) forward(local net.Conn) {
 	b.mu.Lock()
-	target := b.target
+	target, key := b.target, b.key
 	b.mu.Unlock()
+	if !b.s.shouldDial(key) {
+		// The peer dials us; see "One tunnel per pair".
+		local.Close()
+		return
+	}
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
-	remote, err := b.tr.Dial(ctx, target, api.PortSyncthing)
+	remote, err := b.s.cfg.Transport.Dial(ctx, target, api.PortSyncthing)
 	cancel()
 	if err != nil {
 		slog.Debug("syncer: outbound bridge dial", "to", target, "err", err)
@@ -121,10 +176,10 @@ func (s *Syncer) syncBridgesLocked() error {
 			continue
 		}
 		if b, ok := s.bridges[id]; ok {
-			b.setTarget(p.Addr)
+			b.setTarget(p.Addr, p.Key)
 			continue
 		}
-		b, err := newOutBridge(s.cfg.Transport, p.Addr)
+		b, err := newOutBridge(s, p.Addr, p.Key)
 		if err != nil {
 			return err
 		}
