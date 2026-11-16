@@ -76,3 +76,34 @@ func TestPeerState(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncSummary(t *testing.T) {
+	done := api.SyncCompletion{Pct: 100, GlobalBytes: 10, GlobalItems: 2}
+	behind := api.SyncCompletion{Pct: 63.7, GlobalBytes: 3e9, NeedBytes: 1.2e9, NeedItems: 340}
+	for _, tc := range []struct {
+		fs   *api.FolderSync
+		want string
+	}{
+		{nil, "-"},
+		{&api.FolderSync{State: "idle", Local: done}, "up to date"},
+		{&api.FolderSync{State: "scanning", Local: done}, "scanning"},
+		{&api.FolderSync{State: "syncing", Local: behind}, "syncing 63% (1.2 GB, 340 files left)"},
+		{&api.FolderSync{State: "idle", Local: api.SyncCompletion{Pct: 99.9, NeedItems: 1, NeedDeletes: 2}}, "behind 99% (1 file, 2 deletes left)"},
+		{&api.FolderSync{State: "error", Error: "folder path missing"}, "error: folder path missing"},
+		{&api.FolderSync{State: "idle", Local: done, Peers: []api.PeerSync{
+			{Name: "laptop", Connected: true, Known: true, SyncCompletion: api.SyncCompletion{Pct: 80, NeedItems: 3}},
+			{Name: "nas", Connected: false, Known: true, SyncCompletion: api.SyncCompletion{Pct: 10, NeedItems: 9}},
+			{Name: "phone", Connected: true, Known: true, SyncCompletion: done},
+		}}, "up to date; laptop at 80%"},
+	} {
+		if got := syncSummary(tc.fs); got != tc.want {
+			t.Errorf("syncSummary(%+v) = %q, want %q", tc.fs, got, tc.want)
+		}
+	}
+	if got := traffic(&api.Traffic{InRate: 3.4e6, OutRate: 120e3}); got != "↓ 3.4 MB/s  ↑ 120.0 kB/s" {
+		t.Errorf("traffic = %q", got)
+	}
+	if got := traffic(nil); got != "-" {
+		t.Errorf("traffic(nil) = %q", got)
+	}
+}

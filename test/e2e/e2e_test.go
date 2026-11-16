@@ -113,6 +113,34 @@ func TestCluster(t *testing.T) {
 		for _, n := range []*testNode{a, b} {
 			eventually(t, syncTimeout, "delete reaches "+n.name, func() error { return n.absent("docs", "sub/dir/deep.txt") })
 		}
+		// Status shows the folder caught up everywhere, how each peer is
+		// reached and the traffic with it.
+		for _, n := range []*testNode{a, b, cc} {
+			eventually(t, syncTimeout, n.name+" status shows docs up to date", func() error {
+				var fs node.FolderStatus
+				if err := n.call(node.MethodFolderStat, node.FolderStatusParams{Name: "docs", Limit: 10}, &fs); err != nil {
+					return err
+				}
+				s := fs.Folder.Sync
+				if s == nil || !s.Local.UpToDate() || fs.NeedTotal != 0 {
+					return fmt.Errorf("%s: docs sync %+v, %d needed", n.name, s, fs.NeedTotal)
+				}
+				if len(s.Peers) != 2 || len(fs.Peers) != 2 {
+					return fmt.Errorf("%s: %d sync peers, %d peers", n.name, len(s.Peers), len(fs.Peers))
+				}
+				for _, p := range s.Peers {
+					if !p.Connected || !p.Known || !p.UpToDate() {
+						return fmt.Errorf("%s: peer %s %+v", n.name, p.Name, p)
+					}
+				}
+				for _, p := range fs.Peers {
+					if p.Path == nil || p.Traffic == nil || p.Traffic.InTotal == 0 || p.Traffic.OutTotal == 0 {
+						return fmt.Errorf("%s: peer %s path %+v traffic %+v", n.name, p.Name, p.Path, p.Traffic)
+					}
+				}
+				return nil
+			})
+		}
 	})
 
 	step("join-merge", func(t *testing.T) {

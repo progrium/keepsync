@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/config"
 	"github.com/progrium/keepsync/internal/ctl"
 	"github.com/progrium/keepsync/internal/gateway"
@@ -99,10 +100,9 @@ func (e *env) status(args []string) error {
 		fmt.Fprintln(e.stdout, "peers: none")
 	} else {
 		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "PEER\tDEVICE\tSTATE")
+		fmt.Fprintln(tw, "PEER\tDEVICE\tSTATE\tTRAFFIC")
 		for _, p := range st.Peers {
-			state := peerState(p)
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", p.Name, short(string(p.Device)), state)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.Name, short(string(p.Device)), peerState(p), traffic(p.Traffic))
 		}
 		tw.Flush()
 	}
@@ -126,6 +126,72 @@ func peerState(p node.PeerInfo) string {
 	}
 }
 
+// traffic is a peer's TRAFFIC column: receive and send rates over the
+// last 10 seconds.
+func traffic(t *api.Traffic) string {
+	if t == nil {
+		return "-"
+	}
+	return "↓ " + humanRate(t.InRate) + "  ↑ " + humanRate(t.OutRate)
+}
+
+func humanRate(r float64) string { return humanBytes(int64(r)) + "/s" }
+
+// syncSummary is a folder's SYNC column: its state here, then any connected
+// peer that is behind.
+func syncSummary(fs *api.FolderSync) string {
+	if fs == nil {
+		return "-"
+	}
+	var s string
+	l := fs.Local
+	switch {
+	case fs.State == "error":
+		s = "error: " + fs.Error
+	case !l.UpToDate():
+		verb := "behind"
+		if strings.HasPrefix(fs.State, "sync") {
+			verb = "syncing"
+		}
+		s = fmt.Sprintf("%s %s (%s)", verb, pct(l.Pct), needLeft(l))
+	case strings.HasPrefix(fs.State, "scan"):
+		s = "scanning"
+	default:
+		s = "up to date"
+	}
+	for _, p := range fs.Peers {
+		if p.Connected && p.Known && !p.UpToDate() {
+			s += fmt.Sprintf("; %s at %s", p.Name, pct(p.Pct))
+		}
+	}
+	return s
+}
+
+// pct rounds down, so a folder with anything left never shows 100%.
+func pct(v float64) string { return fmt.Sprintf("%d%%", int(v)) }
+
+// needLeft is what a device still needs: "1.2 GB, 340 files left".
+func needLeft(c api.SyncCompletion) string {
+	var parts []string
+	if c.NeedBytes > 0 {
+		parts = append(parts, humanBytes(c.NeedBytes))
+	}
+	if c.NeedItems > 0 {
+		parts = append(parts, plural(c.NeedItems, "file"))
+	}
+	if c.NeedDeletes > 0 {
+		parts = append(parts, plural(c.NeedDeletes, "delete"))
+	}
+	return strings.Join(parts, ", ") + " left"
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
 func short(s string) string {
 	if len(s) > 7 {
 		return s[:7]
@@ -140,7 +206,7 @@ func printFolders(e *env, folders []node.FolderInfo) {
 	}
 	sort.Slice(folders, func(i, j int) bool { return folders[i].Name < folders[j].Name })
 	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "FOLDER\tPATH\tMEMBERS\tKEEP")
+	fmt.Fprintln(tw, "FOLDER\tPATH\tMEMBERS\tSYNC\tKEEP")
 	for _, f := range folders {
 		path := f.Path
 		if !f.Attached {
@@ -153,7 +219,7 @@ func printFolders(e *env, folders []node.FolderInfo) {
 				keep += " (keeper)"
 			}
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", f.Name, path, strings.Join(f.Members, ","), keep)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", f.Name, path, strings.Join(f.Members, ","), syncSummary(f.Sync), keep)
 	}
 	tw.Flush()
 }
@@ -201,6 +267,80 @@ func (e *env) folderLs(args []string) error {
 		return err
 	}
 	printFolders(e, folders)
+	return nil
+}
+
+func (e *env) folderStatus(args []string) error {
+	fs := newFlags(e, "folder status")
+	verbose := fs.Bool("v", false, "list the files still needed here")
+	limit := fs.Int("n", 100, "with -v, list at most this many files")
+	pos, err := parse(fs, args, 1, 1, "<name> [-v] [-n 100]")
+	if err != nil {
+		return err
+	}
+	p := node.FolderStatusParams{Name: pos[0]}
+	if *verbose {
+		p.Limit = max(1, *limit)
+	}
+	var st node.FolderStatus
+	if err := e.nodeCall(node.MethodFolderStat, p, &st); err != nil {
+		return err
+	}
+	f, s := st.Folder, st.Folder.Sync
+	fmt.Fprintf(e.stdout, "%s at %s: %s\n", f.Name, f.Path, syncSummary(s))
+	since := ""
+	if !s.StateSince.IsZero() {
+		since = " since " + ago(s.StateSince)
+	}
+	fmt.Fprintf(e.stdout, "state: %s%s\n", s.State, since)
+	fmt.Fprintf(e.stdout, "here: %s, %s; ", humanBytes(s.Local.GlobalBytes), plural(s.Local.GlobalItems, "item"))
+	if s.Local.UpToDate() {
+		fmt.Fprintln(e.stdout, "up to date")
+	} else {
+		fmt.Fprintf(e.stdout, "%s, %s\n", pct(s.Local.Pct), needLeft(s.Local))
+	}
+	if len(s.Peers) > 0 {
+		fmt.Fprintln(e.stdout)
+		byDevice := map[api.DeviceID]node.PeerInfo{}
+		for _, p := range st.Peers {
+			byDevice[p.Device] = p
+		}
+		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "PEER\tSTATE\tCOMPLETION\tTRAFFIC")
+		for _, p := range s.Peers {
+			pi := byDevice[p.Device]
+			pi.Connected = p.Connected
+			comp := "unknown (no index yet)"
+			switch {
+			case !p.Known:
+			case p.UpToDate():
+				comp = "100%"
+			default:
+				comp = pct(p.Pct) + ", " + needLeft(p.SyncCompletion)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", p.Name, peerState(pi), comp, traffic(pi.Traffic))
+		}
+		tw.Flush()
+	}
+	if *verbose && len(st.Needed) > 0 {
+		fmt.Fprintln(e.stdout)
+		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "STAGE\tSIZE\tPATH")
+		for _, n := range st.Needed {
+			size := humanBytes(n.Size)
+			switch {
+			case n.Deleted:
+				size = "delete"
+			case n.Dir:
+				size = "dir"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", n.Stage, size, n.Path)
+		}
+		tw.Flush()
+		if st.NeedTotal > len(st.Needed) {
+			fmt.Fprintf(e.stdout, "... and %d more (-n to list more)\n", st.NeedTotal-len(st.Needed))
+		}
+	}
 	return nil
 }
 

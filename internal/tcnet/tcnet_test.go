@@ -339,3 +339,77 @@ func TestPath(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+func TestTraffic(t *testing.T) {
+	t.Parallel()
+	dm := derp(t)
+	a, b := newT(t, dm, Options{}), newT(t, dm, Options{})
+	const n = 256 << 10
+	got := make(chan int64, 1)
+	b.Handle(api.PortSyncthing, func(c net.Conn, _ api.NodeKey) {
+		defer c.Close()
+		m, _ := io.Copy(io.Discard, io.LimitReader(c, n))
+		c.Write([]byte("ok"))
+		got <- m
+	})
+	a.Allow(b.Key())
+	b.Allow(a.Key())
+
+	if _, ok := a.Traffic(b.Key()); ok {
+		t.Error("traffic before any connection")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := a.Dial(ctx, b.Addr(), api.PortSyncthing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write(make([]byte, n)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(c, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if m := <-got; m != n {
+		t.Fatalf("b read %d bytes, want %d", m, n)
+	}
+	// Totals are exact; rates need one sample to measure against.
+	time.Sleep(rateTick + rateTick/2)
+	ta, ok := a.Traffic(b.Key())
+	if !ok || ta.OutTotal != n || ta.InTotal != 2 {
+		t.Errorf("a's traffic with b = %+v, %v; want %d out, 2 in", ta, ok, n)
+	}
+	tb, ok := b.Traffic(a.Key())
+	if !ok || tb.InTotal != n || tb.OutTotal != 2 {
+		t.Errorf("b's traffic with a = %+v, %v; want %d in, 2 out", tb, ok, n)
+	}
+	// Everything moved before the first sample, so the rate over the
+	// window may be zero now, but never negative.
+	if ta.OutRate < 0 || tb.InRate < 0 {
+		t.Errorf("negative rates: %+v %+v", ta, tb)
+	}
+}
+
+func TestTrafficRate(t *testing.T) {
+	var tr peerTraffic
+	t0 := time.Now()
+	tr.record(t0)
+	tr.in.Add(5000)
+	tr.out.Add(1000)
+	r := tr.report(t0.Add(2 * time.Second))
+	if r.InRate != 2500 || r.OutRate != 500 || r.InTotal != 5000 || r.OutTotal != 1000 {
+		t.Errorf("report = %+v, want 2500/500 B/s", r)
+	}
+	// Samples older than the window are dropped, keeping the newest.
+	for i := 1; i <= 15; i++ {
+		tr.record(t0.Add(time.Duration(i) * time.Second))
+	}
+	if span := tr.samples[len(tr.samples)-1].at.Sub(tr.samples[0].at); span > rateWindow {
+		t.Errorf("samples span %v, want at most %v", span, rateWindow)
+	}
+	// Nothing moved in the window: zero rate.
+	if r := tr.report(t0.Add(16 * time.Second)); r.InRate != 0 || r.OutRate != 0 {
+		t.Errorf("idle report = %+v, want zero rates", r)
+	}
+}

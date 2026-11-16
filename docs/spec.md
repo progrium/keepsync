@@ -112,6 +112,10 @@ Every keepsync process runs one tailcat server and dispatches incoming connectio
 
 **Path in status.** `keepsync status` shows each connected peer as `connected (direct <ip:port>)` or `connected (relay <region>)`, or plain `connected` when the path can't be told. Two nodes have two tunnels between them, one each way, and Syncthing's connection rides whichever dialed first. The transport counts open connections per tunnel. If the peer dialed in, it reads that peer's current endpoint or DERP region from tailcat's own status, which costs nothing. If only our dial is open, it sends a disco ping over it (2 s timeout) and reports whether the pong came back direct or by which relay; that ping also nudges the tunnel towards a direct path. Both tunnels join the same two hosts, so they normally agree.
 
+**Traffic in status.** The transport also counts the bytes each connection reads and writes, per peer identity across both tunnels, and samples the counters every second. `status` shows each peer's receive and send rates over the last 10 seconds. The counts cover everything sent over tailcat to that peer, which between nodes is Syncthing. Syncthing has no per-folder throughput, so rates are per peer, not per folder.
+
+**Sync progress.** `status` and `folder ls` add a SYNC column per attached folder, from Syncthing's own model: the folder state, and this node's completion (bytes and items still needed, less the bytes of partly pulled files already fetched). It reads `up to date`, `scanning`, `syncing 63% (1.2 GB, 340 files left)`, `behind ...` (needs files but is not pulling, for example because no connected peer has them), or `error: ...`. A connected peer that is behind is appended as `laptop at 80%`; that is Syncthing's view of the peer, from the index the peer sent and what it has downloaded since. `folder status <name>` shows the same per peer, with path and traffic, and `-v` lists the needed files in pull order (pulling, queued, waiting), 100 by default (`-n`).
+
 **Bootstrap.** A node needs only the server's `tc…` address. `node init --server` also accepts a DNS name whose TXT record holds the address, bare or as `keepsync=tc…`. It is resolved once at init and the address is saved. Publishing the address is safe because the server allow-lists node keys.
 
 **Join flow**
@@ -367,10 +371,11 @@ perkeepd runs once per process, so a live server, a recovered server and a drill
 | `server grant <name> <blobs\|read>` | Server | Sets a node's Perkeep scope. |
 | `node init --server <tc… or DNS name> [--name]` | Node | Writes config and keys, prints the node key, exits. The name defaults to the hostname. |
 | `node run` | Node | Runs tailcat, Syncthing, the keepers and the gateway. |
-| `status` | Node | Server connection (or how long it has been unreachable) with a short server summary (health, last flush, disk use, nodes online), peers (with direct or relay path), folders. |
+| `status` | Node | Server connection (or how long it has been unreachable) with a short server summary (health, last flush, disk use, nodes online), peers (with direct or relay path and traffic rates), folders (with sync progress). |
 | `folder add <name> <path>` | Node | Creates a synced folder in the registry and attaches it here. |
 | `folder join <name> <path> [--merge]` | Node | Attaches an existing folder here. A directory with files needs `--merge`. |
-| `folder ls` / `folder rm <name>` | Node | Lists folders, or stops syncing one here. Files stay. |
+| `folder ls` / `folder rm <name>` | Node | Lists folders with their sync state, or stops syncing one here. Files stay. |
+| `folder status <name> [-v] [-n 100]` | Node | One folder's sync state, what this node needs, each peer's completion, path and traffic; `-v` lists needed files. |
 | `keep <folder> [--grace] [--max-defer] [--expire]` | Node | Marks a folder kept. Creates the permanode and `.keepsync`. |
 | `keep status <folder> [-v]` | Node | Files in grace, kept, lagging and expirable. |
 | `unkeep <folder>` | Node | Stops keeping a folder on every node. The archive stays. |

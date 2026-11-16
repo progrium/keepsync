@@ -96,7 +96,7 @@ Then start the node and leave it running:
 keepsync node run
 ```
 
-Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders. A connected peer shows whether its traffic goes direct (with the peer's address) or through a DERP relay (with the region), so you can tell when sync is stuck on a rate-limited relay. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
+Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders. A connected peer shows whether its traffic goes direct (with the peer's address) or through a DERP relay (with the region), so you can tell when sync is stuck on a rate-limited relay, and how fast data is moving each way with it, averaged over the last 10 seconds. Each folder shows whether it is up to date here, or how far along it is (`syncing 63% (1.2 GB, 340 files left)`), and names any connected peer that is behind. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
 
 Repeat for every machine. The approved nodes find and connect to each other on their own.
 
@@ -122,7 +122,7 @@ keepsync folder join docs ~/Documents
 keepsync folder join docs ~/Documents --merge
 ```
 
-`keepsync folder ls` lists folders and their members. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk. If the server can't be reached, the node stops syncing anyway and tells the server later.
+`keepsync folder ls` lists folders, their members and their sync state. `keepsync folder status docs` shows one folder in detail: its state, what this node still needs, and each peer's completion, path and traffic. Add `-v` to list the files still needed, the ones being pulled first. `keepsync folder rm docs` stops syncing a folder on this node. The files stay on disk. If the server can't be reached, the node stops syncing anyway and tells the server later.
 
 At this point the folder syncs between nodes but isn't archived yet.
 

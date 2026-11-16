@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"sync"
@@ -23,6 +24,7 @@ const (
 	MethodFolderJoin = "folder.join"
 	MethodFolderLs   = "folder.ls"
 	MethodFolderRm   = "folder.rm"
+	MethodFolderStat = "folder.status"
 	MethodKeep       = "keep"
 	MethodKeepStatus = "keep.status"
 	MethodRestore    = "restore"
@@ -80,6 +82,27 @@ type FolderInfo struct {
 	Keep     *api.KeepPolicy `json:"keep,omitempty"`
 	Keeper   bool            `json:"keeper,omitempty"` // this node keeps it
 	Attached bool            `json:"attached"`
+	// Sync is the folder's sync progress here and on its peers, nil if
+	// it is not attached or Syncthing could not tell.
+	Sync *api.FolderSync `json:"sync,omitempty"`
+}
+
+// FolderStatusParams is the body of MethodFolderStat.
+type FolderStatusParams struct {
+	Name string `json:"name"`
+	// Limit is how many needed files to list; 0 lists none.
+	Limit int `json:"limit,omitempty"`
+}
+
+// FolderStatus is the result of MethodFolderStat.
+type FolderStatus struct {
+	Folder FolderInfo `json:"folder"`
+	// Peers are the folder's other members, with path and traffic.
+	Peers []PeerInfo `json:"peers,omitempty"`
+	// Needed are files this node still needs, up to the asked limit,
+	// out of NeedTotal.
+	Needed    []api.NeedFile `json:"needed,omitempty"`
+	NeedTotal int            `json:"needTotal"`
 }
 
 // PeerInfo is one peer in MethodStatus.
@@ -90,6 +113,8 @@ type PeerInfo struct {
 	// Path is how traffic to the peer travels (direct or which DERP
 	// relay), nil if it could not be told.
 	Path *api.Path `json:"path,omitempty"`
+	// Traffic is the data moved with the peer, nil if none was.
+	Traffic *api.Traffic `json:"traffic,omitempty"`
 }
 
 // Status is the result of MethodStatus.
@@ -162,6 +187,109 @@ func (n *Node) addPeerPaths(ctx context.Context, st *Status) {
 	wg.Wait()
 }
 
+// addSync fills in Sync for each attached folder, naming peers from peers
+// (the status peer list) or the membership.
+func (n *Node) addSync(folders []FolderInfo, peers []PeerInfo) {
+	sr, ok := n.sy.(api.SyncStatusReporter)
+	if !ok {
+		return
+	}
+	n.mu.Lock()
+	names := map[api.DeviceID]string{}
+	for _, nd := range n.member.Nodes {
+		names[nd.Device] = nd.Name
+	}
+	connected := maps.Clone(n.connected)
+	n.mu.Unlock()
+	for _, p := range peers {
+		names[p.Device] = p.Name
+	}
+	for i := range folders {
+		f := &folders[i]
+		if !f.Attached || f.ID == "" {
+			continue
+		}
+		fs, err := sr.FolderSync(f.ID)
+		if err != nil {
+			continue
+		}
+		for j := range fs.Peers {
+			p := &fs.Peers[j]
+			p.Name, p.Connected = names[p.Device], connected[p.Device]
+			if p.Name == "" {
+				p.Name = string(p.Device)
+			}
+		}
+		f.Sync = &fs
+	}
+}
+
+// addTraffic fills in Traffic for each peer the transport moved data with.
+func (n *Node) addTraffic(peers []PeerInfo) {
+	tr, ok := n.tr.(api.TrafficReporter)
+	if !ok {
+		return
+	}
+	n.mu.Lock()
+	keys := map[api.DeviceID]api.NodeKey{}
+	for _, nd := range n.member.Nodes {
+		keys[nd.Device] = nd.Key
+	}
+	n.mu.Unlock()
+	for i := range peers {
+		if k, ok := keys[peers[i].Device]; ok {
+			if t, ok := tr.Traffic(k); ok {
+				peers[i].Traffic = &t
+			}
+		}
+	}
+}
+
+// folderStatus is MethodFolderStat: one folder's sync progress, its peers
+// and, if asked, the files still needed here.
+func (n *Node) folderStatus(ctx context.Context, p FolderStatusParams) (FolderStatus, error) {
+	if _, err := n.localFolder(p.Name); err != nil {
+		return FolderStatus{}, err
+	}
+	st := n.status()
+	var out FolderStatus
+	found := false
+	for _, f := range st.Folders {
+		if f.Name == p.Name {
+			out.Folder, found = f, true
+		}
+	}
+	if !found || out.Folder.ID == "" {
+		return FolderStatus{}, fmt.Errorf("folder %q is not in the membership yet", p.Name)
+	}
+	// The folder's peers, in membership order.
+	members := map[string]bool{}
+	for _, m := range out.Folder.Members {
+		members[m] = true
+	}
+	for _, pi := range st.Peers {
+		if members[pi.Name] {
+			out.Peers = append(out.Peers, pi)
+		}
+	}
+	folders := []FolderInfo{out.Folder}
+	n.addSync(folders, out.Peers)
+	out.Folder = folders[0]
+	n.addTraffic(out.Peers)
+	n.addPeerPaths(ctx, &Status{Peers: out.Peers})
+	if out.Folder.Sync == nil {
+		return out, fmt.Errorf("folder %q: Syncthing has no sync state for it yet", p.Name)
+	}
+	if sr, ok := n.sy.(api.SyncStatusReporter); ok {
+		needed, total, err := sr.NeedFiles(out.Folder.ID, p.Limit)
+		if err != nil {
+			return out, err
+		}
+		out.Needed, out.NeedTotal = needed, total
+	}
+	return out, nil
+}
+
 // KeepStatus is the result of MethodKeepStatus.
 type KeepStatus struct {
 	Folder    string         `json:"folder"`
@@ -188,6 +316,8 @@ func (n *Node) handlers() {
 			return nil, err
 		}
 		st := n.status()
+		n.addSync(st.Folders, st.Peers)
+		n.addTraffic(st.Peers)
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -196,6 +326,12 @@ func (n *Node) handlers() {
 		n.addServerSummary(ctx, &st)
 		<-done
 		return st, nil
+	})
+	ctl.HandleFunc(n.ctl, MethodFolderStat, func(ctx context.Context, p FolderStatusParams) (any, error) {
+		if err := ready(); err != nil {
+			return nil, err
+		}
+		return n.folderStatus(ctx, p)
 	})
 	ctl.HandleFunc(n.ctl, MethodFolderAdd, func(ctx context.Context, p FolderParams) (any, error) {
 		if err := ready(); err != nil {
@@ -216,7 +352,9 @@ func (n *Node) handlers() {
 		if err := ready(); err != nil {
 			return nil, err
 		}
-		return n.status().Folders, nil
+		st := n.status()
+		n.addSync(st.Folders, st.Peers)
+		return st.Folders, nil
 	})
 	ctl.HandleFunc(n.ctl, MethodFolderRm, func(ctx context.Context, p FolderParams) (any, error) {
 		if err := ready(); err != nil {

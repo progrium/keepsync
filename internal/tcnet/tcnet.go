@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tailscale/tailcat"
@@ -97,6 +98,11 @@ type Transport struct {
 	// Open connections per tunnel, so Path knows which tunnel to ask.
 	inLive  map[key.NodePublic]int // by identity: they dialed our server
 	outLive map[api.Addr]int       // by address: we dialed their server
+
+	// Bytes moved per peer identity, both tunnels together, and the
+	// sampler that turns them into rates.
+	traffic map[key.NodePublic]*peerTraffic
+	stop    chan struct{}
 }
 
 var (
@@ -143,6 +149,8 @@ func New(ctx context.Context, o Options) (*Transport, error) {
 		clients:     map[api.Addr]*tailcat.Client{},
 		inLive:      map[key.NodePublic]int{},
 		outLive:     map[api.Addr]int{},
+		traffic:     map[key.NodePublic]*peerTraffic{},
+		stop:        make(chan struct{}),
 	}
 	if t.dialTimeout == 0 {
 		t.dialTimeout = DefaultDialTimeout
@@ -170,6 +178,7 @@ func New(ctx context.Context, o Options) (*Transport, error) {
 	}
 	t.srv = s
 	t.addr = api.Addr(s.TailcatAddr())
+	go t.sample()
 	if saveRegion && o.Region == nil && o.RegionID == 0 {
 		// Remember the region picked by latency so the address is
 		// stable. The address embeds the full region either way.
@@ -269,7 +278,7 @@ func (t *Transport) onTCP(port uint16) func(net.Conn) {
 			c.Close()
 			return
 		}
-		h(t.track(c, func(d int) { t.inLive[id] += d }), api.NodeKey(id.String()))
+		h(t.track(c, id, func(d int) { t.inLive[id] += d }), api.NodeKey(id.String()))
 	}
 }
 
@@ -294,7 +303,9 @@ func (t *Transport) Dial(ctx context.Context, to api.Addr, port uint16) (net.Con
 		t.dropClient(to, c)
 		return nil, fmt.Errorf("tcnet: dial %v port %d: %w", short(to), port, err)
 	}
-	return t.track(conn, func(d int) { t.outLive[to] += d }), nil
+	// client parsed to already, so this cannot fail.
+	ci, _ := tailcat.ParseAddr(tailcat.Addr(to))
+	return t.track(conn, ci.ServerPublic.NodePublic, func(d int) { t.outLive[to] += d }), nil
 }
 
 func (t *Transport) client(to api.Addr) (*tailcat.Client, error) {
@@ -355,6 +366,7 @@ func (t *Transport) Close() error {
 		return nil
 	}
 	t.closed = true
+	close(t.stop)
 	clients := t.clients
 	t.clients = map[api.Addr]*tailcat.Client{}
 	t.mu.Unlock()
@@ -410,13 +422,19 @@ func (t *Transport) Path(ctx context.Context, peer api.NodeKey, to api.Addr) (ap
 	return api.Path{}, false
 }
 
-// track counts c as open on a tunnel until it is closed. add runs under
-// t.mu with +1 now and -1 on the first Close.
-func (t *Transport) track(c net.Conn, add func(int)) net.Conn {
+// track counts c as open on a tunnel until it is closed, and counts the
+// bytes it moves towards peer's traffic. add runs under t.mu with +1 now
+// and -1 on the first Close.
+func (t *Transport) track(c net.Conn, peer key.NodePublic, add func(int)) net.Conn {
 	t.mu.Lock()
 	add(1)
+	tr := t.traffic[peer]
+	if tr == nil {
+		tr = &peerTraffic{}
+		t.traffic[peer] = tr
+	}
 	t.mu.Unlock()
-	return &trackedConn{Conn: c, done: func() {
+	return &trackedConn{Conn: c, tr: tr, done: func() {
 		t.mu.Lock()
 		add(-1)
 		t.mu.Unlock()
@@ -425,14 +443,104 @@ func (t *Transport) track(c net.Conn, add func(int)) net.Conn {
 
 type trackedConn struct {
 	net.Conn
+	tr   *peerTraffic
 	once sync.Once
 	done func()
+}
+
+func (c *trackedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.tr.in.Add(int64(n))
+	return n, err
+}
+
+func (c *trackedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.tr.out.Add(int64(n))
+	return n, err
 }
 
 func (c *trackedConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(c.done)
 	return err
+}
+
+// Traffic rates are averaged over rateWindow, from a sample of every
+// peer's byte counters taken each rateTick.
+const (
+	rateTick   = time.Second
+	rateWindow = 10 * time.Second
+)
+
+// peerTraffic is the bytes moved with one peer. The counters are atomic;
+// samples is guarded by Transport.mu.
+type peerTraffic struct {
+	in, out atomic.Int64
+	samples []trafficSample // oldest first, spanning at most rateWindow
+}
+
+type trafficSample struct {
+	at      time.Time
+	in, out int64
+}
+
+func (t *Transport) sample() {
+	tick := time.NewTicker(rateTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.stop:
+			return
+		case now := <-tick.C:
+			t.mu.Lock()
+			for _, tr := range t.traffic {
+				tr.record(now)
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
+func (tr *peerTraffic) record(now time.Time) {
+	tr.samples = append(tr.samples, trafficSample{now, tr.in.Load(), tr.out.Load()})
+	drop := 0
+	for drop < len(tr.samples)-1 && now.Sub(tr.samples[drop].at) > rateWindow {
+		drop++
+	}
+	tr.samples = tr.samples[drop:]
+}
+
+// report is the traffic as of now. t.mu must be held.
+func (tr *peerTraffic) report(now time.Time) api.Traffic {
+	in, out := tr.in.Load(), tr.out.Load()
+	r := api.Traffic{InTotal: in, OutTotal: out}
+	if len(tr.samples) > 0 {
+		old := tr.samples[0]
+		if secs := now.Sub(old.at).Seconds(); secs >= rateTick.Seconds()/2 {
+			r.InRate = float64(in-old.in) / secs
+			r.OutRate = float64(out-old.out) / secs
+		}
+	}
+	return r
+}
+
+var _ api.TrafficReporter = (*Transport)(nil)
+
+// Traffic reports the bytes moved with the peer over both tunnels, with
+// rates over the last rateWindow.
+func (t *Transport) Traffic(peer api.NodeKey) (api.Traffic, bool) {
+	id, err := ParseKey(peer)
+	if err != nil {
+		return api.Traffic{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	tr := t.traffic[id]
+	if tr == nil {
+		return api.Traffic{}, false
+	}
+	return tr.report(time.Now()), true
 }
 
 // ParseKey parses a "nodekey:<hex>" api.NodeKey.

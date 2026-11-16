@@ -354,3 +354,44 @@ func TestRestartKeepsIndex(t *testing.T) {
 		})
 	}
 }
+
+func TestFolderSync(t *testing.T) {
+	a, b := pair(t)
+	a.write("one.txt", "1111")
+	a.write("sub/two.txt", "22")
+	a.scan("docs")
+	eventually(t, "file on b", fileIs(filepath.Join(b.dir, "sub/two.txt"), "22"))
+
+	for _, n := range []*node{a, b} {
+		other := b
+		if n == b {
+			other = a
+		}
+		var fs api.FolderSync
+		eventually(t, n.name+" sees both up to date", func() bool {
+			var err error
+			fs, err = n.s.FolderSync("docs")
+			if err != nil || !fs.Local.UpToDate() || len(fs.Peers) != 1 {
+				return false
+			}
+			p := fs.Peers[0]
+			return p.Known && p.UpToDate()
+		})
+		if fs.Local.GlobalBytes != 6 || fs.Local.Pct != 100 {
+			t.Errorf("%s local = %+v, want 6 bytes, 100%%", n.name, fs.Local)
+		}
+		if fs.Peers[0].Device != other.s.DeviceID() {
+			t.Errorf("%s peer = %v, want %v", n.name, fs.Peers[0].Device, other.s.DeviceID())
+		}
+		if fs.State == "" || fs.State == "error" {
+			t.Errorf("%s state = %q (%s)", n.name, fs.State, fs.Error)
+		}
+		files, total, err := n.s.NeedFiles("docs", 10)
+		if err != nil || total != 0 || len(files) != 0 {
+			t.Errorf("%s NeedFiles = %v, %d, %v; want none", n.name, files, total, err)
+		}
+	}
+	if _, err := a.s.FolderSync("nope"); err == nil {
+		t.Error("FolderSync of an unknown folder succeeded")
+	}
+}

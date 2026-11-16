@@ -36,12 +36,15 @@ Server:
 Node:
   node init --server <tc… or name>     create this node, print its key
   node run                             run the node
-  status                               server connection, peers, folders
+  status                               server connection, peers (path,
+                                       traffic), folders (sync progress)
   folder add <name> <path>             create a synced folder
   folder join <name> <path> [--merge]
                                        attach an existing folder here;
                                        --merge if <path> already has files
   folder ls                            list folders
+  folder status <name> [-v]            sync progress here and on each peer;
+                                       -v lists the files still needed
   folder rm <name>                     stop syncing a folder here (files stay)
   keep <folder> [--grace 48h] [--max-defer 7d] [--expire 30d]
                                        mark a folder kept
@@ -148,6 +151,8 @@ func run(e *env, args []string) error {
 			return e.folderLs(a)
 		case "rm", "remove":
 			return e.folderRm(a)
+		case "status":
+			return e.folderStatus(a)
 		}
 	case "keep":
 		if len(rest) > 0 && rest[0] == "status" {

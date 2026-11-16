@@ -305,6 +305,86 @@ type FileState struct {
 	Current bool
 }
 
+// FolderSync is how far along one folder's sync is, on this node and on the
+// peers it shares the folder with.
+type FolderSync struct {
+	// State is Syncthing's folder state: idle, scanning, syncing,
+	// sync-preparing, scan-waiting, sync-waiting, cleaning, error, ...
+	State string `json:"state"`
+	// StateSince is when State was entered.
+	StateSince time.Time `json:"stateSince,omitzero"`
+	// Error is the folder error when State is error.
+	Error string `json:"error,omitempty"`
+	// Local is this node: what the folder holds and what it still needs.
+	Local SyncCompletion `json:"local"`
+	// Peers are the other members' progress, as far as this node knows.
+	Peers []PeerSync `json:"peers,omitempty"`
+}
+
+// SyncCompletion is one device's progress on a folder.
+type SyncCompletion struct {
+	// Pct is 0-100, weighing bytes and items the way Syncthing does.
+	Pct         float64 `json:"pct"`
+	GlobalBytes int64   `json:"globalBytes"`
+	GlobalItems int     `json:"globalItems"`
+	// NeedBytes excludes bytes of partly pulled files already fetched.
+	NeedBytes   int64 `json:"needBytes"`
+	NeedItems   int   `json:"needItems"`
+	NeedDeletes int   `json:"needDeletes"`
+}
+
+// UpToDate reports whether nothing is needed.
+func (c SyncCompletion) UpToDate() bool {
+	return c.NeedBytes == 0 && c.NeedItems == 0 && c.NeedDeletes == 0
+}
+
+// PeerSync is a peer's progress on a folder.
+type PeerSync struct {
+	Device DeviceID `json:"device"`
+	// Name is the peer's node name, filled in by the node.
+	Name string `json:"name,omitempty"`
+	// Connected is whether the peer is connected now, filled in by the node.
+	Connected bool `json:"connected"`
+	// Known is false until the peer has sent its index for the folder, so
+	// its progress cannot be told yet.
+	Known bool `json:"known"`
+	SyncCompletion
+}
+
+// NeedFile is a file this node still needs for a folder.
+type NeedFile struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	Deleted bool   `json:"deleted,omitempty"`
+	Dir     bool   `json:"dir,omitempty"`
+	// Stage is "pulling" (in progress), "queued" or "waiting".
+	Stage string `json:"stage"`
+}
+
+// SyncStatusReporter is an optional Syncer method set for sync progress.
+type SyncStatusReporter interface {
+	FolderSync(folderID string) (FolderSync, error)
+	// NeedFiles lists up to limit files this node still needs, in pull
+	// order, and the total number needed.
+	NeedFiles(folderID string, limit int) ([]NeedFile, int, error)
+}
+
+// Traffic is the data moved to and from a peer over the transport.
+type Traffic struct {
+	// InRate and OutRate are bytes per second over the last few seconds.
+	InRate  float64 `json:"inRate"`
+	OutRate float64 `json:"outRate"`
+	// InTotal and OutTotal count since the transport started.
+	InTotal  int64 `json:"inTotal"`
+	OutTotal int64 `json:"outTotal"`
+}
+
+// TrafficReporter is an optional Transport method. Traffic reports the
+// data moved with the peer whose identity is key, ok false if none ever was.
+type TrafficReporter interface {
+	Traffic(key NodeKey) (t Traffic, ok bool)
+}
+
 // Syncer is the embedded Syncthing instance.
 type Syncer interface {
 	Start(ctx context.Context) error
