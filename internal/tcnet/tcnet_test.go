@@ -270,3 +270,72 @@ func (l *connListener) Accept() (net.Conn, error) {
 }
 func (l *connListener) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
 func (l *connListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestPath(t *testing.T) {
+	t.Parallel()
+	dm := derp(t)
+	a, b := newT(t, dm, Options{}), newT(t, dm, Options{})
+	held := make(chan struct{})
+	b.Handle(api.PortSyncthing, func(c net.Conn, _ api.NodeKey) {
+		defer c.Close()
+		c.Write([]byte{1})
+		<-held
+	})
+	a.Allow(b.Key())
+	b.Allow(a.Key())
+
+	// No connection yet: neither side can tell.
+	if p, ok := a.Path(context.Background(), b.Key(), b.Addr()); ok {
+		t.Errorf("a.Path before dial = %+v, want none", p)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := a.Dial(ctx, b.Addr(), api.PortSyncthing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	valid := func(p api.Path) bool {
+		if p.Direct {
+			return p.Endpoint != "" && p.Relay == ""
+		}
+		return p.Relay != ""
+	}
+	check := func(name string, from, to *Transport) {
+		t.Helper()
+		var p api.Path
+		var ok bool
+		for range 20 {
+			if p, ok = from.Path(ctx, to.Key(), to.Addr()); ok {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !ok || !valid(p) {
+			t.Errorf("%s = %+v, %v; want a direct endpoint or a relay", name, p, ok)
+		} else {
+			t.Logf("%s = %+v", name, p)
+		}
+	}
+	check("a.Path (outbound)", a, b)
+	check("b.Path (inbound)", b, a)
+
+	// Once the connection closes on both ends, the path is unknown again.
+	c.Close()
+	close(held)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, okA := a.Path(context.Background(), b.Key(), b.Addr())
+		_, okB := b.Path(context.Background(), a.Key(), a.Addr())
+		if !okA && !okB {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Path after close: a %v, b %v; want both unknown", okA, okB)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

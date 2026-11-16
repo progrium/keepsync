@@ -93,9 +93,16 @@ type Transport struct {
 	idents   map[key.NodePublic]key.NodePublic // identity -> incoming dial key
 	clients  map[api.Addr]*tailcat.Client
 	closed   bool
+
+	// Open connections per tunnel, so Path knows which tunnel to ask.
+	inLive  map[key.NodePublic]int // by identity: they dialed our server
+	outLive map[api.Addr]int       // by address: we dialed their server
 }
 
-var _ api.Transport = (*Transport)(nil)
+var (
+	_ api.Transport    = (*Transport)(nil)
+	_ api.PathReporter = (*Transport)(nil)
+)
 
 // ErrClosed is returned by Dial after Close.
 var ErrClosed = errors.New("tcnet: transport closed")
@@ -134,6 +141,8 @@ func New(ctx context.Context, o Options) (*Transport, error) {
 		allowed:     map[key.NodePublic]key.NodePublic{},
 		idents:      map[key.NodePublic]key.NodePublic{},
 		clients:     map[api.Addr]*tailcat.Client{},
+		inLive:      map[key.NodePublic]int{},
+		outLive:     map[api.Addr]int{},
 	}
 	if t.dialTimeout == 0 {
 		t.dialTimeout = DefaultDialTimeout
@@ -260,7 +269,7 @@ func (t *Transport) onTCP(port uint16) func(net.Conn) {
 			c.Close()
 			return
 		}
-		h(c, api.NodeKey(id.String()))
+		h(t.track(c, func(d int) { t.inLive[id] += d }), api.NodeKey(id.String()))
 	}
 }
 
@@ -285,7 +294,7 @@ func (t *Transport) Dial(ctx context.Context, to api.Addr, port uint16) (net.Con
 		t.dropClient(to, c)
 		return nil, fmt.Errorf("tcnet: dial %v port %d: %w", short(to), port, err)
 	}
-	return conn, nil
+	return t.track(conn, func(d int) { t.outLive[to] += d }), nil
 }
 
 func (t *Transport) client(to api.Addr) (*tailcat.Client, error) {
@@ -353,6 +362,77 @@ func (t *Transport) Close() error {
 		c.Close()
 	}
 	return t.srv.Close()
+}
+
+// pathPingTimeout bounds the disco ping Path sends on an outbound tunnel.
+const pathPingTimeout = 2 * time.Second
+
+// Path reports how traffic to the peer travels. It prefers the tunnel the
+// peer dialed into our server, whose state tailcat already tracks; failing
+// that it disco pings the peer over the tunnel we dialed, which also nudges
+// that tunnel towards a direct path. Both tunnels run between the same two
+// hosts, so they normally agree.
+func (t *Transport) Path(ctx context.Context, peer api.NodeKey, to api.Addr) (api.Path, bool) {
+	id, err := ParseKey(peer)
+	if err != nil {
+		return api.Path{}, false
+	}
+	t.mu.Lock()
+	dk, allowed := t.idents[id]
+	in := allowed && t.inLive[id] > 0
+	c := t.clients[to]
+	out := c != nil && t.outLive[to] > 0
+	t.mu.Unlock()
+	if in {
+		if ps, ok := t.srv.Status().Peer[dk]; ok && (ps.CurAddr != "" || ps.Relay != "") {
+			if ps.CurAddr != "" {
+				return api.Path{Direct: true, Endpoint: ps.CurAddr}, true
+			}
+			return api.Path{Relay: ps.Relay}, true
+		}
+	}
+	if !out {
+		return api.Path{}, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, pathPingTimeout)
+	defer cancel()
+	r, err := c.DiscoPing(ctx)
+	switch {
+	case err != nil:
+		return api.Path{}, false
+	case r.Endpoint != "":
+		return api.Path{Direct: true, Endpoint: r.Endpoint}, true
+	case r.DERPRegionCode != "":
+		return api.Path{Relay: r.DERPRegionCode}, true
+	case r.DERPRegionID != 0:
+		return api.Path{Relay: fmt.Sprint(r.DERPRegionID)}, true
+	}
+	return api.Path{}, false
+}
+
+// track counts c as open on a tunnel until it is closed. add runs under
+// t.mu with +1 now and -1 on the first Close.
+func (t *Transport) track(c net.Conn, add func(int)) net.Conn {
+	t.mu.Lock()
+	add(1)
+	t.mu.Unlock()
+	return &trackedConn{Conn: c, done: func() {
+		t.mu.Lock()
+		add(-1)
+		t.mu.Unlock()
+	}}
+}
+
+type trackedConn struct {
+	net.Conn
+	once sync.Once
+	done func()
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.done)
+	return err
 }
 
 // ParseKey parses a "nodekey:<hex>" api.NodeKey.

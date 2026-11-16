@@ -101,10 +101,7 @@ func (e *env) status(args []string) error {
 		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "PEER\tDEVICE\tSTATE")
 		for _, p := range st.Peers {
-			state := "disconnected"
-			if p.Connected {
-				state = "connected"
-			}
+			state := peerState(p)
 			fmt.Fprintf(tw, "%s\t%s\t%s\n", p.Name, short(string(p.Device)), state)
 		}
 		tw.Flush()
@@ -112,6 +109,21 @@ func (e *env) status(args []string) error {
 	fmt.Fprintln(e.stdout)
 	printFolders(e, st.Folders)
 	return nil
+}
+
+// peerState is a peer's STATE column: connected or not, and when connected
+// whether traffic goes direct or through a DERP relay.
+func peerState(p node.PeerInfo) string {
+	switch {
+	case !p.Connected:
+		return "disconnected"
+	case p.Path == nil:
+		return "connected"
+	case p.Path.Direct:
+		return "connected (direct " + p.Path.Endpoint + ")"
+	default:
+		return "connected (relay " + p.Path.Relay + ")"
+	}
 }
 
 func short(s string) string {

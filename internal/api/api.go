@@ -56,6 +56,24 @@ type Transport interface {
 	Close() error
 }
 
+// Path is how traffic to a peer travels right now.
+type Path struct {
+	// Direct is true when packets go straight to the peer over UDP.
+	Direct bool `json:"direct"`
+	// Endpoint is the peer's ip:port when Direct.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Relay is the DERP region code carrying the traffic when not Direct.
+	Relay string `json:"relay,omitempty"`
+}
+
+// PathReporter is an optional Transport method. Path reports how traffic to
+// the peer with identity key and address addr travels, using whichever
+// tunnel currently carries a connection to it. ok is false when no
+// connection is open to the peer or the path cannot be told.
+type PathReporter interface {
+	Path(ctx context.Context, key NodeKey, addr Addr) (p Path, ok bool)
+}
+
 // Node is one member of a keepsync network.
 type Node struct {
 	Name   string

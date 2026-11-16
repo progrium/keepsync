@@ -96,7 +96,7 @@ Then start the node and leave it running:
 keepsync node run
 ```
 
-Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
+Check it with `keepsync status`, which shows the server connection with a short server summary (healthy or not, last flush, disk and bucket use, nodes online), then peers and folders. A connected peer shows whether its traffic goes direct (with the peer's address) or through a DERP relay (with the region), so you can tell when sync is stuck on a rate-limited relay. If the node hasn't been approved yet, `status` prints the `server add` command again. `keepsync server nodes` on the server lists every node and whether it is online.
 
 Repeat for every machine. The approved nodes find and connect to each other on their own.
 

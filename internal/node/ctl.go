@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -86,6 +87,9 @@ type PeerInfo struct {
 	Name      string       `json:"name"`
 	Device    api.DeviceID `json:"device"`
 	Connected bool         `json:"connected"`
+	// Path is how traffic to the peer travels (direct or which DERP
+	// relay), nil if it could not be told.
+	Path *api.Path `json:"path,omitempty"`
 }
 
 // Status is the result of MethodStatus.
@@ -129,6 +133,35 @@ func (n *Node) addServerSummary(ctx context.Context, st *Status) {
 	st.ServerSummary = &sum
 }
 
+// addPeerPaths fills in Path for each connected peer, asking the transport
+// for all of them at once.
+func (n *Node) addPeerPaths(ctx context.Context, st *Status) {
+	pr, ok := n.tr.(api.PathReporter)
+	if !ok {
+		return
+	}
+	n.mu.Lock()
+	byDevice := map[api.DeviceID]api.Node{}
+	for _, nd := range n.member.Nodes {
+		byDevice[nd.Device] = nd
+	}
+	n.mu.Unlock()
+	var wg sync.WaitGroup
+	for i := range st.Peers {
+		p := &st.Peers[i]
+		nd, ok := byDevice[p.Device]
+		if !p.Connected || !ok {
+			continue
+		}
+		wg.Go(func() {
+			if path, ok := pr.Path(ctx, nd.Key, nd.Addr); ok {
+				p.Path = &path
+			}
+		})
+	}
+	wg.Wait()
+}
+
 // KeepStatus is the result of MethodKeepStatus.
 type KeepStatus struct {
 	Folder    string         `json:"folder"`
@@ -155,7 +188,13 @@ func (n *Node) handlers() {
 			return nil, err
 		}
 		st := n.status()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			n.addPeerPaths(ctx, &st)
+		}()
 		n.addServerSummary(ctx, &st)
+		<-done
 		return st, nil
 	})
 	ctl.HandleFunc(n.ctl, MethodFolderAdd, func(ctx context.Context, p FolderParams) (any, error) {
