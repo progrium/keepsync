@@ -66,7 +66,7 @@ Then start the server and leave it running (under systemd, launchd or similar):
 keepsync server run
 ```
 
-It starts ZeroFS, starts Perkeep and the registry, and flushes to the bucket every minute. Stopping it with Ctrl-C or SIGTERM drains and flushes everything to the bucket first.
+It starts ZeroFS, starts Perkeep and the registry, and flushes to the bucket every minute. Stopping it with Ctrl-C, SIGTERM or SIGHUP drains and flushes everything to the bucket first; a second Ctrl-C quits at once. ZeroFS never outlives the server: on Linux it stops when keepsync dies for any reason, and on any platform `server run` stops a ZeroFS left running by an earlier run before starting its own.
 
 Check on it with:
 
