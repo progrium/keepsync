@@ -17,9 +17,7 @@ Nodes sync directly with each other, so sync keeps working while the server is d
 ### Prerequisites
 
 - **Go 1.27.2** or newer, to build keepsync.
-- **tailcat.** Nothing to install. keepsync embeds tailcat as a library, and `go.mod` pins a version from tailcat's `main` branch, which `go build` fetches. By default traffic is relayed through tailcat's public DERP relays when a direct connection can't be made. Those are rate-limited, so for real sync volumes run your own `derper` and pass `--derp-map` and `--derp-region` to `server init` and `node init`.
 - **An S3-compatible bucket** for the archive, such as Cloudflare R2, AWS S3, or MinIO, with an access key that can read and write it.
-- **ZeroFS v2.3.7** on the server. You don't need to install it: `server init` downloads the pinned release and checks its SHA-256 if it isn't on your `PATH`. Builds exist for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, and freebsd/amd64.
 
 ### Build
 
