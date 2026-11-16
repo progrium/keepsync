@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -349,6 +350,9 @@ func (s *Supervisor) Start(ctx context.Context) (err error) {
 	if err := s.prepareDirs(); err != nil {
 		return err
 	}
+	if err := s.stopStale(s.cfg.StopTimeout); err != nil {
+		return err
+	}
 	if err := writeFileAtomic(s.configPath, []byte(renderConfig(configParams{
 		Storage:     s.cfg.Storage,
 		CacheDir:    filepath.Join(s.cfg.DataDir, "cache"),
@@ -405,6 +409,9 @@ func (s *Supervisor) launchLocked(ctx context.Context) (err error) {
 		return fmt.Errorf("zerofs: start: %w", err)
 	}
 	s.proc = cmd
+	if err := os.WriteFile(s.pidFile(), []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600); err != nil {
+		s.log.Warn("zerofs: writing pid file", "err", err)
+	}
 	s.done = make(chan struct{})
 	s.exitErr = nil
 	go s.wait(cmd, s.done)
@@ -641,9 +648,14 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("zerofs: exited: %w", err))
 	}
 	s.proc = nil
+	os.Remove(s.pidFile())
 	s.closeLog()
 	return errors.Join(errs...)
 }
+
+// pidFile holds the pid of the running zerofs, so a later run can find it
+// if this keepsync is killed before stopping it.
+func (s *Supervisor) pidFile() string { return filepath.Join(s.cfg.DataDir, "zerofs.pid") }
 
 func (s *Supervisor) prepareDirs() error {
 	for _, d := range []string{s.cfg.DataDir, filepath.Join(s.cfg.DataDir, "cache"), filepath.Dir(s.ninePSocket)} {

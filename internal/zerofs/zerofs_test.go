@@ -466,3 +466,20 @@ func TestMountPointDetection(t *testing.T) {
 		}
 	}
 }
+
+func TestRunsConfig(t *testing.T) {
+	for _, c := range []struct {
+		argv []string
+		want bool
+	}{
+		{[]string{"/bin/zerofs", "run", "--config", "/s/zerofs.toml"}, true},
+		{[]string{"zerofs", "run", "--config", "/other/zerofs.toml"}, false},
+		{[]string{"zerofs", "flush", "--config", "/s/zerofs.toml"}, false},
+		{[]string{"zerofs", "run", "--config"}, false},
+		{nil, false},
+	} {
+		if got := runsConfig(c.argv, "/s/zerofs.toml"); got != c.want {
+			t.Errorf("runsConfig(%q) = %v, want %v", c.argv, got, c.want)
+		}
+	}
+}
