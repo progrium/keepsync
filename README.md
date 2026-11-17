@@ -1,4 +1,13 @@
-# keepsync
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+    <img src="docs/images/logo.svg" alt="keepsync logo: a castle keep circled by a ring of synced nodes" width="160">
+  </picture>
+</p>
+
+<h1 align="center">keepsync</h1>
+
+<p align="center"><b>Sync your folders everywhere. Keep every version forever.</b></p>
 
 keepsync keeps a set of folders synced across your machines and archives them permanently. It is one Go binary that embeds Syncthing for sync and Perkeep for the archive, stores the archive in any S3-compatible bucket through ZeroFS, and connects everything over tailcat, so nothing needs a public IP, open ports, or DNS.
 
