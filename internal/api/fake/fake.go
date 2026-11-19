@@ -336,6 +336,21 @@ func (r *Registry) Membership() api.Membership {
 	return copyMembership(r.m)
 }
 
+// Forget drops a registered node from the membership, keeping it
+// approved: what the server shows after `server remove` and `server add`.
+func (r *Registry) Forget(key api.NodeKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nodes := r.m.Nodes[:0]
+	for _, n := range r.m.Nodes {
+		if n.Key != key {
+			nodes = append(nodes, n)
+		}
+	}
+	r.m.Nodes = nodes
+	r.publishLocked()
+}
+
 func (r *Registry) publishLocked() {
 	r.m.Version++
 	m := copyMembership(r.m)
