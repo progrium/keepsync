@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/progrium/keepsync/internal/api"
 	"github.com/progrium/keepsync/internal/api/fake"
 )
@@ -694,5 +696,21 @@ func TestKeptFileIsPutAgainUntilDurable(t *testing.T) {
 	e.clock.Advance(time.Hour)
 	if rep := e.pass(); len(rep.Reput) != 0 || len(k.unconfirmed) != 0 {
 		t.Fatalf("durable file put again (%v) or still tracked (%d)", rep.Reput, len(k.unconfirmed))
+	}
+}
+
+// TestKeepsNFCPath: a name spelled in NFD on disk (as Syncthing writes it
+// on macOS) is kept at its NFC spelling, the one other nodes keep (#10).
+func TestKeepsNFCPath(t *testing.T) {
+	e := newEnv(t)
+	nfc, nfd := norm.NFC.String("naïve-文件.txt"), norm.NFD.String("naïve-文件.txt")
+	e.write(nfd, "hello", 72*hour)
+	rep := e.pass()
+	tree := e.tree()
+	if _, ok := tree[nfc]; !ok || len(tree) != 1 || !slices.Contains(rep.Kept, nfc) {
+		t.Fatalf("tree %v, report %+v", tree, rep)
+	}
+	if rep := e.pass(); len(rep.Kept) != 0 {
+		t.Fatalf("kept again: %+v", rep)
 	}
 }

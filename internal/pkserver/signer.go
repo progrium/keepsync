@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/text/unicode/norm"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/client"
 	"perkeep.org/pkg/schema"
@@ -160,7 +161,11 @@ func (s *Server) NewPermanode(ctx context.Context, title string) (api.BlobRef, e
 
 // splitPath splits a slash path into its components, refusing empty, "."
 // and ".." components and absolute paths.
+//
+// Paths are NFC-normalized, so a name spelled in NFC on one node and in NFD
+// on another (as Syncthing writes it on macOS) is one kept file (issue #10).
 func splitPath(p string) ([]string, error) {
+	p = norm.NFC.String(p)
 	if p == "" || strings.HasPrefix(p, "/") {
 		return nil, fmt.Errorf("pkserver: bad path %q", p)
 	}
@@ -742,9 +747,44 @@ func (s *Server) loadChildren(ctx context.Context, dir *treeNode, attrs map[stri
 		} else if err := s.loadChildren(ctx, n, cattrs, at, visited); err != nil {
 			return err
 		}
-		dir.children[name] = n
+		// Names are NFC, as splitPath makes them. An archive kept before
+		// that may name one file in both NFC and NFD: fold them together.
+		key := norm.NFC.String(name)
+		if prev, ok := dir.children[key]; ok {
+			n = mergeSpellings(prev, n)
+		}
+		dir.children[key] = n
 	}
 	return nil
+}
+
+// mergeSpellings picks between two nodes a directory names with the same
+// NFC name: the file kept last, or for directories the one claimed last,
+// holding the other's children too. A file wins over a directory if it is
+// newer, and the reverse.
+func mergeSpellings(a, b *treeNode) *treeNode {
+	switch {
+	case a.isFile && b.isFile:
+		if b.keptAt.After(a.keptAt) {
+			return b
+		}
+		return a
+	case !a.isFile && !b.isFile:
+		if b.lastClaim.After(a.lastClaim) {
+			a, b = b, a
+		}
+		for name, c := range b.children {
+			if prev, ok := a.children[name]; ok {
+				c = mergeSpellings(prev, c)
+			}
+			a.children[name] = c
+		}
+		return a
+	}
+	if newestMtime(b).After(newestMtime(a)) {
+		return b
+	}
+	return a
 }
 
 // signAndUpload signs bb with the server's identity and stores it. The

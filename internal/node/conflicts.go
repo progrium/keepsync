@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/text/unicode/norm"
 	"perkeep.org/pkg/blob"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -359,7 +360,8 @@ func (n *Node) runConflict(ctx context.Context, folder, abs string, force bool) 
 
 	origRel, _ := filepath.Rel(lf.Path, orig)
 	copyRel, _ := filepath.Rel(lf.Path, abs)
-	origRel, copyRel = filepath.ToSlash(origRel), filepath.ToSlash(copyRel)
+	// Kept paths are NFC, however the names are spelled on disk (#10).
+	origRel, copyRel = norm.NFC.String(filepath.ToSlash(origRel)), norm.NFC.String(filepath.ToSlash(copyRel))
 
 	// Every node that held the losing version can make a copy of it (a
 	// bystander that got both versions does too), so one conflict can

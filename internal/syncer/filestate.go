@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 
+	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 
 	"github.com/progrium/keepsync/internal/api"
@@ -24,7 +25,9 @@ func (s *Syncer) FileState(folderID, path string) (api.FileState, error) {
 	if _, ok := s.wrapper.Folder(folderID); !ok {
 		return api.FileState{}, nil
 	}
-	name := filepath.ToSlash(filepath.Clean(path))
+	// Syncthing's index holds names in the OS's own spelling: NFD on
+	// macOS, NFC elsewhere. Callers may pass either (kept paths are NFC).
+	name := osutil.NativeFilename(filepath.ToSlash(filepath.Clean(path)))
 
 	global, ok, err := app.Internals.GlobalFileInfo(folderID, name)
 	if err != nil {
