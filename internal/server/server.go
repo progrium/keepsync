@@ -111,6 +111,11 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	}
 	// A missing bucket or bad keys would otherwise only show on the first
 	// run, buried in zerofs.log, after the kit is written.
+	// ZeroFS refuses a plain-http endpoint without allow_http, so skipping
+	// the bucket check would not help.
+	if strings.HasPrefix(o.Storage.Endpoint, "http://") && !o.Storage.AllowHTTP {
+		return nil, fmt.Errorf("server: bucket endpoint %s is plain http: pass --allow-http to use it", o.Storage.Endpoint)
+	}
 	if !o.NoBucketCheck {
 		if err := CheckBucket(ctx, &http.Client{Timeout: 30 * time.Second}, cfg.Storage); err != nil {
 			return nil, fmt.Errorf("server: %w (or pass --no-bucket-check)", err)
