@@ -143,6 +143,39 @@ func TestCluster(t *testing.T) {
 		}
 	})
 
+	// A node removed and added again while it runs registers again and
+	// syncs, with no restart (issue #9).
+	step("remove-readd", func(t *testing.T) {
+		if err := c.serverCall(server.MethodRemove, server.RemoveParams{Name: b.name}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.serverCall(server.MethodAdd, server.AddParams{Key: b.key, Name: b.name}, nil); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 2*time.Minute, "b registered again", func() error {
+			var nodes []registry.NodeInfo
+			if err := c.serverCall(server.MethodNodes, nil, &nodes); err != nil {
+				return err
+			}
+			for _, n := range nodes {
+				if n.Key == b.key {
+					if !n.Registered || string(n.Device) != string(b.dev) {
+						return fmt.Errorf("registered=%v device=%q", n.Registered, n.Device)
+					}
+					return nil
+				}
+			}
+			return errors.New("b not listed")
+		})
+		// Removal took b out of docs; rejoining at the same path needs no
+		// --merge.
+		if err := b.call(node.MethodFolderJoin, node.FolderParams{Name: "docs", Path: b.dir("docs")}, nil); err != nil {
+			t.Fatalf("rejoin docs on b: %v", err)
+		}
+		a.write("docs", "after-readd.txt", "hi")
+		eventually(t, syncTimeout, "after-readd.txt reaches b", func() error { return b.hasContent("docs", "after-readd.txt", "hi") })
+	})
+
 	step("join-merge", func(t *testing.T) {
 		if err := a.call(node.MethodFolderAdd, node.FolderParams{Name: "shared", Path: a.dir("shared")}, nil); err != nil {
 			t.Fatalf("folder add shared: %v", err)
