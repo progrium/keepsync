@@ -923,6 +923,13 @@ func TestHistory(t *testing.T) {
 	if _, err := k.srv.History(ctx, k.root, "h"); err == nil {
 		t.Error("History of a directory succeeded")
 	}
+	// A path where nothing was ever kept has no history, and no error: a
+	// conflict hook on a new file depends on it (issue #3).
+	for _, p := range []string{"never-kept.txt", "h/missing", "h/f/below-a-file"} {
+		if h, err := k.srv.History(ctx, k.root, p); err != nil || len(h) != 0 {
+			t.Errorf("History(%s) = %v, %v; want none", p, h, err)
+		}
+	}
 }
 
 // TestRestoreAfterExpiryClearsMark: an expired file restored with the same

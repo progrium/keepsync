@@ -456,7 +456,7 @@ func (s *Server) MarkGone(ctx context.Context, g api.GoneClaim) error {
 // had, oldest first, folded from its claims. Each entry's Claims are those
 // recovering that version by name needs: the current chain of directories
 // and naming claims, and that version's content claim. Gone marks are not
-// part of history.
+// part of history. A path where nothing was ever kept has no history.
 func (s *Server) History(ctx context.Context, permanode api.BlobRef, path string) ([]api.PathEntry, error) {
 	parts, err := splitPath(path)
 	if err != nil {
@@ -483,8 +483,13 @@ func (s *Server) History(ctx context.Context, permanode api.BlobRef, path string
 	if err != nil {
 		return nil, err
 	}
-	if n == nil || !n.isFile {
-		return nil, fmt.Errorf("pkserver: %s: no kept file at %s", permanode, path)
+	if n == nil {
+		// Nothing was ever kept at path: no history, not an error, so a
+		// conflict on a file first edited within grace still gets its hook.
+		return nil, nil
+	}
+	if !n.isFile {
+		return nil, fmt.Errorf("pkserver: %s: %s is a directory, not a kept file", permanode, path)
 	}
 
 	claims, err := s.claimsOf(ctx, n.pn)

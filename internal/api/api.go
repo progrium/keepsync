@@ -225,7 +225,8 @@ type RegistryClient interface {
 	Durable(ctx context.Context, refs []BlobRef) ([]bool, error)
 	// MarkGone records why a kept file left sync (see GoneClaim).
 	MarkGone(ctx context.Context, g GoneClaim) error
-	// History returns every content version kept at path, oldest first.
+	// History returns every content version kept at path, oldest first,
+	// and none (not an error) if nothing was ever kept there.
 	History(ctx context.Context, permanode BlobRef, path string) ([]PathEntry, error)
 }
 
@@ -241,7 +242,8 @@ type Signer interface {
 	// MarkGone records why a kept file left sync. It writes nothing if the
 	// path already has that mark, or now holds other content than g.File.
 	MarkGone(ctx context.Context, g GoneClaim) error
-	// History returns every content version kept at path, oldest first.
+	// History returns every content version kept at path, oldest first,
+	// and none (not an error) if nothing was ever kept there.
 	History(ctx context.Context, permanode BlobRef, path string) ([]PathEntry, error)
 }
 

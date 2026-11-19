@@ -262,8 +262,8 @@ The script runs in the folder root with:
 | `KEEPSYNC_ORIGINAL` | Absolute path of the current file |
 | `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
 | `KEEPSYNC_CONFLICT_NODE` | Name of the node whose change lost, else its short device ID |
-| `KEEPSYNC_BASE` | A temp file with the common ancestor of both versions, for a three-way merge, or empty if there is none |
-| `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor; `0` if it is only the last kept version, a guess |
+| `KEEPSYNC_BASE` | A temp file with the common ancestor of both versions, for a three-way merge, or empty if there is none (as when the file was never kept) |
+| `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor; `0` if it is only the last kept version, a guess (never one identical to either side) |
 
 To resolve, write the result to `$KEEPSYNC_ORIGINAL`, delete `$KEEPSYNC_CONFLICT`, and exit 0. A non-zero exit, a timeout, or a copy left in place leaves the conflict for you.
 
