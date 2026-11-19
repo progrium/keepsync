@@ -442,6 +442,10 @@ func TestSupervisorStartFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exited during startup") {
 		t.Fatalf("got %v", err)
 	}
+	// The reason is in the error, not only in zerofs.log (issue #6).
+	if !strings.Contains(err.Error(), "fake zerofs: failing on purpose") {
+		t.Errorf("error lacks the reason from zerofs.log: %v", err)
+	}
 	if time.Since(start) > 10*time.Second {
 		t.Fatal("Start did not notice the exit promptly")
 	}
@@ -538,5 +542,20 @@ func TestCheckSocketPaths(t *testing.T) {
 	}
 	if err := CheckSocketPaths(base[:len(base)-1]); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLogReason(t *testing.T) {
+	for _, c := range []struct{ log, want string }{
+		// A missing bucket: the S3 error ends a long Rust debug dump.
+		{"\x1b[32mINFO\x1b[0m starting\nError: Generic S3 error: Error {\n    status: 404,\n    body: Some(\"<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>\"),\n}\n",
+			"S3 error NoSuchBucket: The specified bucket does not exist"},
+		{"\x1b[32mINFO\x1b[0m starting\n\x1b[31mERROR\x1b[0m bad config: no [storage]\nbye\n", "ERROR bad config: no [storage]"},
+		{"starting\nkilled\n", "killed"},
+		{"", ""},
+	} {
+		if got := logReason(c.log); got != c.want {
+			t.Errorf("logReason(%q) = %q, want %q", c.log, got, c.want)
+		}
 	}
 }

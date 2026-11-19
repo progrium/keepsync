@@ -368,7 +368,7 @@ perkeepd runs once per process, so a live server, a recovered server, and a dril
 
 | Command | Role | What it does |
 | --- | --- | --- |
-| `server init --bucket <url> [flags]` | Server | Creates the tailcat key, Perkeep identity, and ZeroFS config, finds or downloads ZeroFS, writes the kit, prints the address. Flags: `--endpoint`, `--region`, `--access-key`, `--secret-key` (default `$AWS_*`), `--allow-http`, `--zerofs`, `--zerofs-password-file`, `--mode store|cache`, `--cache-size <GB>`, `--mount`, `--mount-dir`, `--no-download`, `--kit`, `--derp-map`, `--derp-region`. |
+| `server init --bucket <url> [flags]` | Server | Creates the tailcat key, Perkeep identity, and ZeroFS config, finds or downloads ZeroFS, writes the kit, prints the address. First it refuses a `--dir` too long for its unix sockets, and checks the bucket by writing, reading, and deleting one small object under the prefix (s3:// with keys only). Flags: `--endpoint`, `--region`, `--access-key`, `--secret-key` (default `$AWS_*`), `--allow-http`, `--zerofs`, `--zerofs-password-file`, `--mode store|cache`, `--cache-size <GB>`, `--mount`, `--mount-dir`, `--no-download`, `--no-bucket-check`, `--kit`, `--derp-map`, `--derp-region`. |
 | `server run` | Server | Supervises ZeroFS, perkeepd, the registry, and tailcat. Drains and flushes on stop. |
 | `server add <nodekey> [--name]` | Server | Approves a node. The name defaults to the one the node registers with. |
 | `server remove <name>` | Server | Removes a node. |

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,8 @@ type InitOptions struct {
 	MountDir string
 	// NoDownload fails instead of downloading the pinned zerofs.
 	NoDownload bool
+	// NoBucketCheck skips checking the bucket (see CheckBucket).
+	NoBucketCheck bool
 	// Mode is config.ModeStore (default) or config.ModeCache.
 	Mode string
 	// CacheSizeGB sets ZeroFS's disk cache; 0 takes the mode's default.
@@ -105,6 +108,13 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	}
 	if err := zerofs.CheckSocketPaths(cfg.ZeroFSDir()); err != nil {
 		return nil, fmt.Errorf("server: %w", err)
+	}
+	// A missing bucket or bad keys would otherwise only show on the first
+	// run, buried in zerofs.log, after the kit is written.
+	if !o.NoBucketCheck {
+		if err := CheckBucket(ctx, &http.Client{Timeout: 30 * time.Second}, cfg.Storage); err != nil {
+			return nil, fmt.Errorf("server: %w (or pass --no-bucket-check)", err)
+		}
 	}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		return nil, err

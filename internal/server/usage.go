@@ -5,17 +5,12 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 
 	"github.com/progrium/keepsync/internal/config"
 )
@@ -225,47 +220,22 @@ func bucketSize(ctx context.Context, hc *http.Client, st config.Storage) (bytes,
 		return 0, 0, fmt.Errorf("bucket usage: %s:// is not supported", u.Scheme)
 	}
 
-	bucket, prefix := u.Host, strings.TrimPrefix(u.Path, "/")
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
+	b, err := newS3Bucket(hc, st)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bucket usage: %w", err)
 	}
-	region := st.Region
-	if region == "" || region == "auto" && st.Endpoint == "" {
-		region = "us-east-1"
-	}
-	endpoint := strings.TrimRight(st.Endpoint, "/")
-	if endpoint == "" {
-		endpoint = "https://s3." + region + ".amazonaws.com"
-	}
-	creds := aws.Credentials{AccessKeyID: st.AccessKeyID, SecretAccessKey: st.SecretAccessKey}
-	const emptySHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	token := ""
 	for {
-		q := url.Values{"list-type": {"2"}, "prefix": {prefix}}
+		q := url.Values{"list-type": {"2"}, "prefix": {b.prefix}}
 		if token != "" {
 			q.Set("continuation-token", token)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/"+bucket+"?"+q.Encode(), nil)
-		if err != nil {
-			return 0, 0, err
-		}
-		req.Header.Set("X-Amz-Content-Sha256", emptySHA)
-		if creds.AccessKeyID != "" {
-			if err := v4.NewSigner().SignHTTP(ctx, creds, req, emptySHA, "s3", region, time.Now()); err != nil {
-				return 0, 0, err
-			}
-		}
-		resp, err := hc.Do(req)
+		status, body, err := b.do(ctx, http.MethodGet, "", q, nil)
 		if err != nil {
 			return 0, 0, fmt.Errorf("bucket usage: %w", err)
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		resp.Body.Close()
-		if err != nil {
-			return 0, 0, err
-		}
-		if resp.StatusCode != http.StatusOK {
-			return 0, 0, fmt.Errorf("bucket usage: list %s: %s", bucket, resp.Status)
+		if status != http.StatusOK {
+			return 0, 0, fmt.Errorf("bucket usage: list %s: %w", b.bucket, s3Error(status, body))
 		}
 		var res struct {
 			Contents []struct {

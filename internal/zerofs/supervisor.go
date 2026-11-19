@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,6 +146,7 @@ type Supervisor struct {
 	exitErr  error
 	mount    mounter
 	logFile  *os.File
+	logStart int64     // zerofs.log's size when the current process started
 	out      io.Writer // zerofs's output, kept for restarts
 	env      []string  // zerofs's environment, kept for restarts
 
@@ -425,6 +427,12 @@ func (s *Supervisor) launchLocked(ctx context.Context) (err error) {
 	for _, p := range []string{s.ninePSocket, s.rpcSocket} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+	}
+	s.logStart = 0
+	if s.logFile != nil {
+		if st, err := s.logFile.Stat(); err == nil {
+			s.logStart = st.Size()
 		}
 	}
 	cmd := exec.Command(s.cfg.Binary, "run", "--config", s.configPath)
@@ -751,12 +759,76 @@ func (s *Supervisor) waitSocket(ctx context.Context, path string) error {
 		}
 		select {
 		case <-s.done:
+			if why := s.startupReason(); why != "" {
+				return fmt.Errorf("zerofs: exited during startup (%v): %s; see %s", s.exitErr, why, s.logHint())
+			}
 			return fmt.Errorf("zerofs: exited during startup (%v); see %s", s.exitErr, s.logHint())
 		case <-ctx.Done():
 			return fmt.Errorf("zerofs: %s not ready: %w; see %s", path, ctx.Err(), s.logHint())
 		case <-t.C:
 		}
 	}
+}
+
+// startupReason picks why zerofs failed from what it logged this start:
+// an S3 error code and message if there is one (they end a long debug dump
+// otherwise, as for a missing bucket), else the last line that mentions an
+// error, else the last line.
+func (s *Supervisor) startupReason() string {
+	if s.logFile == nil {
+		return ""
+	}
+	f, err := os.Open(s.logFile.Name())
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	const tail = 64 << 10
+	start := s.logStart
+	if st, err := f.Stat(); err == nil && st.Size()-start > tail {
+		start = st.Size() - tail
+	}
+	b, err := io.ReadAll(io.NewSectionReader(f, start, tail))
+	if err != nil && len(b) == 0 {
+		return ""
+	}
+	return logReason(string(b))
+}
+
+var (
+	s3CodeRE    = regexp.MustCompile(`<Code>([^<]+)</Code>`)
+	s3MessageRE = regexp.MustCompile(`<Message>([^<]+)</Message>`)
+	ansiRE      = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]")
+)
+
+func logReason(log string) string {
+	log = ansiRE.ReplaceAllString(log, "")
+	if m := s3CodeRE.FindAllStringSubmatch(log, -1); m != nil {
+		why := "S3 error " + m[len(m)-1][1]
+		if msg := s3MessageRE.FindAllStringSubmatch(log, -1); msg != nil {
+			why += ": " + msg[len(msg)-1][1]
+		}
+		return why
+	}
+	var last, lastErr string
+	for _, line := range strings.Split(log, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		last = line
+		if strings.Contains(strings.ToLower(line), "error") {
+			lastErr = line
+		}
+	}
+	why := lastErr
+	if why == "" {
+		why = last
+	}
+	if len(why) > 300 {
+		why = why[:300] + "..."
+	}
+	return why
 }
 
 func (s *Supervisor) logHint() string {

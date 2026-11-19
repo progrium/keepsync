@@ -56,7 +56,9 @@ keepsync server init \
   --region auto
 ```
 
-For AWS S3, drop `--endpoint` and pass your `--region`. For a local MinIO over plain HTTP, add `--allow-http`.
+For AWS S3, drop `--endpoint` and pass your `--region`. For a local MinIO over plain HTTP, add `--allow-http`. To try keepsync without a bucket, `--bucket file:///path/to/dir` keeps the archive in a local directory instead.
+
+`server init` checks the bucket before it writes anything, by writing, reading, and deleting one small object under the prefix, so a missing bucket or keys that can't write fail init rather than the first `server run`. Pass `--no-bucket-check` to skip it, say when the bucket isn't reachable from where you run init.
 
 `server init` takes `--mode store` (the default) or `--mode cache`. A **store** server keeps every archived blob on its own disk and copies it to the bucket; reads are local. A **cache** server keeps no blob store on disk: Perkeep writes straight to the bucket through ZeroFS, and local disk holds only the index and ZeroFS's cache, which you size with `--cache-size <GB>` (default 10, minimum 2). Use cache mode when the archive is bigger than the server's disk; reading old files then fetches them from the bucket. The mode can't change after init, but a recovery can pick either (see [Recover a lost server](#recover-a-lost-server)).
 

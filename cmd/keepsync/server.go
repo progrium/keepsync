@@ -31,6 +31,7 @@ func (e *env) serverInit(args []string) error {
 	fs.StringVar(&o.Mount, "mount", "", "how to reach ZeroFS: 9p (default, no mount), fuse, v9fs or external")
 	fs.StringVar(&o.MountDir, "mount-dir", "", "ZeroFS mount point (default <server dir>/zerofs/mnt)")
 	fs.BoolVar(&o.NoDownload, "no-download", false, "fail instead of downloading zerofs")
+	fs.BoolVar(&o.NoBucketCheck, "no-bucket-check", false, "skip checking that the bucket exists and the keys can write to it")
 	fs.StringVar(&o.Mode, "mode", config.ModeStore, "where blobs live: store (local disk, replicated to the bucket) or cache (the bucket only, with a local ZeroFS cache)")
 	fs.Float64Var(&o.CacheSizeGB, "cache-size", 0, fmt.Sprintf("ZeroFS disk cache in GB (default %d in store mode, %d in cache mode; minimum %d)", config.StoreCacheSizeGB, config.DefaultCacheModeGB, config.MinCacheSizeGB))
 	kitOut := fs.String("kit", "", "where to write the recovery kit (default ./"+kit.FileName+")")
