@@ -177,6 +177,13 @@ func New(cfg Config) (*Supervisor, error) {
 		return nil, err
 	}
 	cfg.DataDir = dataDir
+	// zerofs runs with DataDir as its working directory, where a relative
+	// binary path would resolve wrongly. A bare name is left for PATH.
+	if strings.ContainsRune(cfg.Binary, filepath.Separator) {
+		if cfg.Binary, err = filepath.Abs(cfg.Binary); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.Mount == "" {
 		cfg.Mount = MountFUSE
 	}

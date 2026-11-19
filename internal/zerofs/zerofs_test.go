@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -481,5 +483,45 @@ func TestRunsConfig(t *testing.T) {
 		if got := runsConfig(c.argv, "/s/zerofs.toml"); got != c.want {
 			t.Errorf("runsConfig(%q) = %v, want %v", c.argv, got, c.want)
 		}
+	}
+}
+
+// TestSupervisorRelativeBinary: a relative binary and data dir (from a
+// relative --dir) still start zerofs, though it runs in the data dir
+// (issue #2).
+func TestSupervisorRelativeBinary(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "zfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.MkdirAll(filepath.Join(dir, "a", "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(exe, filepath.Join(dir, "a", "bin", "zerofs")); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	s, err := New(Config{
+		Binary:   filepath.Join("a", "bin", "zerofs"),
+		DataDir:  "a",
+		Storage:  Storage{URL: "s3://bucket/prefix", AccessKeyID: "test-akid-value", SecretAccessKey: "test-secret-value"},
+		Password: "0123456789abcdef0123456789abcdef",
+		Env:      []string{fakeEnv + "=" + filepath.Join(dir, "events")},
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mount = &dirMount{}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

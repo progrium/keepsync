@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +76,14 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	}
 	if o.Mount == "" {
 		o.Mount = string(zerofs.MountNineP)
+	}
+	// server.toml outlives this working directory, so store absolute paths.
+	if o.ZeroFS != "" && strings.ContainsRune(o.ZeroFS, filepath.Separator) {
+		abs, err := filepath.Abs(o.ZeroFS)
+		if err != nil {
+			return nil, err
+		}
+		o.ZeroFS = abs
 	}
 	cfg := &config.Server{
 		Dir:     o.Dir,
