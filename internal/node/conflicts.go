@@ -491,7 +491,8 @@ func (n *Node) resolveConflict(ctx context.Context, path string) (ConflictInfo, 
 // sides and that the original's current Syncthing version W descends from
 // (an entry kept without a version counts as an ancestor). It is exact if
 // that entry has a version. Failing that, it is the last kept version, as
-// a guess; with nothing kept at the path there is no base.
+// a guess, if that too differs from both sides; otherwise, or with nothing
+// kept at the path, there is no base.
 func (n *Node) conflictBase(ctx context.Context, folderID string, archive api.BlobRef, origRel, orig, copyAbs, dir string) (string, bool, error) {
 	hist, err := n.reg.History(ctx, archive, origRel)
 	if err != nil {
@@ -558,7 +559,32 @@ func (n *Node) conflictBase(ctx context.Context, folderID string, archive api.Bl
 	if !ok {
 		return "", false, nil
 	}
-	if err := fetch(e.File, dst); err != nil {
+	// A guess equal to one side would make the other side look like the
+	// only change, and a merge would drop this side's edit (issue #4).
+	d, seen := differs[e.File]
+	if !seen {
+		if err := fetch(e.File, cand); err != nil {
+			return "", false, err
+		}
+		same, err := sameContent(cand, orig)
+		if err == nil && !same {
+			same, err = sameContent(cand, copyAbs)
+		}
+		if err != nil {
+			os.Remove(cand)
+			return "", false, fmt.Errorf("compare the base: %w", err)
+		}
+		d = !same
+	}
+	if !d {
+		os.Remove(cand)
+		return "", false, nil
+	}
+	if !seen {
+		if err := os.Rename(cand, dst); err != nil {
+			return "", false, err
+		}
+	} else if err := fetch(e.File, dst); err != nil {
 		return "", false, err
 	}
 	return dst, false, nil

@@ -59,7 +59,9 @@ keepsync server init \
   --region auto
 ```
 
-For AWS S3, drop `--endpoint` and pass your `--region`. For a local MinIO over plain HTTP, add `--allow-http`.
+For AWS S3, drop `--endpoint` and pass your `--region`. For a local MinIO over plain HTTP, add `--allow-http`. To try keepsync without a bucket, `--bucket file:///path/to/dir` keeps the archive in a local directory instead.
+
+`server init` checks the bucket before it writes anything, by writing, reading, and deleting one small object under the prefix, so a missing bucket or keys that can't write fail init rather than the first `server run`. Pass `--no-bucket-check` to skip it, say when the bucket isn't reachable from where you run init.
 
 `server init` takes `--mode store` (the default) or `--mode cache`. A **store** server keeps every archived blob on its own disk and copies it to the bucket; reads are local. A **cache** server keeps no blob store on disk: Perkeep writes straight to the bucket through ZeroFS, and local disk holds only the index and ZeroFS's cache, which you size with `--cache-size <GB>` (default 10, minimum 2). Use cache mode when the archive is bigger than the server's disk; reading old files then fetches them from the bucket. The mode can't change after init, but a recovery can pick either (see [Recover a lost server](#recover-a-lost-server)).
 
@@ -265,8 +267,8 @@ The script runs in the folder root with:
 | `KEEPSYNC_ORIGINAL` | Absolute path of the current file |
 | `KEEPSYNC_CONFLICT` | Absolute path of the conflict copy |
 | `KEEPSYNC_CONFLICT_NODE` | Name of the node whose change lost, else its short device ID |
-| `KEEPSYNC_BASE` | A temp file with the common ancestor of both versions, for a three-way merge, or empty if there is none |
-| `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor; `0` if it is only the last kept version, a guess |
+| `KEEPSYNC_BASE` | A temp file with the common ancestor of both versions, for a three-way merge, or empty if there is none (as when the file was never kept) |
+| `KEEPSYNC_BASE_EXACT` | `1` if the base is known to be the common ancestor; `0` if it is only the last kept version, a guess (never one identical to either side) |
 
 To resolve, write the result to `$KEEPSYNC_ORIGINAL`, delete `$KEEPSYNC_CONFLICT`, and exit 0. A non-zero exit, a timeout, or a copy left in place leaves the conflict for you.
 

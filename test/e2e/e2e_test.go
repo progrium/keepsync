@@ -519,6 +519,24 @@ func TestCluster(t *testing.T) {
 			})
 		}
 
+		// A file never kept (both sides inside grace) still gets its hook,
+		// with no base (issue #3).
+		conflict(t, hookN, loser, "new.txt")
+		for _, n := range nodes() {
+			eventually(t, 2*syncTimeout, "new.txt merge reaches "+n.name, func() error {
+				if err := n.hasContent("notes", "new.txt", "from "+hookN.name+"\nfrom "+loser.name+"\n"); err != nil {
+					return err
+				}
+				if cps := copies(n, "notes", "new.sync-conflict-*"); len(cps) > 0 {
+					return fmt.Errorf("conflict copies on %s: %v", n.name, cps)
+				}
+				return nil
+			})
+		}
+		if runs := c.hookRuns("new.txt"); len(runs) != 1 || !strings.HasPrefix(runs[0], hookN.name+" ") || !strings.Contains(runs[0], " base=none exact=0 ") {
+			t.Errorf("hook runs for new.txt: %q, want one on %s with no base", runs, hookN.name)
+		}
+
 		// A failing hook leaves the copy for a human.
 		conflict(t, hookN, loser, "fail-g.txt")
 		for _, n := range nodes() {

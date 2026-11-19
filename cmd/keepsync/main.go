@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -95,6 +96,14 @@ func run(e *env, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Absolute from here on: child processes (zerofs) run in other
+	// directories, so a relative --dir or $KEEPSYNC_DIR would point
+	// somewhere else for them (issue #2).
+	base, err := filepath.Abs(e.base)
+	if err != nil {
+		return fmt.Errorf("--dir %s: %w", e.base, err)
+	}
+	e.base = base
 	args = fs.Args()
 	if len(args) == 0 {
 		fs.Usage()

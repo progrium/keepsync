@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +43,8 @@ type InitOptions struct {
 	MountDir string
 	// NoDownload fails instead of downloading the pinned zerofs.
 	NoDownload bool
+	// NoBucketCheck skips checking the bucket (see CheckBucket).
+	NoBucketCheck bool
 	// Mode is config.ModeStore (default) or config.ModeCache.
 	Mode string
 	// CacheSizeGB sets ZeroFS's disk cache; 0 takes the mode's default.
@@ -75,6 +80,14 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	if o.Mount == "" {
 		o.Mount = string(zerofs.MountNineP)
 	}
+	// server.toml outlives this working directory, so store absolute paths.
+	if o.ZeroFS != "" && strings.ContainsRune(o.ZeroFS, filepath.Separator) {
+		abs, err := filepath.Abs(o.ZeroFS)
+		if err != nil {
+			return nil, err
+		}
+		o.ZeroFS = abs
+	}
 	cfg := &config.Server{
 		Dir:     o.Dir,
 		Mode:    o.Mode,
@@ -87,6 +100,26 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	// Refuse a dir too long for the sockets now, before the kit and
+	// passphrase are made, not on the first run.
+	if err := config.CheckSocketPath(cfg.SocketPath()); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	if err := zerofs.CheckSocketPaths(cfg.ZeroFSDir()); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	// A missing bucket or bad keys would otherwise only show on the first
+	// run, buried in zerofs.log, after the kit is written.
+	// ZeroFS refuses a plain-http endpoint without allow_http, so skipping
+	// the bucket check would not help.
+	if strings.HasPrefix(o.Storage.Endpoint, "http://") && !o.Storage.AllowHTTP {
+		return nil, fmt.Errorf("server: bucket endpoint %s is plain http: pass --allow-http to use it", o.Storage.Endpoint)
+	}
+	if !o.NoBucketCheck {
+		if err := CheckBucket(ctx, &http.Client{Timeout: 30 * time.Second}, cfg.Storage); err != nil {
+			return nil, fmt.Errorf("server: %w (or pass --no-bucket-check)", err)
+		}
 	}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		return nil, err

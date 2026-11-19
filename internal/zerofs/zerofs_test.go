@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -440,6 +442,10 @@ func TestSupervisorStartFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exited during startup") {
 		t.Fatalf("got %v", err)
 	}
+	// The reason is in the error, not only in zerofs.log (issue #6).
+	if !strings.Contains(err.Error(), "fake zerofs: failing on purpose") {
+		t.Errorf("error lacks the reason from zerofs.log: %v", err)
+	}
 	if time.Since(start) > 10*time.Second {
 		t.Fatal("Start did not notice the exit promptly")
 	}
@@ -480,6 +486,76 @@ func TestRunsConfig(t *testing.T) {
 	} {
 		if got := runsConfig(c.argv, "/s/zerofs.toml"); got != c.want {
 			t.Errorf("runsConfig(%q) = %v, want %v", c.argv, got, c.want)
+		}
+	}
+}
+
+// TestSupervisorRelativeBinary: a relative binary and data dir (from a
+// relative --dir) still start zerofs, though it runs in the data dir
+// (issue #2).
+func TestSupervisorRelativeBinary(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "zfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.MkdirAll(filepath.Join(dir, "a", "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(exe, filepath.Join(dir, "a", "bin", "zerofs")); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	s, err := New(Config{
+		Binary:   filepath.Join("a", "bin", "zerofs"),
+		DataDir:  "a",
+		Storage:  Storage{URL: "s3://bucket/prefix", AccessKeyID: "test-akid-value", SecretAccessKey: "test-secret-value"},
+		Password: "0123456789abcdef0123456789abcdef",
+		Env:      []string{fakeEnv + "=" + filepath.Join(dir, "events")},
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mount = &dirMount{}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCheckSocketPaths: the RPC socket is the longer one, so a dir whose 9P
+// socket just fits must still be refused (issue #5).
+func TestCheckSocketPaths(t *testing.T) {
+	base := "/" + strings.Repeat("d", maxSocketPath-len("/run/9p.sock")-1)
+	if n := len(SocketPaths(base)[0]); n != maxSocketPath {
+		t.Fatalf("9p socket is %d bytes, want %d", n, maxSocketPath)
+	}
+	if err := CheckSocketPaths(base); err == nil {
+		t.Fatal("rpc.sock over the limit was accepted")
+	}
+	if err := CheckSocketPaths(base[:len(base)-1]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLogReason(t *testing.T) {
+	for _, c := range []struct{ log, want string }{
+		// A missing bucket: the S3 error ends a long Rust debug dump.
+		{"\x1b[32mINFO\x1b[0m starting\nError: Generic S3 error: Error {\n    status: 404,\n    body: Some(\"<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>\"),\n}\n",
+			"S3 error NoSuchBucket: The specified bucket does not exist"},
+		{"\x1b[32mINFO\x1b[0m starting\n\x1b[31mERROR\x1b[0m bad config: no [storage]\nbye\n", "ERROR bad config: no [storage]"},
+		{"starting\nkilled\n", "killed"},
+		{"", ""},
+	} {
+		if got := logReason(c.log); got != c.want {
+			t.Errorf("logReason(%q) = %q, want %q", c.log, got, c.want)
 		}
 	}
 }

@@ -248,6 +248,23 @@ func TestConflictBaseNotAncestorFallsBack(t *testing.T) {
 	}
 }
 
+// TestConflictBaseFallbackEqualToSideIsNone: a guessed base equal to
+// either side would make a merge drop that side's edit (issue #4), so there
+// is no base instead.
+func TestConflictBaseFallbackEqualToSideIsNone(t *testing.T) {
+	for _, side := range []string{"mine", "theirs"} {
+		t.Run(side, func(t *testing.T) {
+			tn, pn := newBaseTestNode(t)
+			putVersion(t, tn, pn, "a.txt", side, vv("BBBBBBB", 5))
+			tn.sy.(*fake.Syncer).SetFileState(tn.folderID(t), "a.txt", api.FileState{Known: true, Current: true, Version: vv("AAAAAAA", 1)})
+			got, exact := tn.base(t, "mine", "theirs")
+			if got != "" || exact {
+				t.Fatalf("base = %q exact=%v, want none", got, exact)
+			}
+		})
+	}
+}
+
 func TestConflictBaseUnversionedNotExact(t *testing.T) {
 	tn, pn := newBaseTestNode(t)
 	putVersion(t, tn, pn, "a.txt", "v1", nil)

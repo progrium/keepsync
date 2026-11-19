@@ -2,6 +2,9 @@ package node
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/progrium/keepsync/internal/config"
@@ -32,5 +35,17 @@ func TestInitOffline(t *testing.T) {
 	}
 	if _, err := Init(context.Background(), InitOptions{Dir: dir, Server: "tcXYZ"}); err == nil {
 		t.Fatal("second init should fail")
+	}
+}
+
+// TestInitRefusesLongDir: a dir too long for the control socket fails init
+// before anything is created (issue #5).
+func TestInitRefusesLongDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), strings.Repeat("d", config.MaxSocketPath))
+	if _, err := Init(context.Background(), InitOptions{Dir: dir, Server: "tcXYZ"}); err == nil || !strings.Contains(err.Error(), "socket path") {
+		t.Fatalf("got %v, want a socket path error", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("init created %s: %v", dir, err)
 	}
 }
