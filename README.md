@@ -15,6 +15,9 @@ A synced folder can hold just recent files (say the last 30 days) while the arch
 
 For an overview of the pieces and why they were chosen, see the [architecture](docs/architecture.md). For how it works in detail, see the [spec](docs/spec.md).
 
+> [!NOTE]
+> **Feedback wanted: should cloud replication be optional?** Today the server needs an S3-compatible bucket. We're considering letting it run without one, with the option to add a bucket later. If you'd use keepsync without a bucket, or have concerns, please weigh in on [issue #8](https://github.com/progrium/keepsync/issues/8).
+
 ## Getting started
 
 ### How it fits together
