@@ -525,3 +525,18 @@ func TestSupervisorRelativeBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCheckSocketPaths: the RPC socket is the longer one, so a dir whose 9P
+// socket just fits must still be refused (issue #5).
+func TestCheckSocketPaths(t *testing.T) {
+	base := "/" + strings.Repeat("d", maxSocketPath-len("/run/9p.sock")-1)
+	if n := len(SocketPaths(base)[0]); n != maxSocketPath {
+		t.Fatalf("9p socket is %d bytes, want %d", n, maxSocketPath)
+	}
+	if err := CheckSocketPaths(base); err == nil {
+		t.Fatal("rpc.sock over the limit was accepted")
+	}
+	if err := CheckSocketPaths(base[:len(base)-1]); err != nil {
+		t.Fatal(err)
+	}
+}

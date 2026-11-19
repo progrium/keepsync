@@ -98,6 +98,14 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	// Refuse a dir too long for the sockets now, before the kit and
+	// passphrase are made, not on the first run.
+	if err := config.CheckSocketPath(cfg.SocketPath()); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	if err := zerofs.CheckSocketPaths(cfg.ZeroFSDir()); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		return nil, err
 	}

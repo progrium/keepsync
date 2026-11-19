@@ -66,6 +66,9 @@ func Init(ctx context.Context, o InitOptions) (*InitResult, error) {
 	}
 	listen := config.DefaultGatewayListen
 	cfg := &config.Node{Dir: o.Dir, Name: name, Server: string(addr), Network: o.Network, Gateway: config.Gateway{Listen: &listen}}
+	if err := config.CheckSocketPath(cfg.SocketPath()); err != nil {
+		return nil, fmt.Errorf("node: %w", err)
+	}
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		return nil, err
 	}

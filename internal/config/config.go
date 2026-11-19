@@ -62,6 +62,20 @@ func BaseDir() string {
 	return filepath.Join(home, ".local", "share", "keepsync")
 }
 
+// MaxSocketPath is the longest unix socket path that works everywhere:
+// sun_path is 104 bytes on macOS and FreeBSD, 108 on Linux, including the
+// NUL.
+const MaxSocketPath = 103
+
+// CheckSocketPath reports a socket path too long to listen on, so init can
+// refuse a --dir before it creates anything.
+func CheckSocketPath(path string) error {
+	if len(path) > MaxSocketPath {
+		return fmt.Errorf("socket path %s is %d bytes, over the %d-byte limit for unix sockets; use a shorter --dir", path, len(path), MaxSocketPath)
+	}
+	return nil
+}
+
 // RoleDir is the directory for role (ServerRole or NodeRole) under base.
 func RoleDir(base, role string) string { return filepath.Join(base, role) }
 

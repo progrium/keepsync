@@ -234,10 +234,31 @@ func New(cfg Config) (*Supervisor, error) {
 
 	s := &Supervisor{cfg: cfg, log: cfg.Logger.With("component", "zerofs"), mount: m}
 	s.configPath = filepath.Join(cfg.DataDir, "zerofs.toml")
-	runDir := filepath.Join(cfg.DataDir, "run")
-	s.ninePSocket = filepath.Join(runDir, "9p.sock")
-	s.rpcSocket = filepath.Join(runDir, "rpc.sock")
+	socks := SocketPaths(cfg.DataDir)
+	s.ninePSocket, s.rpcSocket = socks[0], socks[1]
 	return s, nil
+}
+
+// SocketPaths returns the unix sockets zerofs listens on for dataDir: 9P,
+// then RPC.
+func SocketPaths(dataDir string) []string {
+	runDir := filepath.Join(dataDir, "run")
+	return []string{filepath.Join(runDir, "9p.sock"), filepath.Join(runDir, "rpc.sock")}
+}
+
+// CheckSocketPaths reports whether dataDir is short enough for zerofs's
+// sockets, so a caller can check before creating anything.
+func CheckSocketPaths(dataDir string) error {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return err
+	}
+	for _, p := range SocketPaths(dataDir) {
+		if len(p) > maxSocketPath {
+			return fmt.Errorf("zerofs: socket path %s is %d bytes, over the %d-byte limit for unix sockets; use a shorter --dir", p, len(p), maxSocketPath)
+		}
+	}
+	return nil
 }
 
 // Dir is the mount point, or "" in MountNineP mode, where nothing is
@@ -675,8 +696,8 @@ func (s *Supervisor) prepareDirs() error {
 			return err
 		}
 	}
-	if len(s.ninePSocket) > maxSocketPath {
-		return fmt.Errorf("zerofs: socket path %s is longer than %d bytes; use a shorter DataDir", s.ninePSocket, maxSocketPath)
+	if err := CheckSocketPaths(s.cfg.DataDir); err != nil {
+		return err
 	}
 	if s.cfg.Mount == MountNineP {
 		return nil
