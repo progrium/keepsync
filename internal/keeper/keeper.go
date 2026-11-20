@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/progrium/keepsync/internal/api"
 )
 
@@ -298,6 +300,7 @@ func (k *Keeper) KeepNow(ctx context.Context, rels ...string) (Report, error) {
 			continue
 		}
 		abs := filepath.Join(k.cfg.Dir, filepath.FromSlash(rel))
+		rel = archivePath(rel)
 		fi, err := os.Lstat(abs)
 		if err != nil {
 			rep.Errors = append(rep.Errors, err)
@@ -335,6 +338,11 @@ func (k *Keeper) excluder() (Excluder, error) {
 	}
 	return LoadPatterns(k.cfg.Dir, StIgnoreFile, KeepIgnoreFile)
 }
+
+// archivePath is rel as it is kept: NFC-normalized, so the NFD names
+// Syncthing writes on macOS and the NFC names other systems use are one
+// kept file (issue #10). The server normalizes too.
+func archivePath(rel string) string { return norm.NFC.String(rel) }
 
 // walk lists the regular files to consider, sorted by path. Symlinks and
 // other special files are skipped.
@@ -380,7 +388,8 @@ func (k *Keeper) walk() ([]file, error) {
 		if err != nil {
 			return nil
 		}
-		files = append(files, file{rel: rel, abs: abs, mtime: fi.ModTime(), size: fi.Size(), mode: fi.Mode().Perm()})
+		// Kept paths are NFC (see archivePath); abs stays as on disk.
+		files = append(files, file{rel: archivePath(rel), abs: abs, mtime: fi.ModTime(), size: fi.Size(), mode: fi.Mode().Perm()})
 		return nil
 	})
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })

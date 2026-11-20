@@ -349,25 +349,51 @@ func (n *Node) watch(ctx context.Context) {
 		n.mu.Unlock()
 		n.retryLeaves(ctx)
 		n.apply(ctx, m)
-		ch, err := n.reg.Watch(ctx)
+		wctx, stopWatch := context.WithCancel(ctx)
+		ch, err := n.reg.Watch(wctx)
 		if err != nil {
+			stopWatch()
 			fail(err)
 			continue
 		}
 		n.mu.Lock()
 		n.watching = true
 		n.mu.Unlock()
-		backoff = time.Second
+		unregistered := false
 		for m := range ch {
 			n.mu.Lock()
 			n.serverSeen = time.Now()
 			n.mu.Unlock()
+			// The watch reconnects on its own, so a node removed and added
+			// again (`server remove`, `server add`) would keep watching as
+			// an approved node the server knows no device or address for,
+			// and nobody would sync with it (issue #9). Register again.
+			if !hasNode(m, n.tr.Key()) {
+				unregistered = true
+				break
+			}
+			backoff = time.Second
 			n.apply(ctx, m)
 		}
-		if ctx.Err() == nil {
+		stopWatch()
+		switch {
+		case ctx.Err() != nil:
+		case unregistered:
+			fail(errors.New("the server no longer lists this node (removed and added again?); registering again"))
+		default:
 			fail(errors.New("membership stream closed"))
 		}
 	}
+}
+
+// hasNode reports whether m lists the registered node key.
+func hasNode(m api.Membership, key api.NodeKey) bool {
+	for _, nd := range m.Nodes {
+		if nd.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) events() {

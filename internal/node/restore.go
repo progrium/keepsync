@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/osutil"
+	"golang.org/x/text/unicode/norm"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/client"
 	"perkeep.org/pkg/schema"
@@ -86,7 +88,8 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 	if archive == "" {
 		return res, fmt.Errorf("folder %s has never been kept", p.Folder)
 	}
-	prefix := strings.Trim(path.Clean("/"+filepath.ToSlash(p.Path)), "/")
+	// Kept paths are NFC; a name typed on macOS may be NFD (#10).
+	prefix := norm.NFC.String(strings.Trim(path.Clean("/"+filepath.ToSlash(p.Path)), "/"))
 	dest := lf.Path
 	if p.To != "" {
 		if dest, err = absDir(p.To); err != nil {
@@ -137,7 +140,9 @@ func (n *Node) restore(ctx context.Context, p RestoreParams) (RestoreResult, err
 			res.Deleted = append(res.Deleted, name)
 			continue
 		}
-		dst := filepath.Join(dest, filepath.FromSlash(name))
+		// Written in the OS's own spelling (NFD on macOS), as Syncthing
+		// writes names.
+		dst := filepath.Join(dest, filepath.FromSlash(osutil.NativeFilename(name)))
 		if !strings.HasPrefix(dst, dest+string(filepath.Separator)) {
 			res.Errors = append(res.Errors, name+": path escapes the folder")
 			continue

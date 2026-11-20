@@ -241,6 +241,7 @@ Durations accept Go syntax plus a `d` suffix. A policy is rejected unless grace 
 - The root permanode has `title` and `camliRoot` set to the folder name, so it appears under `pk-mount`'s `roots/`.
 - Every directory below the root has its own permanode. Its parent names it with `camliPath:<name> → dir permanode`.
 - Every file has its own permanode, with `camliContent → fileref`, `keepsyncMtime`, `keepsyncVersion` (the Syncthing version vector, as `ID:counter,…`), and `keepsyncMode` (its permission bits, in octal; a chmod with the same content sets it on its own). Its directory names it with `camliPath:<name> → file permanode`.
+- Names are Unicode NFC. Syncthing writes names in NFD on macOS and NFC elsewhere, so the keeper and the server normalize every kept path, and restore writes names in the OS's own form. An archive kept before this may name one file in both forms; the server reads them as one path, the one kept last (for directories, the one claimed last, holding both sets of children).
 - A file that left sync also has `keepsyncGone` (`expired` or `deleted`) and `keepsyncGoneAt`. Keeping the path again clears both, in the same claim as the content; keeping identical content again (such as restoring an expired file) clears them on their own.
 
 Each change is one signed multi claim:
